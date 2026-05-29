@@ -12,6 +12,7 @@ Use `safe_edit.py` as the single implementation and single documented entry poin
 ```bash
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --expected-count 1
 python safe_edit.py inspect --file path/to/file --json
+python safe_edit.py stat --file path/to/file
 python safe_edit.py convert --file path/to/file --to-encoding utf-8-bom --to-line-ending crlf --final-newline ensure
 python safe_edit.py regex --file path/to/file --pattern "foo\\d+" --replacement "bar" --expected-count 1
 python safe_edit.py insert --file path/to/file --line 10 --text "new line"
@@ -41,8 +42,18 @@ On Windows, `py -3 safe_edit.py ...` is acceptable when `python` is not on `PATH
 ## Commands
 
 - `inspect`: report encoding, BOM, line ending counts, file size, line count, NUL presence, and permission bits without writing.
+- `stat`: concise summary for AI agents - shows encoding, line endings, size, and line count only. Use `--json` for machine-readable output.
+  ```text
+  Encoding: UTF-8
+  Line endings: LF
+  Size: 12 KB
+  Lines: 392
+  ```
 - `convert`: explicitly convert encoding, line endings, final newline, or trailing whitespace without textual replacement.
 - `edit --old TEXT --new TEXT`: replace literal text. Empty `--new ""` is allowed; empty `--old ""` is refused.
+  ```bash
+  python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --interactive
+  ```
 - `regex --pattern PATTERN --replacement TEXT`: replace with Python `re.sub` semantics. Flags: `i`, `m`, `s`, `x`, `a`. Use `--literal-replacement` when backreferences must not be interpreted.
 - `insert --line N --text TEXT`: insert before 1-based line `N`.
 - `prepend --text TEXT`: add text at the beginning of the file.
@@ -51,6 +62,57 @@ On Windows, `py -3 safe_edit.py ...` is acceptable when `python` is not on `PATH
 - `replace-lines --start N --end M --text TEXT`: replace an inclusive 1-based line range.
 - `delete-lines --start N --end M`: delete an inclusive 1-based line range.
 - `batch --ops-file ops.json`: run multiple operations in memory, then write once.
+
+## Regex Examples
+
+Use `regex` only when exact `edit` is not possible.
+
+### Replace version number
+```bash
+python safe_edit.py regex --file config.py \
+  --pattern 'version = "[^"]+"' \
+  --replacement 'version = "2.0.0"'
+```
+
+### Replace all numbers
+```bash
+python safe_edit.py regex --file data.txt \
+  --pattern '\d+' \
+  --replacement '0'
+```
+
+### Use capture groups
+```bash
+python safe_edit.py regex --file code.cpp \
+  --pattern 'foo\((\w+)\)' \
+  --replacement 'bar(\1)'
+```
+
+### Literal replacement (no backreference)
+```bash
+python safe_edit.py regex --file text.txt \
+  --pattern 'error' \
+  --replacement '\1test' \
+  --literal-replacement
+```
+
+### Anti-patterns (DO NOT)
+```bash
+# BAD: Too greedy, may match too much
+--pattern '.*'
+
+# BAD: Could match unintended content
+--pattern 'foo.*bar'
+
+# GOOD: Be specific
+--pattern 'version = "\d+\.\d+"'
+```
+
+### Key Principles
+- Prefer `edit` over `regex` when possible
+- Test with `--dry-run --diff` first
+- Use `--expected-count` to verify match count
+- Use `--literal-replacement` when replacement contains backslashes
 
 ## Large Or Multiline Values
 
@@ -70,7 +132,7 @@ Available value sources:
 - `--replacement`, `--replacement-file`, `--replacement-stdin`
 - `--text`, `--text-file`, `--text-stdin`
 
-Argument files default to UTF-8; override with `--arg-encoding`.
+Argument files default to UTF-8; override with `--arg-encoding` (aliases: `--param-encoding`, `--input-encoding`).
 
 ## Batch JSON
 
@@ -102,6 +164,26 @@ python safe_edit.py convert --file a.cpp --trim-trailing-whitespace
 
 The same post-transform flags can be combined with `edit`, `regex`, `batch`, and other mutating commands when one read/write cycle is preferred.
 
+## Interactive Mode
+
+Apply changes with user confirmation. Similar to `git add -p`.
+
+```bash
+python safe_edit.py edit --file a.cpp --old "foo" --new "bar" -i
+```
+
+When prompted:
+- `y` - yes, apply this change
+- `n` - no, skip this change  
+- `a` - all, apply all remaining without prompting
+- `q` - quit, skip remaining changes
+- `?` - help
+
+**Constraints:**
+- Requires interactive terminal (TTY)
+- Cannot use with `--dry-run`
+- Not applicable to `inspect` command
+
 ## Guarantees
 
 - Detects and preserves `utf-8`, `utf-8-bom`, `gbk`, UTF-16 with BOM, UTF-16 without BOM when NUL patterns are clear, plus manual `shift-jis`, `big5`, `latin-1`, `utf-16-le`, and `utf-16-be`.
@@ -123,6 +205,9 @@ The same post-transform flags can be combined with `edit`, `regex`, `batch`, and
 - `--count N`: regex replacement limit; `0` means all.
 - `--no-op-ok`: allow replacement text or pattern not to be found.
 - `--explain-match-failure`: show detailed diagnostics when a match fails (see below).
+- `--ignore-indent`: ignore indentation differences when matching (tabs vs spaces).
+- `--ignore-eol`: ignore line ending differences when matching (CRLF vs LF).
+- `--normalize-whitespace`: treat consecutive whitespace as equivalent when matching.
 - `--dry-run`: validate and transform in memory without writing.
 - `--force-write`: write even when output bytes are identical to the original.
 - `--diff --context N`: emit unified diff preview.
@@ -131,6 +216,7 @@ The same post-transform flags can be combined with `edit`, `regex`, `batch`, and
 - `--backup-suffix SUFFIX`: customize backup suffix; `{timestamp}` is supported.
 - `--allow-nul`: allow decoded NUL characters.
 - `--follow-symlink`: edit the symlink target instead of refusing.
+- `--interactive, -i`: prompt before applying changes.
 - `--max-bytes N`: raise or lower the default 50 MiB limit.
 - `--lock-timeout N`: wait for another safe-edit process; default is 10 seconds.
 - `--lock-stale-seconds N`: remove a safe-edit lock older than `N` seconds.
@@ -168,6 +254,63 @@ The diagnostic shows:
 - Expected pattern with whitespace visualized (`[SP]` = space, `[TAB]` = tab, `[CR]` = carriage return, `[LF]` = line feed)
 - Actual content at that location
 - Specific differences detected (indentation type, line endings, etc.)
+
+## Controlled Whitespace Matching
+
+By default, `edit` requires exact character-by-character matching. When whitespace differences cause match failures, use these **controlled relaxation flags**:
+
+```bash
+# Match despite indentation differences (tabs vs spaces)
+python safe_edit.py edit --file code.cpp --old "    return 42" --new "    return 43" --ignore-indent
+
+# Match despite line ending differences (CRLF vs LF)
+python safe_edit.py edit --file code.cpp --old "line1\nline2" --new "new1\nnew2" --ignore-eol
+
+# Match despite whitespace quantity differences (multiple spaces vs single space)
+python safe_edit.py edit --file code.cpp --old "foo bar" --new "baz qux" --normalize-whitespace
+```
+
+### Key Principles
+
+1. **Explicit, not magic**: Each flag must be explicitly requested. No automatic normalization.
+2. **Match-only, not replace**: These flags affect `--old` matching only. The `--new` replacement text is inserted exactly as provided.
+3. **Preserve original formatting**: The file's original whitespace (indentation, line endings, spacing) is preserved in unchanged portions.
+4. **Composable**: Flags can be combined for complex scenarios.
+
+### Flag Details
+
+- `--ignore-indent`: Remove leading whitespace from each line before matching. Useful when files use tabs but your pattern uses spaces, or vice versa.
+- `--ignore-eol`: Normalize all line endings to LF before matching. Useful when files use CRLF but your pattern uses LF, or vice versa.
+- `--normalize-whitespace`: Collapse consecutive whitespace (spaces, tabs, newlines) to a single space before matching. Useful when whitespace quantity varies.
+
+### Example: Cross-Platform Code
+
+A file with Windows formatting (tabs + CRLF + extra spaces):
+
+```
+def foo():
+		return    42
+```
+
+Match with Unix-style pattern:
+
+```bash
+python safe_edit.py edit --file code.cpp \
+    --old "def foo():\n    return 42" \
+    --new "def bar():\n    return 43" \
+    --ignore-indent \
+    --ignore-eol \
+    --normalize-whitespace \
+    --expected-count 1
+```
+
+Result: The replacement succeeds, but the file keeps its original formatting (tabs, CRLF, extra spaces).
+
+### Limitations
+
+- Only affects `edit` command (literal replacement). Does not affect `regex`, `insert`, or other commands.
+- When normalization is used, the replacement text replaces the entire matched `--old` text exactly as provided.
+- For complex whitespace transformations, consider using `regex` with explicit patterns instead.
 
 ## Anchor-Based Line Positioning
 

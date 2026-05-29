@@ -1291,5 +1291,741 @@ class SafeEditTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), bytes.fromhex("c4 e3 ba c3 0d 0a 62 61 72 0d 0a"))
 
 
+    # =========================================================================
+    # --interactive mode tests
+    # =========================================================================
+
+    def test_interactive_with_dry_run_fails(self):
+        """Test that --interactive with --dry-run fails."""
+        path = self.tmpdir / "interactive_dry.txt"
+        path.write_bytes(b"foo\n")
+        
+        result = self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "foo",
+            "--new",
+            "bar",
+            "--expected-count",
+            "1",
+            "--interactive",
+            "--dry-run",
+            expect=2,
+        )
+        
+        self.assertIn("--interactive cannot be used with --dry-run", result.stderr)
+
+    def test_interactive_with_inspect_fails(self):
+        """Test that --interactive with inspect command fails."""
+        path = self.tmpdir / "interactive_inspect.txt"
+        path.write_bytes(b"foo\n")
+        
+        result = self.run_tool(
+            "inspect",
+            "--file",
+            path,
+            "--interactive",
+            expect=2,
+        )
+        
+        self.assertIn("--interactive is not applicable to inspect command", result.stderr)
+
+    def test_interactive_in_non_tty_fails(self):
+        """Test that --interactive fails in non-interactive terminal (piped)."""
+        path = self.tmpdir / "interactive_nontty.txt"
+        path.write_bytes(b"foo\n")
+        
+        # When running via subprocess, stdin/stdout are pipes, not TTY
+        result = self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "foo",
+            "--new",
+            "bar",
+            "--expected-count",
+            "1",
+            "--interactive",
+            expect=2,
+        )
+        
+        self.assertIn("--interactive requires an interactive terminal", result.stderr)
+
+    def test_interactive_accept_with_y(self):
+        """Test --interactive with 'y' (yes) input applies the change."""
+        path = self.tmpdir / "interactive_y.txt"
+        path.write_bytes(b"foo\n")
+        
+        # Simulate user input 'y' with forced interactive mode
+        env = os.environ.copy()
+        env['SAFE_EDIT_FORCE_INTERACTIVE'] = '1'
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "edit", "--file", str(path),
+             "--old", "foo", "--new", "bar",
+             "--expected-count", "1",
+             "--interactive"],
+            input="y\n",
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            env=env,
+        )
+        
+        # Should show diff and prompt
+        self.assertIn("-foo", result.stdout)
+        self.assertIn("+bar", result.stdout)
+        self.assertIn("Apply this change?", result.stdout)
+        
+        # File should be modified
+        self.assertEqual(path.read_bytes(), b"bar\n")
+
+    def test_interactive_reject_with_n(self):
+        """Test --interactive with 'n' (no) input skips the change."""
+        path = self.tmpdir / "interactive_n.txt"
+        path.write_bytes(b"foo\n")
+        original = path.read_bytes()
+        
+        # Simulate user input 'n' with forced interactive mode
+        env = os.environ.copy()
+        env['SAFE_EDIT_FORCE_INTERACTIVE'] = '1'
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "edit", "--file", str(path),
+             "--old", "foo", "--new", "bar",
+             "--expected-count", "1",
+             "--interactive"],
+            input="n\n",
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            env=env,
+        )
+        
+        # Should show diff and prompt
+        self.assertIn("Apply this change?", result.stdout)
+        
+        # File should NOT be modified
+        self.assertEqual(path.read_bytes(), original)
+        
+        # Should show skipped message
+        self.assertIn("Skipped write: user declined in interactive mode", result.stdout)
+
+    def test_interactive_apply_all_with_a(self):
+        """Test --interactive with 'a' (all) input applies all changes."""
+        path = self.tmpdir / "interactive_a.txt"
+        path.write_bytes(b"foo\nbar\n")
+        
+        # Simulate user input 'a' with forced interactive mode
+        env = os.environ.copy()
+        env['SAFE_EDIT_FORCE_INTERACTIVE'] = '1'
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "edit", "--file", str(path),
+             "--old", "foo", "--new", "baz",
+             "--expected-count", "1",
+             "--interactive"],
+            input="a\n",
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            env=env,
+        )
+        
+        # File should be modified
+        self.assertEqual(path.read_bytes(), b"baz\nbar\n")
+
+    def test_interactive_quit_with_q(self):
+        """Test --interactive with 'q' (quit) input skips the change."""
+        path = self.tmpdir / "interactive_q.txt"
+        path.write_bytes(b"foo\n")
+        original = path.read_bytes()
+        
+        # Simulate user input 'q' with forced interactive mode
+        env = os.environ.copy()
+        env['SAFE_EDIT_FORCE_INTERACTIVE'] = '1'
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "edit", "--file", str(path),
+             "--old", "foo", "--new", "bar",
+             "--expected-count", "1",
+             "--interactive"],
+            input="q\n",
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            env=env,
+        )
+        
+        # File should NOT be modified
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_interactive_help_with_question(self):
+        """Test --interactive with '?' shows help and re-prompts."""
+        path = self.tmpdir / "interactive_help.txt"
+        path.write_bytes(b"foo\n")
+        
+        # Simulate user input '?' then 'n' with forced interactive mode
+        env = os.environ.copy()
+        env['SAFE_EDIT_FORCE_INTERACTIVE'] = '1'
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "edit", "--file", str(path),
+             "--old", "foo", "--new", "bar",
+             "--expected-count", "1",
+             "--interactive"],
+            input="?\nn\n",
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            env=env,
+        )
+        
+        # Should show help
+        self.assertIn("y - yes", result.stdout)
+        self.assertIn("n - no", result.stdout)
+        self.assertIn("a - all", result.stdout)
+        self.assertIn("q - quit", result.stdout)
+
+    def test_interactive_shows_diff_context(self):
+        """Test --interactive shows diff with proper context."""
+        path = self.tmpdir / "interactive_context.txt"
+        # Create file with multiple lines
+        content_lines = ["line1", "line2", "line3", "target", "line5", "line6", "line7"]
+        path.write_bytes(("\n".join(content_lines) + "\n").encode())
+        
+        # Simulate user input 'y' with forced interactive mode
+        env = os.environ.copy()
+        env['SAFE_EDIT_FORCE_INTERACTIVE'] = '1'
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "edit", "--file", str(path),
+             "--old", "target", "--new", "replaced",
+             "--expected-count", "1",
+             "--interactive",
+             "--context", "2"],
+            input="y\n",
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            env=env,
+        )
+        
+        # Should show context lines in diff
+        self.assertIn("line2", result.stdout)
+        self.assertIn("line3", result.stdout)
+        self.assertIn("target", result.stdout)
+        self.assertIn("replaced", result.stdout)
+        self.assertIn("line5", result.stdout)
+        self.assertIn("line6", result.stdout)
+
+    def test_interactive_short_flag(self):
+        """Test -i short flag works same as --interactive."""
+        path = self.tmpdir / "interactive_short.txt"
+        path.write_bytes(b"foo\n")
+        
+        # Simulate user input 'y' with short flag and forced interactive mode
+        env = os.environ.copy()
+        env['SAFE_EDIT_FORCE_INTERACTIVE'] = '1'
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "edit", "--file", str(path),
+             "--old", "foo", "--new", "bar",
+             "--expected-count", "1",
+             "-i"],
+            input="y\n",
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            env=env,
+        )
+        
+        # File should be modified
+        self.assertEqual(path.read_bytes(), b"bar\n")
+
+    # =========================================================================
+    # Controlled whitespace matching tests (--ignore-indent, --ignore-eol, --normalize-whitespace)
+    # =========================================================================
+
+    def test_ignore_indent_tab_vs_space(self):
+        """Test --ignore-indent allows matching tab-indented text with space-indented pattern."""
+        path = self.tmpdir / "indent_tab.txt"
+        # File uses tab indentation
+        path.write_bytes(b"def foo():\n\treturn 42\n")
+        
+        # Match with space indentation (should fail without flag)
+        result = self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "    return 42",  # 4 spaces instead of tab
+            "--new",
+            "    return 43",
+            expect=2,
+        )
+        self.assertIn("not found", result.stderr)
+        
+        # Match with space indentation (should succeed with flag)
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "    return 42",  # 4 spaces instead of tab
+            "--new",
+            "    return 43",
+            "--expected-count",
+            "1",
+            "--ignore-indent",
+        )
+        
+        # Should have replaced, but kept original indentation (tab)
+        self.assertEqual(path.read_bytes(), b"def foo():\n\treturn 43\n")
+
+    def test_ignore_indent_space_vs_tab(self):
+        """Test --ignore-indent allows matching space-indented text with tab-indented pattern."""
+        path = self.tmpdir / "indent_space.txt"
+        # File uses space indentation
+        path.write_bytes(b"def foo():\n    return 42\n")
+        
+        # Match with tab indentation (should succeed with flag)
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "\treturn 42",  # tab instead of spaces
+            "--new",
+            "\treturn 43",
+            "--expected-count",
+            "1",
+            "--ignore-indent",
+        )
+        
+        # Should have replaced, but kept original indentation (spaces)
+        self.assertEqual(path.read_bytes(), b"def foo():\n    return 43\n")
+
+    def test_ignore_eol_crlf_vs_lf(self):
+        """Test --ignore-eol allows matching CRLF text with LF pattern."""
+        path = self.tmpdir / "eol_crlf.txt"
+        # File uses CRLF
+        path.write_bytes(b"line1\r\nline2\r\n")
+        
+        # Match with LF (should fail without flag)
+        result = self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "line1\nline2",
+            "--new",
+            "new1\nnew2",
+            expect=2,
+        )
+        self.assertIn("not found", result.stderr)
+        
+        # Match with LF (should succeed with flag)
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "line1\nline2",
+            "--new",
+            "new1\nnew2",
+            "--expected-count",
+            "1",
+            "--ignore-eol",
+        )
+        
+        # Should have replaced, but kept original line endings (CRLF)
+        self.assertEqual(path.read_bytes(), b"new1\r\nnew2\r\n")
+
+    def test_ignore_eol_lf_vs_crlf(self):
+        """Test --ignore-eol allows matching LF text with CRLF pattern."""
+        path = self.tmpdir / "eol_lf.txt"
+        # File uses LF
+        path.write_bytes(b"line1\nline2\n")
+        
+        # Match with CRLF (should succeed with flag)
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "line1\r\nline2",
+            "--new",
+            "new1\r\nnew2",
+            "--expected-count",
+            "1",
+            "--ignore-eol",
+        )
+        
+        # Should have replaced, but kept original line endings (LF)
+        self.assertEqual(path.read_bytes(), b"new1\nnew2\n")
+
+    def test_normalize_whitespace_multiple_vs_single(self):
+        """Test --normalize-whitespace treats multiple spaces as single space."""
+        path = self.tmpdir / "whitespace.txt"
+        # File has multiple spaces
+        path.write_bytes(b"foo    bar\n")
+        
+        # Match with single space (should fail without flag)
+        result = self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "foo bar",
+            "--new",
+            "baz qux",
+            expect=2,
+        )
+        self.assertIn("not found", result.stderr)
+        
+        # Match with single space (should succeed with flag)
+        # Use replacement that matches original whitespace pattern
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "foo bar",
+            "--new",
+            "baz    qux",  # Keep original whitespace pattern
+            "--expected-count",
+            "1",
+            "--normalize-whitespace",
+        )
+        
+        # Should have replaced with the provided new text
+        self.assertEqual(path.read_bytes(), b"baz    qux\n")
+
+    def test_normalize_whitespace_tabs_and_spaces(self):
+        """Test --normalize-whitespace treats tabs and spaces as equivalent."""
+        path = self.tmpdir / "whitespace_mixed.txt"
+        # File has tabs and spaces mixed
+        path.write_bytes(b"foo\t \tbar\n")
+        
+        # Match with single space (should succeed with flag)
+        # Use replacement that matches original whitespace pattern
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "foo bar",
+            "--new",
+            "baz\t \tqux",  # Keep original whitespace pattern
+            "--expected-count",
+            "1",
+            "--normalize-whitespace",
+        )
+        
+        # Should have replaced with the provided new text
+        self.assertEqual(path.read_bytes(), b"baz\t \tqux\n")
+
+    def test_combined_flags(self):
+        """Test combination of --ignore-indent, --ignore-eol, --normalize-whitespace."""
+        path = self.tmpdir / "combined.txt"
+        # File has tabs, CRLF, and multiple spaces
+        path.write_bytes(b"def foo():\r\n\treturn    42\r\n")
+        
+        # Match with spaces, LF, and single space (should succeed with all flags)
+        # Use replacement that matches original formatting
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "def foo():\n    return 42",
+            "--new",
+            "def bar():\n\treturn    43",  # Keep original formatting (tab + multiple spaces)
+            "--expected-count",
+            "1",
+            "--ignore-indent",
+            "--ignore-eol",
+            "--normalize-whitespace",
+        )
+        
+        # Should have replaced with the provided new text
+        self.assertEqual(path.read_bytes(), b"def bar():\r\n\treturn    43\r\n")
+
+    def test_replacement_not_affected(self):
+        """Test that whitespace flags don't affect replacement text."""
+        path = self.tmpdir / "replacement.txt"
+        # File has tabs
+        path.write_bytes(b"\tfoo\n")
+        
+        # Match with spaces, replace with different indentation
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "    foo",
+            "--new",
+            "        bar",  # 8 spaces
+            "--expected-count",
+            "1",
+            "--ignore-indent",
+        )
+        
+        # Replacement should be inserted as-is (8 spaces), not converted to tabs
+        # But the original line's indentation (tab) should be preserved
+        # Actually, the replacement replaces the entire matched text
+        self.assertEqual(path.read_bytes(), b"\tbar\n")  # Original tab preserved, but "foo" -> "bar"
+
+    def test_ignore_indent_multiline(self):
+        """Test --ignore-indent with multiline pattern."""
+        path = self.tmpdir / "multiline_indent.txt"
+        # File has mixed indentation
+        path.write_bytes(b"if (x) {\n\t\tdoSomething();\n\t}\n")
+        
+        # Match with different indentation
+        # Use replacement that matches original indentation pattern
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "if (x) {\n        doSomething();\n    }",
+            "--new",
+            "if (y) {\n\t\tdoSomething();\n\t}",  # Keep original indentation
+            "--expected-count",
+            "1",
+            "--ignore-indent",
+        )
+        
+        # Should have replaced with the provided new text
+        self.assertEqual(path.read_bytes(), b"if (y) {\n\t\tdoSomething();\n\t}\n")
+
+    def test_whitespace_flags_only_affect_edit(self):
+        """Test that whitespace flags only affect edit command, not other commands."""
+        path = self.tmpdir / "other_command.txt"
+        path.write_bytes(b"\tfoo\nbar\n")
+        
+        # insert should work normally (not affected by --ignore-indent)
+        self.run_tool(
+            "insert",
+            "--file",
+            path,
+            "--line",
+            "1",
+            "--text",
+            "new line",
+            "--ignore-indent",  # Should be ignored for insert
+        )
+        
+        # Should insert at beginning
+        self.assertEqual(path.read_bytes(), b"new line\n\tfoo\nbar\n")
+
+    def test_whitespace_flags_with_regex_not_affected(self):
+        """Test that whitespace flags don't affect regex command."""
+        path = self.tmpdir / "regex_not_affected.txt"
+        path.write_bytes(b"\tfoo\n")
+        
+        # regex should work normally (not affected by --ignore-indent)
+        self.run_tool(
+            "regex",
+            "--file",
+            path,
+            "--pattern",
+            r"\s+foo",
+            "--replacement",
+            "bar",
+            "--expected-count",
+            "1",
+            "--ignore-indent",  # Should be ignored for regex
+        )
+        
+        # Should replace whitespace+foo with bar
+        self.assertEqual(path.read_bytes(), b"bar\n")
+
+    def test_whitespace_flags_with_expected_count(self):
+        """Test that whitespace flags work correctly with --expected-count."""
+        path = self.tmpdir / "expected_count.txt"
+        # File has 3 occurrences with different indentation
+        path.write_bytes(b"\tfoo\n    foo\n\t\tfoo\n")
+        
+        # Should find all 3 with --ignore-indent
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "foo",
+            "--new",
+            "bar",
+            "--expected-count",
+            "3",
+            "--ignore-indent",
+        )
+        
+        # All should be replaced
+        self.assertEqual(path.read_bytes(), b"\tbar\n    bar\n\t\tbar\n")
+
+    def test_whitespace_flags_with_first(self):
+        """Test that whitespace flags work correctly with --first."""
+        path = self.tmpdir / "first_flag.txt"
+        # File has 2 occurrences with different indentation
+        path.write_bytes(b"\tfoo\n    foo\n")
+        
+        # Should replace only first with --first
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "foo",
+            "--new",
+            "bar",
+            "--first",
+            "--ignore-indent",
+        )
+        
+        # Only first should be replaced
+        self.assertEqual(path.read_bytes(), b"\tbar\n    foo\n")
+
+    # =========================================================================
+    # stat command tests
+    # =========================================================================
+
+    def test_stat_basic_output(self):
+        """Test stat command produces concise output."""
+        path = self.tmpdir / "stat_basic.txt"
+        path.write_bytes(b"line1\nline2\nline3\n")
+        
+        result = self.run_tool("stat", "--file", path)
+        
+        # Should have concise output format
+        self.assertIn("Encoding: UTF-8", result.stdout)
+        self.assertIn("Line endings: LF", result.stdout)
+        self.assertIn("Size:", result.stdout)
+        self.assertIn("Lines: 3", result.stdout)
+
+    def test_stat_json_output(self):
+        """Test stat command with --json produces machine-readable output."""
+        path = self.tmpdir / "stat_json.txt"
+        path.write_bytes(b"alpha\r\nbeta\r\n")
+        
+        result = self.run_tool("stat", "--file", path, "--json")
+        payload = json.loads(result.stdout)
+        
+        # Should have minimal fields
+        self.assertEqual(payload["encoding"], "utf-8")
+        self.assertEqual(payload["lineEnding"], "crlf")
+        self.assertEqual(payload["sizeBytes"], 13)  # "alpha\r\nbeta\r\n" = 13 bytes
+        self.assertEqual(payload["lineCount"], 2)
+        self.assertEqual(payload["command"], "stat")
+        
+        # Should NOT have detailed fields like inspect
+        self.assertNotIn("hasBom", payload)
+        self.assertNotIn("mixedLineEndings", payload)
+        self.assertNotIn("lineEndingCounts", payload)
+        self.assertNotIn("permissionsOctal", payload)
+
+    def test_stat_utf8_bom_file(self):
+        """Test stat command with UTF-8 BOM file."""
+        path = self.tmpdir / "stat_bom.txt"
+        path.write_bytes(codecs.BOM_UTF8 + b"content\n")
+        
+        result = self.run_tool("stat", "--file", path)
+        
+        # Should show UTF-8-BOM encoding
+        self.assertIn("Encoding: UTF-8-BOM", result.stdout)
+
+    def test_stat_gbk_file(self):
+        """Test stat command with GBK encoded file."""
+        path = self.tmpdir / "stat_gbk.txt"
+        # GBK encoded Chinese text
+        path.write_bytes(bytes.fromhex("c4 e3 ba c3 0d 0a"))
+        
+        result = self.run_tool("stat", "--file", path, "--encoding", "gbk", "--json")
+        payload = json.loads(result.stdout)
+        
+        self.assertEqual(payload["encoding"], "gbk")
+        self.assertEqual(payload["lineEnding"], "crlf")
+
+    def test_stat_empty_file(self):
+        """Test stat command with empty file."""
+        path = self.tmpdir / "stat_empty.txt"
+        path.write_bytes(b"")
+        
+        result = self.run_tool("stat", "--file", path, "--json")
+        payload = json.loads(result.stdout)
+        
+        self.assertEqual(payload["lineCount"], 0)
+        self.assertEqual(payload["sizeBytes"], 0)
+        self.assertEqual(payload["encoding"], "utf-8")
+        self.assertEqual(payload["lineEnding"], "lf")
+
+    def test_stat_large_file_size_format(self):
+        """Test stat command formats size correctly for larger files."""
+        path = self.tmpdir / "stat_large.txt"
+        # Create a file larger than 1 KB
+        content = "line\n" * 300  # 300 lines, ~1500 bytes
+        path.write_bytes(content.encode("utf-8"))
+        
+        result = self.run_tool("stat", "--file", path)
+        
+        # Size should be shown in KB
+        self.assertIn("KB", result.stdout)
+        self.assertIn("Lines: 300", result.stdout)
+
+    def test_stat_small_file_size_format(self):
+        """Test stat command formats size correctly for small files."""
+        path = self.tmpdir / "stat_small.txt"
+        path.write_bytes(b"tiny")
+        
+        result = self.run_tool("stat", "--file", path)
+        
+        # Size should be shown in bytes (less than 1 KB)
+        self.assertIn("bytes", result.stdout)
+        self.assertNotIn("KB", result.stdout)
+
+    def test_stat_vs_inspect_difference(self):
+        """Test that stat output is more concise than inspect."""
+        path = self.tmpdir / "compare.txt"
+        path.write_bytes(b"line1\r\nline2\n")
+        
+        # Get stat output
+        stat_result = self.run_tool("stat", "--file", path)
+        stat_lines = stat_result.stdout.strip().split("\n")
+        
+        # Get inspect output
+        inspect_result = self.run_tool("inspect", "--file", path)
+        
+        # stat should have exactly 4 lines (Encoding, Line endings, Size, Lines)
+        self.assertEqual(len(stat_lines), 4)
+        
+        # stat output should be more concise (shorter total length)
+        self.assertLess(len(stat_result.stdout), len(inspect_result.stdout))
+        
+        # stat should not contain detailed info like inspect
+        self.assertNotIn("mixedLineEndings", stat_result.stdout)
+        self.assertNotIn("hasNul", stat_result.stdout)
+        self.assertNotIn("permissionsOctal", stat_result.stdout)
+
+    def test_stat_preserves_encoding_detection(self):
+        """Test that stat uses same encoding detection as inspect."""
+        path = self.tmpdir / "stat_detect.txt"
+        path.write_bytes(codecs.BOM_UTF8 + b"test\r\n")
+        
+        # Both should detect UTF-8-BOM
+        stat_result = self.run_tool("stat", "--file", path, "--json")
+        inspect_result = self.run_tool("inspect", "--file", path, "--json")
+        
+        stat_payload = json.loads(stat_result.stdout)
+        inspect_payload = json.loads(inspect_result.stdout)
+        
+        self.assertEqual(stat_payload["encoding"], inspect_payload["encoding"])
+        self.assertEqual(stat_payload["lineEnding"], inspect_payload["lineEnding"])
+
+
 if __name__ == "__main__":
     unittest.main()

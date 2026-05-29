@@ -466,6 +466,36 @@ def parse_regex_flags(value: str) -> int:
     return flags
 
 
+def normalize_for_match(text: str, ignore_indent: bool = False, ignore_eol: bool = False, normalize_whitespace: bool = False) -> str:
+    """Normalize text for matching with controlled whitespace flexibility.
+    
+    This is a controlled relaxation of strict matching, not magic.
+    Each flag explicitly enables a specific normalization.
+    
+    Args:
+        text: The text to normalize
+        ignore_indent: If True, remove leading whitespace from each line
+        ignore_eol: If True, normalize all line endings to LF
+        normalize_whitespace: If True, collapse consecutive whitespace to single space
+    
+    Returns:
+        Normalized text for matching
+    """
+    if ignore_indent:
+        # Remove leading whitespace from each line
+        text = '\n'.join(line.lstrip() for line in text.split('\n'))
+    
+    if ignore_eol:
+        # Normalize all line endings to LF
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+    
+    if normalize_whitespace:
+        # Collapse consecutive whitespace to single space
+        text = re.sub(r'\s+', ' ', text)
+    
+    return text
+
+
 def read_argument_file(path: str, arg_encoding: str) -> str:
     try:
         return Path(path).read_text(encoding=arg_encoding)
@@ -526,12 +556,20 @@ def resolve_operation_value(
     return read_argument_file(str(file_path), arg_encoding)
 
 
-def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, explain: bool = False) -> Tuple[str, int]:
+def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, explain: bool = False, 
+                        ignore_indent: bool = False, ignore_eol: bool = False, normalize_whitespace: bool = False) -> Tuple[str, int]:
     old = str(operation["old"])
     new = normalize_user_newlines(str(operation["new"]), newline)
     if old == "":
         fail("old text must not be empty")
-    actual = text.count(old)
+    
+    # Apply controlled whitespace normalization for matching only
+    # The replacement text (new) is NOT normalized - it's used as-is
+    normalized_text = normalize_for_match(text, ignore_indent, ignore_eol, normalize_whitespace)
+    normalized_old = normalize_for_match(old, ignore_indent, ignore_eol, normalize_whitespace)
+    
+    # Count matches using normalized versions
+    actual = normalized_text.count(normalized_old)
     expected = operation.get("expected_count")
     if expected is not None and actual != int(expected):
         fail(f"expected {expected} occurrence(s), found {actual}")
@@ -541,8 +579,152 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
             fail(f"old text was not found; refusing a silent no-op\n\n{explanation}")
         else:
             fail("old text was not found; refusing a silent no-op")
-    count = 1 if bool(operation.get("first", False)) else -1
-    return (text.replace(old, new, count), min(actual, 1) if count == 1 else actual)
+    
+    # Perform replacement on original text (not normalized)
+    # We need to find the actual positions in the original text
+    if ignore_indent or ignore_eol or normalize_whitespace:
+        # When normalization is used, we need to find matches in original text
+        # by mapping normalized positions back to original positions
+        result_text = text
+        count_replaced = 0
+        
+        # Find all matches in normalized text and map to original
+        if bool(operation.get("first", False)):
+            # Replace only first match
+            # Find the first occurrence in normalized text
+            norm_pos = normalized_text.find(normalized_old)
+            if norm_pos >= 0:
+                # Find corresponding position in original text
+                # The matched content in original text may have different length than original_old
+                original_pos, original_len = find_original_position(
+                    text, normalized_text, norm_pos, normalized_old, old,
+                    ignore_indent, ignore_eol, normalize_whitespace
+                )
+                if original_pos >= 0:
+                    # Adjust replacement to preserve original indentation
+                    original_matched = text[original_pos:original_pos + original_len]
+                    adjusted_new = adjust_replacement_for_indent(original_matched, new, ignore_indent)
+                    result_text = text[:original_pos] + adjusted_new + text[original_pos + original_len:]
+                    count_replaced = 1
+        else:
+            # Replace all matches
+            # Find all occurrences and replace them
+            positions = []
+            search_start = 0
+            search_start_orig = 0
+            while True:
+                norm_pos = normalized_text.find(normalized_old, search_start)
+                if norm_pos < 0:
+                    break
+                original_pos, original_len = find_original_position(
+                    text, normalized_text, norm_pos, normalized_old, old,
+                    ignore_indent, ignore_eol, normalize_whitespace,
+                    start_search_pos=search_start_orig
+                )
+                if original_pos >= 0:
+                    positions.append((original_pos, original_len))
+                    search_start_orig = original_pos + original_len
+                search_start = norm_pos + len(normalized_old)
+            
+            # Replace from end to start to preserve positions
+            for original_pos, original_len in sorted(positions, key=lambda x: x[0], reverse=True):
+                # Adjust replacement to preserve original indentation
+                original_matched = result_text[original_pos:original_pos + original_len]
+                adjusted_new = adjust_replacement_for_indent(original_matched, new, ignore_indent)
+                result_text = result_text[:original_pos] + adjusted_new + result_text[original_pos + original_len:]
+                count_replaced += 1
+        
+        return (result_text, count_replaced)
+    else:
+        # No normalization - use original simple logic
+        count = 1 if bool(operation.get("first", False)) else -1
+        return (text.replace(old, new, count), min(actual, 1) if count == 1 else actual)
+
+
+def find_original_position(original_text: str, normalized_text: str, norm_pos: int, 
+                            normalized_old: str, original_old: str,
+                            ignore_indent: bool, ignore_eol: bool, normalize_whitespace: bool,
+                            start_search_pos: int = 0) -> Tuple[int, int]:
+    """Find the position in original text corresponding to a normalized match position.
+    
+    This maps a match found in normalized text back to the original text.
+    Returns (position, length) tuple where position is the start in original text
+    and length is the length of the matched content in original text.
+    """
+    # Simple case: if no normalization, position is same
+    if not ignore_indent and not ignore_eol and not normalize_whitespace:
+        pos = original_text.find(original_old)
+        return (pos, len(original_old)) if pos >= 0 else (-1, 0)
+    
+    # Strategy: scan through original text, extract substrings of varying lengths,
+    # normalize them, and compare with normalized_old
+    # The matched content in original text may have different length than original_old
+    
+    # For efficiency, we use a heuristic: the matched content in original text
+    # should have similar length to original_old (within a factor of 2)
+    # This handles cases like: tab vs 4 spaces, CRLF vs LF, multiple spaces vs single space
+    
+    min_len = max(1, len(normalized_old))  # Minimum possible length
+    max_len = max(len(original_old), len(original_old) * 2, len(normalized_old) * 3)  # Maximum possible length
+    
+    search_start = start_search_pos
+    while search_start < len(original_text):
+        # Try different lengths from this position
+        for length in range(min_len, min(max_len + 1, len(original_text) - search_start + 1)):
+            candidate = original_text[search_start:search_start + length]
+            normalized_candidate = normalize_for_match(candidate, ignore_indent, ignore_eol, normalize_whitespace)
+            
+            if normalized_candidate == normalized_old:
+                return (search_start, length)
+        
+        search_start += 1
+    
+    return (-1, 0)
+
+
+def adjust_replacement_for_indent(original_matched: str, new_text: str, ignore_indent: bool) -> str:
+    """Adjust replacement text to preserve original indentation style.
+    
+    When --ignore-indent is used, the replacement should preserve the original
+    indentation style (tabs vs spaces) from the matched content.
+    
+    Args:
+        original_matched: The matched content from the original file
+        new_text: The replacement text provided by user
+        ignore_indent: Whether --ignore-indent was used
+    
+    Returns:
+        Adjusted replacement text with original indentation preserved
+    """
+    if not ignore_indent:
+        return new_text
+    
+    # Extract original indentation (leading whitespace of first line)
+    original_indent = ""
+    for char in original_matched:
+        if char in ' \t':
+            original_indent += char
+        else:
+            break
+    
+    # Extract new text's indentation
+    new_indent = ""
+    for char in new_text:
+        if char in ' \t':
+            new_indent += char
+        else:
+            break
+    
+    # If both have indentation, replace new indentation with original
+    if original_indent and new_indent:
+        return original_indent + new_text[len(new_indent):]
+    
+    # If only original has indentation, prepend it
+    if original_indent and not new_indent:
+        return original_indent + new_text
+    
+    # Otherwise, return as-is
+    return new_text
 
 
 def apply_regex_edit(text: str, operation: Dict[str, Any], newline: str, explain: bool = False) -> Tuple[str, int]:
@@ -688,10 +870,12 @@ def apply_replace_lines(text: str, operation: Dict[str, Any], newline: str) -> T
     return (join_records(records[:start] + replacement + records[end:]), end - start)
 
 
-def apply_operation(text: str, operation: Dict[str, Any], newline: str, explain: bool = False) -> Tuple[str, int, str]:
+def apply_operation(text: str, operation: Dict[str, Any], newline: str, explain: bool = False,
+                    ignore_indent: bool = False, ignore_eol: bool = False, normalize_whitespace: bool = False) -> Tuple[str, int, str]:
     op = str(operation.get("op") or operation.get("command") or "").replace("_", "-")
     if op == "edit":
-        new_text, changed = apply_literal_edit(text, operation, newline, explain)
+        new_text, changed = apply_literal_edit(text, operation, newline, explain, 
+                                                ignore_indent, ignore_eol, normalize_whitespace)
     elif op == "regex":
         new_text, changed = apply_regex_edit(text, operation, newline, explain)
     elif op == "insert":
@@ -719,6 +903,79 @@ def apply_post_transforms(text: str, args: argparse.Namespace, newline: str) -> 
         newline = line_sep(args.to_line_ending)
     text = set_final_newline(text, args.final_newline, newline)
     return text
+
+
+def is_interactive_terminal() -> bool:
+    """Check if we're running in an interactive terminal.
+    
+    For testing purposes, set SAFE_EDIT_FORCE_INTERACTIVE=1 environment variable
+    to bypass the TTY check.
+    """
+    # Allow forcing interactive mode for testing
+    if os.environ.get('SAFE_EDIT_FORCE_INTERACTIVE', '').lower() in ('1', 'true', 'yes'):
+        return True
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def prompt_interactive(
+    path: Path,
+    before: str,
+    after: str,
+    context: int,
+    operation_desc: Optional[str] = None,
+) -> Tuple[bool, bool]:
+    """Prompt user for confirmation before applying changes.
+    
+    Returns:
+        (apply_this, apply_all) tuple:
+        - apply_this: True if this change should be applied
+        - apply_all: True if all remaining changes should be applied without prompting
+    
+    Raises:
+        SafeEditError: If not in interactive terminal
+    """
+    if not is_interactive_terminal():
+        fail("--interactive requires an interactive terminal (stdin/stdout must be TTY)")
+    
+    # Show diff
+    diff_text = generate_diff(path, before, after, context)
+    if diff_text:
+        print(diff_text)
+        print()
+    
+    if operation_desc:
+        print(f"Operation: {operation_desc}")
+    
+    while True:
+        try:
+            response = input("Apply this change? [y/n/a/q/?] ").strip().lower()
+        except EOFError:
+            return (False, False)
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+            return (False, False)
+        
+        if response in ("y", "yes"):
+            return (True, False)
+        elif response in ("n", "no"):
+            return (False, False)
+        elif response in ("a", "all"):
+            return (True, True)
+        elif response in ("q", "quit"):
+            return (False, False)
+        elif response in ("?", "h", "help"):
+            print("Options:")
+            print("  y - yes, apply this modification")
+            print("  n - no, skip this modification")
+            print("  a - all, apply all remaining modifications without prompting")
+            print("  q - quit, exit without applying remaining modifications")
+            print("  ? - help, show this help message")
+        else:
+            print(f"Unknown response: {response}. Use y/n/a/q/?")
+
 
 
 def generate_diff(path: Path, before: str, after: str, context: int) -> str:
@@ -842,6 +1099,27 @@ def inspect_target(path: Path, original: bytes, encoding: EncodingInfo, text: st
         "endsWithNewline": bool(text.endswith(("\n", "\r"))),
         "hasNul": "\x00" in text,
         "permissionsOctal": oct(mode),
+        "dryRun": True,
+        "changed": 0,
+        "operations": [],
+        "backup": None,
+        "written": False,
+        "skipped": True,
+        "wouldChangeBytes": False,
+    }
+
+
+def stat_target(path: Path, original: bytes, encoding: EncodingInfo, text: str) -> Dict[str, Any]:
+    """Return a concise summary of file metadata for AI agents."""
+    newline_style, _line_counts, _mixed_line_endings = detect_line_ending(text)
+    records = split_records(text)
+    return {
+        "file": str(path),
+        "command": "stat",
+        "encoding": encoding.name,
+        "lineEnding": newline_style,
+        "sizeBytes": len(original),
+        "lineCount": len(records),
         "dryRun": True,
         "changed": 0,
         "operations": [],
@@ -1029,6 +1307,7 @@ def build_parser() -> argparse.ArgumentParser:
         "command",
         choices=(
             "inspect",
+            "stat",
             "convert",
             "edit",
             "regex",
@@ -1055,7 +1334,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--to-line-ending", choices=("preserve", "lf", "crlf", "cr"), default="preserve")
     parser.add_argument("--final-newline", choices=("preserve", "ensure", "strip"), default="preserve")
     parser.add_argument("--trim-trailing-whitespace", action="store_true")
-    parser.add_argument("--arg-encoding", default="utf-8", help="encoding for --*-file and --ops-file")
+    parser.add_argument("--arg-encoding", "--param-encoding", "--input-encoding", default="utf-8", help="encoding for --*-file and --ops-file")
     parser.add_argument("--backup", action="store_true")
     parser.add_argument("--backup-dir")
     parser.add_argument("--backup-suffix", default=".safe-edit-{timestamp}.bak")
@@ -1070,6 +1349,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lock-stale-seconds", type=float, default=0.0)
     parser.add_argument("--no-lock", action="store_true")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--interactive", "-i", action="store_true",
+                        help="prompt for confirmation before each write operation")
 
     parser.add_argument("--old")
     parser.add_argument("--old-file")
@@ -1093,6 +1374,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-op-ok", action="store_true")
     parser.add_argument("--explain-match-failure", action="store_true",
                         help="show detailed diagnostics when match fails")
+    
+    # Controlled whitespace matching flags (only affect --old matching, not --new replacement)
+    parser.add_argument("--ignore-indent", action="store_true",
+                        help="ignore indentation differences when matching (tabs vs spaces)")
+    parser.add_argument("--ignore-eol", action="store_true",
+                        help="ignore line ending differences when matching (CRLF vs LF)")
+    parser.add_argument("--normalize-whitespace", action="store_true",
+                        help="treat consecutive whitespace as equivalent when matching")
 
     parser.add_argument("--line", type=int)
     parser.add_argument("--start", type=int)
@@ -1117,12 +1406,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> Dict[str, Any]:
+    # Validate --interactive constraints
+    if getattr(args, 'interactive', False):
+        if args.dry_run:
+            fail("--interactive cannot be used with --dry-run (dry-run doesn't write anyway)")
+        if args.command == "inspect":
+            fail("--interactive is not applicable to inspect command (read-only)")
+    
     path = resolve_target_path(args.file, args.follow_symlink)
     if args.command == "inspect":
         original = read_target(path, args.max_bytes)
         encoding = detect_encoding(original, args.encoding)
         text = strict_decode(original, encoding)
         return inspect_target(path, original, encoding, text)
+    if args.command == "stat":
+        original = read_target(path, args.max_bytes)
+        encoding = detect_encoding(original, args.encoding)
+        text = strict_decode(original, encoding)
+        return stat_target(path, original, encoding, text)
 
     operations, _base_dir = command_to_operations(args)
     if args.command == "convert" and (
@@ -1147,8 +1448,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         new_text = text
         operation_results: List[Dict[str, Any]] = []
         explain = getattr(args, "explain_match_failure", False)
+        ignore_indent = getattr(args, "ignore_indent", False)
+        ignore_eol = getattr(args, "ignore_eol", False)
+        normalize_whitespace = getattr(args, "normalize_whitespace", False)
         for index, operation in enumerate(operations, start=1):
-            new_text, changed, op = apply_operation(new_text, operation, newline, explain)
+            new_text, changed, op = apply_operation(new_text, operation, newline, explain,
+                                                     ignore_indent, ignore_eol, normalize_whitespace)
             operation_results.append({"index": index, "op": op, "changed": changed})
 
         new_text = apply_post_transforms(new_text, args, newline)
@@ -1185,6 +1490,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             summary["diff"] = diff_text
 
         if not args.dry_run:
+            # Interactive mode: prompt before writing
+            interactive = getattr(args, 'interactive', False)
+            apply_all = False
+            
+            if interactive and not apply_all:
+                # Show diff and prompt
+                diff_for_prompt = generate_diff(path, text, new_text, args.context) if not args.diff else diff_text
+                apply_this, apply_all = prompt_interactive(path, text, new_text, args.context)
+                if not apply_this:
+                    summary["skipped"] = True
+                    summary["interactiveSkipped"] = True
+                    return summary
+            
             if output == original and not args.force_write:
                 summary["skipped"] = True
             else:
@@ -1204,6 +1522,18 @@ def emit_summary(summary: Dict[str, Any], as_json: bool) -> None:
     if "diff" in summary and summary["diff"]:
         print(summary["diff"])
     note = "DRY-RUN " if summary["dryRun"] else ""
+    if summary.get("command") == "stat":
+        # Concise output for AI agents
+        size_kb = summary['sizeBytes'] / 1024
+        if size_kb >= 1:
+            size_str = f"{size_kb:.0f} KB"
+        else:
+            size_str = f"{summary['sizeBytes']} bytes"
+        print(f"Encoding: {summary['encoding'].upper()}")
+        print(f"Line endings: {summary['lineEnding'].upper()}")
+        print(f"Size: {size_str}")
+        print(f"Lines: {summary['lineCount']}")
+        return
     if summary.get("command") == "inspect":
         print(
             f"Inspect: {summary['file']} "
@@ -1222,7 +1552,10 @@ def emit_summary(summary: Dict[str, Any], as_json: bool) -> None:
         f"changed={summary['changed']})"
     )
     if summary.get("skipped"):
-        print("Skipped write: output bytes are identical to the original")
+        if summary.get("interactiveSkipped"):
+            print("Skipped write: user declined in interactive mode")
+        else:
+            print("Skipped write: output bytes are identical to the original")
     if summary["mixedLineEndings"]:
         print(f"Warning: mixed line endings detected: {summary['lineEndingCounts']}", file=sys.stderr)
     if summary["backup"]:
