@@ -2595,6 +2595,288 @@ class SafeEditTests(unittest.TestCase):
         self.assertIn("matchOptions", payload)
         self.assertTrue(payload["matchOptions"]["autoMatch"])
 
+    # =========================================================================
+    # classify_error_type coverage tests
+    # =========================================================================
+
+    def test_error_type_match_ambiguous(self):
+        """Test error type classification for ambiguous anchor match."""
+        path = self.tmpdir / "err_ambiguous.txt"
+        path.write_bytes(b"pattern\nline1\npattern\nline2\n")
+        
+        result = self.run_tool(
+            "replace-lines", "--file", path,
+            "--anchor-pattern", "pattern",
+            "--offset-start", "+1", "--offset-end", "+1",
+            "--text", "new",
+            "--json", expect=2,
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "match_ambiguous")
+
+    def test_error_type_file_error(self):
+        """Test error type classification for missing file."""
+        path = self.tmpdir / "nonexistent_file_xyz.txt"
+        
+        result = self.run_tool(
+            "inspect", "--file", path,
+            "--json", expect=2,
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "file_error")
+
+    def test_error_type_lock_error(self):
+        """Test error type classification for lock contention."""
+        path = self.tmpdir / "err_lock.txt"
+        path.write_bytes(b"foo\n")
+        
+        # Create a lock file that is not stale
+        lock = self.tmpdir / ".err_lock.txt.safe-edit.lock"
+        lock.write_text("active", encoding="utf-8")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "1",
+            "--lock-timeout", "0.1",
+            "--lock-stale-seconds", "0",
+            "--json", expect=2,
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "lock_error")
+
+    def test_error_type_format_error(self):
+        """Test error type classification for diff-input format error."""
+        path = self.tmpdir / "err_format.txt"
+        path.write_bytes(b"foo\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--diff-input", "this is not a valid diff format",
+            "--json", expect=2,
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "format_error")
+
+    # =========================================================================
+    # --allow-nul tests
+    # =========================================================================
+
+    def test_allow_nul_permits_nul_bytes(self):
+        """Test --allow-nul allows editing files with NUL bytes."""
+        path = self.tmpdir / "nul_allowed.txt"
+        path.write_bytes(b"hello\x00world\n")
+        
+        # Without --allow-nul, should fail
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "hello", "--new", "hi",
+            "--expected-count", "1",
+            expect=2,
+        )
+        self.assertIn("NUL", result.stderr)
+        
+        # With --allow-nul, should succeed
+        self.run_tool(
+            "edit", "--file", path,
+            "--old", "hello", "--new", "hi",
+            "--expected-count", "1",
+            "--allow-nul",
+        )
+        self.assertEqual(path.read_bytes(), b"hi\x00world\n")
+
+    # =========================================================================
+    # --max-bytes tests
+    # =========================================================================
+
+    def test_max_bytes_rejects_large_file(self):
+        """Test --max-bytes rejects files exceeding the limit."""
+        path = self.tmpdir / "large.txt"
+        path.write_bytes(b"x" * 1000)
+        
+        result = self.run_tool(
+            "inspect", "--file", path,
+            "--max-bytes", "100",
+            "--json", expect=2,
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "file_error")
+
+    def test_max_bytes_allows_file_under_limit(self):
+        """Test --max-bytes allows files within the limit."""
+        path = self.tmpdir / "small.txt"
+        path.write_bytes(b"small content\n")
+        
+        result = self.run_tool(
+            "inspect", "--file", path,
+            "--max-bytes", "1000",
+            "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+
+    # =========================================================================
+    # Additional encoding tests
+    # =========================================================================
+
+    def test_latin1_encoding_edit(self):
+        """Test editing a Latin-1 encoded file."""
+        path = self.tmpdir / "latin1.txt"
+        # Latin-1 encoded: "café" = 63 61 66 e9
+        path.write_bytes(bytes.fromhex("63 61 66 e9 0a"))
+        
+        self.run_tool(
+            "edit", "--file", path,
+            "--encoding", "latin-1",
+            "--old", "caf", "--new", "CAF",
+            "--expected-count", "1",
+        )
+        
+        # "CAFé\n" in Latin-1
+        self.assertEqual(path.read_bytes(), bytes.fromhex("43 41 46 e9 0a"))
+
+    def test_utf16_le_encoding_inspect(self):
+        """Test inspecting a UTF-16-LE file with BOM."""
+        path = self.tmpdir / "utf16le.txt"
+        # UTF-16-LE BOM + "hello\n"
+        content = codecs.BOM_UTF16_LE + "hello\n".encode("utf-16-le")
+        path.write_bytes(content)
+        
+        result = self.run_tool("inspect", "--file", path, "--json")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["encoding"], "utf-16-le")
+
+    # =========================================================================
+    # --count flag for regex
+    # =========================================================================
+
+    def test_regex_count_limits_replacements(self):
+        """Test --count limits the number of regex replacements."""
+        path = self.tmpdir / "regex_count.txt"
+        path.write_bytes(b"aaa bbb aaa bbb aaa\n")
+        
+        self.run_tool(
+            "regex", "--file", path,
+            "--pattern", "aaa", "--replacement", "xxx",
+            "--count", "2",
+        )
+        
+        # Only first 2 occurrences should be replaced
+        self.assertEqual(path.read_bytes(), b"xxx bbb xxx bbb aaa\n")
+
+    # =========================================================================
+    # diff-input + auto-match combination
+    # =========================================================================
+
+    def test_diff_input_with_auto_match(self):
+        """Test --diff-input with --auto-match for flexible matching."""
+        path = self.tmpdir / "diff_auto.txt"
+        # CRLF line endings in file, LF in diff input, multiline
+        path.write_bytes(b"hello world\r\nfoo bar\r\n")
+        
+        # Diff input uses LF for multiline, file uses CRLF
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--diff-input", "------- SEARCH\nhello world\nfoo bar\n=======\nhello universe\nfoo baz\n+++++++ REPLACE",
+            "--auto-match", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "ignore-eol")
+
+    # =========================================================================
+    # Fuzzy multiline match
+    # =========================================================================
+
+    def test_fuzzy_multiline_match(self):
+        """Test --fuzzy with multiline content where most lines match exactly."""
+        path = self.tmpdir / "fuzzy_multi.txt"
+        path.write_bytes(b"def calculate(price, qty):\n    total = price * qty\n    return total\n")
+        
+        # Only one line differs (cost vs price in first line)
+        # Note: fuzzy multiline uses line-level SequenceMatcher, so we need
+        # most lines to match exactly for similarity >= 0.6
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "def calculate(cost, qty):\n    total = price * qty\n    return total",
+            "--new", "def compute(price, qty):\n    result = price * qty\n    return result",
+            "--auto-match", "--fuzzy", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "fuzzy")
+
+    # =========================================================================
+    # Context disambiguation + expected-count
+    # =========================================================================
+
+    def test_context_with_expected_count(self):
+        """Test context filtering reduces matches to match expected-count."""
+        path = self.tmpdir / "ctx_count.txt"
+        # "target" appears 3 times
+        path.write_bytes(b"prefix_A\ntarget\nmiddle\nprefix_B\ntarget\nsuffix\nprefix_C\ntarget\nend\n")
+        
+        # After context filtering (only matches after "prefix_B"), should find 1
+        self.run_tool(
+            "edit", "--file", path,
+            "--old", "target", "--new", "replaced",
+            "--context-before", "prefix_B",
+            "--expected-count", "1",
+        )
+        
+        self.assertEqual(
+            path.read_bytes(),
+            b"prefix_A\ntarget\nmiddle\nprefix_B\nreplaced\nsuffix\nprefix_C\ntarget\nend\n"
+        )
+
+    # =========================================================================
+    # Empty SEARCH section in diff-input
+    # =========================================================================
+
+    def test_diff_input_empty_search_skipped(self):
+        """Test --diff-input with empty SEARCH section is skipped."""
+        path = self.tmpdir / "diff_empty_search.txt"
+        path.write_bytes(b"hello\n")
+        
+        # Empty SEARCH section followed by a valid one
+        self.run_tool(
+            "edit", "--file", path,
+            "--diff-input", "------- SEARCH\n=======\nshould_be_skipped\n+++++++ REPLACE\n------- SEARCH\nhello\n=======\nworld\n+++++++ REPLACE",
+        )
+        
+        self.assertEqual(path.read_bytes(), b"world\n")
+
+    # =========================================================================
+    # adjust_replacement_for_indent edge cases
+    # =========================================================================
+
+    def test_ignore_indent_preserves_original_indentation_multiline(self):
+        """Test --ignore-indent preserves original indentation on first line."""
+        path = self.tmpdir / "indent_multi.txt"
+        # File uses tabs
+        path.write_bytes(b"class Foo:\n\tdef bar(self):\n\t\treturn 42\n")
+        
+        # Match with spaces, replace with different content
+        self.run_tool(
+            "edit", "--file", path,
+            "--old", "def bar(self):\n        return 42",
+            "--new", "def baz(self):\n        return 99",
+            "--expected-count", "1",
+            "--ignore-indent",
+        )
+        
+        # Should keep original tab indentation on first line
+        content = path.read_bytes()
+        self.assertIn(b"\tdef baz(self):", content)
+
 
 if __name__ == "__main__":
     unittest.main()

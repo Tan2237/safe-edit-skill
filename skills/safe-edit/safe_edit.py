@@ -68,9 +68,9 @@ def classify_error_type(message: str) -> str:
         return "match_count_mismatch"
     if "decode" in msg or "encode" in msg or "encoding" in msg or "bom" in msg:
         return "encoding_error"
-    if "file not found" in msg or "not a regular" in msg or "symlink" in msg or "failed to read" in msg or "failed to" in msg and "file" in msg:
+    if "file not found" in msg or "not a regular" in msg or "symlink" in msg or "failed to read" in msg or "failed to" in msg and "file" in msg or "exceeding" in msg and "max-bytes" in msg:
         return "file_error"
-    if "lock" in msg:
+    if "lock already exists" in msg or "lock file" in msg or "stale lock" in msg:
         return "lock_error"
     if "diff-input format" in msg or "search/replace" in msg:
         return "format_error"
