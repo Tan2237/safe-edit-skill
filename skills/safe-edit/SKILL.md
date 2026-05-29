@@ -1,5 +1,6 @@
 ---
 name: safe-edit
+version: 1.0.0
 description: Safely edit existing text, source, and config files through one cross-platform Python script while preserving encoding, BOM, newline style, permissions, and atomic-write integrity. Use for literal replacements, line insertions, and line deletions when avoiding mojibake, truncated files, silent no-ops, or noisy Git diffs matters; prefer this over ad-hoc cat, Set-Content, sed, or regex writes.
 ---
 
