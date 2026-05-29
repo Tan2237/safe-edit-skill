@@ -163,6 +163,83 @@ class SafeEditTests(unittest.TestCase):
         self.assertIn("bar", result.stdout)
         self.assertEqual(path.read_bytes(), before)
 
+    def test_convert_encoding_line_endings_and_final_newline(self):
+        path = self.tmpdir / "convert.txt"
+        path.write_bytes("alpha\nbeta".encode("utf-8"))
+        result = self.run_tool(
+            "convert",
+            "--file",
+            path,
+            "--to-encoding",
+            "utf-8-bom",
+            "--to-line-ending",
+            "crlf",
+            "--final-newline",
+            "ensure",
+            "--json",
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["outputEncoding"], "utf-8-bom")
+        self.assertEqual(payload["outputLineEnding"], "crlf")
+        self.assertTrue(payload["written"])
+        self.assertEqual(path.read_bytes(), codecs.BOM_UTF8 + b"alpha\r\nbeta\r\n")
+
+    def test_convert_can_trim_and_strip_final_newline(self):
+        path = self.tmpdir / "trim.txt"
+        path.write_bytes(b"a  \n\tb\t\n")
+        self.run_tool("convert", "--file", path, "--trim-trailing-whitespace", "--final-newline", "strip")
+        self.assertEqual(path.read_bytes(), b"a\n\tb")
+
+    def test_backup_dir_and_suffix(self):
+        path = self.tmpdir / "backup.txt"
+        backup_dir = self.tmpdir / "backups"
+        path.write_bytes(b"before\n")
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "before",
+            "--new",
+            "after",
+            "--expected-count",
+            "1",
+            "--backup",
+            "--backup-dir",
+            backup_dir,
+            "--backup-suffix",
+            ".bak",
+        )
+        self.assertEqual(path.read_bytes(), b"after\n")
+        backup = backup_dir / "backup.txt.bak"
+        self.assertTrue(backup.exists())
+        self.assertEqual(backup.read_bytes(), b"before\n")
+
+    def test_stale_lock_can_be_removed(self):
+        path = self.tmpdir / "locked.txt"
+        path.write_bytes(b"foo\n")
+        lock = self.tmpdir / ".locked.txt.safe-edit.lock"
+        lock.write_text("stale", encoding="utf-8")
+        old_time = time.time() - 120
+        os.utime(lock, (old_time, old_time))
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "foo",
+            "--new",
+            "bar",
+            "--expected-count",
+            "1",
+            "--lock-timeout",
+            "1",
+            "--lock-stale-seconds",
+            "10",
+        )
+        self.assertEqual(path.read_bytes(), b"bar\n")
+        self.assertFalse(lock.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 ---
 name: safe-edit
-description: Safely inspect and edit existing text, source, and config files through one cross-platform Python script while preserving encoding, BOM, newline style, permissions, and atomic-write integrity. Use for encoding/line-ending inspection, literal replacements, explicit regex replacements, line prepends/appends/insertions/deletions, line-range replacement, diff previews, and JSON batch edits when avoiding mojibake, truncated files, silent no-ops, unnecessary writes, or noisy Git diffs matters.
+description: Safely inspect, edit, and explicitly convert existing text, source, and config files through one cross-platform Python script while preserving encoding, BOM, newline style, permissions, and atomic-write integrity by default. Use for encoding/line-ending inspection, literal replacements, explicit regex replacements, line prepends/appends/insertions/deletions, line-range replacement, explicit encoding/newline/final-newline normalization, diff previews, and JSON batch edits when avoiding mojibake, truncated files, silent no-ops, unnecessary writes, or noisy Git diffs matters.
 ---
 
 # safe-edit
@@ -12,6 +12,7 @@ Use `safe_edit.py` as the single implementation and single documented entry poin
 ```bash
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --expected-count 1
 python safe_edit.py inspect --file path/to/file --json
+python safe_edit.py convert --file path/to/file --to-encoding utf-8-bom --to-line-ending crlf --final-newline ensure
 python safe_edit.py regex --file path/to/file --pattern "foo\\d+" --replacement "bar" --expected-count 1
 python safe_edit.py insert --file path/to/file --line 10 --text "new line"
 python safe_edit.py prepend --file path/to/file --text-file header.txt
@@ -30,15 +31,17 @@ On Windows, `py -3 safe_edit.py ...` is acceptable when `python` is not on `PATH
 2. Keep `edit` literal-only. Use `regex` only when the task explicitly needs a regex.
 3. Treat any nonzero exit as "file unchanged"; the script writes a same-directory temp file, atomically replaces the target, and verifies bytes after writing.
 4. Prefer `--expected-count N` for replacements so wrong matches fail loudly.
-5. Use `--dry-run --diff` before risky edits.
-6. Run `inspect --json` before uncertain edits to verify encoding, line endings, and binary risk.
-7. Use `--backup` when the user wants a retained timestamped `.bak` copy.
-8. For pure ASCII files in GBK/Shift-JIS/Big5 projects, pass `--encoding gbk`, `--encoding shift-jis`, or `--encoding big5` before inserting non-ASCII text. ASCII is otherwise detected as UTF-8.
-9. Do not use this skill for binary files, huge generated files, symlinks, or non-text formats unless the user explicitly accepts those risks.
+5. Use `convert` or post-transform flags only when the task explicitly asks for format normalization.
+6. Use `--dry-run --diff` before risky edits.
+7. Run `inspect --json` before uncertain edits to verify encoding, line endings, and binary risk.
+8. Use `--backup` when the user wants a retained timestamped `.bak` copy.
+9. For pure ASCII files in GBK/Shift-JIS/Big5 projects, pass `--encoding gbk`, `--encoding shift-jis`, or `--encoding big5` before inserting non-ASCII text. ASCII is otherwise detected as UTF-8.
+10. Do not use this skill for binary files, huge generated files, symlinks, or non-text formats unless the user explicitly accepts those risks.
 
 ## Commands
 
 - `inspect`: report encoding, BOM, line ending counts, file size, line count, NUL presence, and permission bits without writing.
+- `convert`: explicitly convert encoding, line endings, final newline, or trailing whitespace without textual replacement.
 - `edit --old TEXT --new TEXT`: replace literal text. Empty `--new ""` is allowed; empty `--old ""` is refused.
 - `regex --pattern PATTERN --replacement TEXT`: replace with Python `re.sub` semantics. Flags: `i`, `m`, `s`, `x`, `a`. Use `--literal-replacement` when backreferences must not be interpreted.
 - `insert --line N --text TEXT`: insert before 1-based line `N`.
@@ -86,6 +89,19 @@ Use batch when an edit needs multiple transformations but should read and write 
 
 Batch accepts a JSON list or an object with `operations` / `ops`. Relative `*_file` paths are resolved from the ops file directory.
 
+## Explicit Normalization
+
+Default edits preserve the original format. Use these only when the requested task includes normalization:
+
+```bash
+python safe_edit.py convert --file a.cpp --to-encoding utf-8-bom
+python safe_edit.py convert --file a.cpp --to-line-ending crlf
+python safe_edit.py convert --file a.cpp --final-newline ensure
+python safe_edit.py convert --file a.cpp --trim-trailing-whitespace
+```
+
+The same post-transform flags can be combined with `edit`, `regex`, `batch`, and other mutating commands when one read/write cycle is preferred.
+
 ## Guarantees
 
 - Detects and preserves `utf-8`, `utf-8-bom`, `gbk`, UTF-16 with BOM, UTF-16 without BOM when NUL patterns are clear, plus manual `shift-jis`, `big5`, `latin-1`, `utf-16-le`, and `utf-16-be`.
@@ -98,6 +114,10 @@ Batch accepts a JSON list or an object with `operations` / `ops`. Relative `*_fi
 ## Useful Options
 
 - `--encoding auto|utf-8|utf-8-bom|gbk|shift-jis|big5|latin-1|utf-16-le|utf-16-be`: override target decoding.
+- `--to-encoding preserve|utf-8|utf-8-bom|gbk|shift-jis|big5|latin-1|utf-16-le|utf-16-be`: override output encoding.
+- `--to-line-ending preserve|lf|crlf|cr`: normalize output line endings.
+- `--final-newline preserve|ensure|strip`: control final newline.
+- `--trim-trailing-whitespace`: strip spaces and tabs before line endings.
 - `--expected-count N`: require exactly `N` literal occurrences or regex matches.
 - `--first`: replace only the first literal/regex match.
 - `--count N`: regex replacement limit; `0` means all.
@@ -106,9 +126,12 @@ Batch accepts a JSON list or an object with `operations` / `ops`. Relative `*_fi
 - `--force-write`: write even when output bytes are identical to the original.
 - `--diff --context N`: emit unified diff preview.
 - `--backup`: keep a timestamped backup before replacement.
+- `--backup-dir DIR`: place backups in a separate directory.
+- `--backup-suffix SUFFIX`: customize backup suffix; `{timestamp}` is supported.
 - `--allow-nul`: allow decoded NUL characters.
 - `--follow-symlink`: edit the symlink target instead of refusing.
 - `--max-bytes N`: raise or lower the default 50 MiB limit.
 - `--lock-timeout N`: wait for another safe-edit process; default is 10 seconds.
+- `--lock-stale-seconds N`: remove a safe-edit lock older than `N` seconds.
 - `--no-lock`: skip the cooperative lock.
 - `--json`: emit machine-readable status.

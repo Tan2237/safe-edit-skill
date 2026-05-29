@@ -8,12 +8,14 @@
 
 - 单文件 Python 标准库实现，Windows/Linux/macOS 通用。
 - `inspect` 只检查不写入，可输出编码、BOM、行尾统计、文件大小、行数、NUL 字符和权限位。
+- `convert` 显式转换编码、行尾、最终换行，或清理尾随空白；普通编辑默认仍保留原格式。
 - 自动检测并保留 `utf-8`、`utf-8-bom`、`gbk`、UTF-16 BOM，以及清晰 NUL 模式下的无 BOM UTF-16。
 - 支持手动指定 `shift-jis`、`big5`、`latin-1`、`utf-16-le`、`utf-16-be`。
 - 自动检测并保留 CRLF、LF、CR 行尾风格。
 - 支持字面量替换、显式正则替换、插入行、文件头追加、文件尾追加、删除行、替换行范围、删除行范围。
 - 支持 `--old-file`、`--new-file`、`--text-file`、stdin 等方式传入大段/多行内容。
 - 支持 `--dry-run --diff` 预览、`--expected-count` 防误匹配、`--backup` 备份、JSON batch 一次读写多步编辑。
+- 支持备份目录/后缀自定义，以及 stale lock 自动清理。
 - 同目录临时文件写入、原子替换、写后字节校验，并带有协作锁以降低并发写入风险。
 - 如果变换后的字节和原文件完全一致，默认跳过写入，避免无意义的 mtime 和 Git 状态变化。
 - 附带 `unittest` 测试套件和 GitHub Actions，覆盖 Windows、Linux、macOS。
@@ -53,6 +55,7 @@ skills/safe-edit/
 
 ```bash
 python safe_edit.py inspect --file path/to/file --json
+python safe_edit.py convert --file path/to/file --to-encoding utf-8-bom --to-line-ending crlf --final-newline ensure
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --expected-count 1
 python safe_edit.py regex --file path/to/file --pattern "foo\\d+" --replacement "bar" --expected-count 1
 python safe_edit.py insert --file path/to/file --line 10 --text "new line"
@@ -81,6 +84,19 @@ python safe_edit.py edit \
 ```
 
 `--expected-count` 不匹配时会失败并保持文件不变。默认情况下，没有找到匹配也会失败，避免静默 no-op。
+
+## 显式转换和规范化
+
+普通编辑默认保留原编码和行尾。只有明确需要规范化时才使用 `convert` 或后处理选项：
+
+```bash
+python safe_edit.py convert --file a.cpp --to-encoding utf-8-bom
+python safe_edit.py convert --file a.cpp --to-line-ending crlf
+python safe_edit.py convert --file a.cpp --final-newline ensure
+python safe_edit.py convert --file a.cpp --trim-trailing-whitespace
+```
+
+这些后处理选项也可以和 `edit`、`regex`、`batch` 等写入命令组合，做到一次读写内完成内容修改和格式规范化。
 
 ## 多行内容
 
@@ -157,6 +173,10 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 | 选项 | 说明 |
 | --- | --- |
 | `--encoding` | 指定目标文件编码，默认 `auto` |
+| `--to-encoding` | 指定输出编码，默认 `preserve` |
+| `--to-line-ending` | 指定输出行尾，支持 `preserve`、`lf`、`crlf`、`cr` |
+| `--final-newline` | 控制最终换行，支持 `preserve`、`ensure`、`strip` |
+| `--trim-trailing-whitespace` | 清理每行末尾的空格和 tab |
 | `--expected-count N` | 要求匹配次数恰好为 `N` |
 | `--first` | 只替换第一个匹配 |
 | `--count N` | 正则替换数量限制，`0` 表示全部 |
@@ -165,10 +185,13 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 | `--force-write` | 即使输出字节相同也强制写入 |
 | `--diff --context N` | 输出 unified diff |
 | `--backup` | 写入前创建时间戳备份 |
+| `--backup-dir DIR` | 把备份放到指定目录 |
+| `--backup-suffix SUFFIX` | 自定义备份后缀，支持 `{timestamp}` |
 | `--json` | 输出机器可读状态 |
 | `--follow-symlink` | 编辑符号链接目标 |
 | `--max-bytes N` | 覆盖默认 50 MiB 文件大小限制 |
 | `--lock-timeout N` | 等待 safe-edit 协作锁，默认 10 秒 |
+| `--lock-stale-seconds N` | 删除超过 `N` 秒的 stale safe-edit 锁 |
 | `--no-lock` | 跳过协作锁 |
 
 ## 边界

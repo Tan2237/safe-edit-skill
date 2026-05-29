@@ -82,6 +82,13 @@ def make_encoding_info(name: str, data: bytes = b"") -> EncodingInfo:
     return EncodingInfo(name, ENCODING_CODECS[name])
 
 
+def encoding_for_output(name: str, original: EncodingInfo) -> EncodingInfo:
+    name = normalize_encoding(name)
+    if name == "preserve":
+        return original
+    return make_encoding_info(name)
+
+
 def strict_decode(data: bytes, info: EncodingInfo) -> str:
     payload = data
     if info.bom:
@@ -214,6 +221,30 @@ def join_records(records: Iterable[Tuple[str, str]]) -> str:
 
 def normalize_user_newlines(text: str, sep: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", sep)
+
+
+def convert_line_endings(text: str, style: str) -> str:
+    if style == "preserve":
+        return text
+    return normalize_user_newlines(text, line_sep(style))
+
+
+def trim_trailing_whitespace(text: str) -> str:
+    return join_records((line.rstrip(" \t"), sep) for line, sep in split_records(text))
+
+
+def set_final_newline(text: str, mode: str, sep: str) -> str:
+    if mode == "preserve":
+        return text
+    if mode == "ensure":
+        return text if text.endswith(("\n", "\r")) else text + sep
+    if mode == "strip":
+        while text.endswith("\r\n"):
+            text = text[:-2]
+        while text.endswith(("\n", "\r")):
+            text = text[:-1]
+        return text
+    fail(f"unsupported final newline mode: {mode}")
 
 
 def block_records(text: str, sep: str, final_sep: str) -> List[Tuple[str, str]]:
@@ -451,6 +482,16 @@ def apply_operation(text: str, operation: Dict[str, Any], newline: str) -> Tuple
     return (new_text, changed, op)
 
 
+def apply_post_transforms(text: str, args: argparse.Namespace, newline: str) -> str:
+    if args.trim_trailing_whitespace:
+        text = trim_trailing_whitespace(text)
+    if args.to_line_ending != "preserve":
+        text = convert_line_endings(text, args.to_line_ending)
+        newline = line_sep(args.to_line_ending)
+    text = set_final_newline(text, args.final_newline, newline)
+    return text
+
+
 def generate_diff(path: Path, before: str, after: str, context: int) -> str:
     diff = difflib.unified_diff(
         before.splitlines(),
@@ -464,9 +505,10 @@ def generate_diff(path: Path, before: str, after: str, context: int) -> str:
 
 
 class FileLock:
-    def __init__(self, path: Path, timeout: float) -> None:
+    def __init__(self, path: Path, timeout: float, stale_seconds: float) -> None:
         self.path = path.with_name(f".{path.name}.safe-edit.lock")
         self.timeout = timeout
+        self.stale_seconds = stale_seconds
         self.acquired = False
 
     def __enter__(self) -> "FileLock":
@@ -482,9 +524,26 @@ class FileLock:
                 self.acquired = True
                 return self
             except FileExistsError:
+                self.remove_stale_lock()
                 if time.monotonic() >= deadline:
                     fail(f"lock already exists: {self.path}")
                 time.sleep(0.05)
+
+    def remove_stale_lock(self) -> None:
+        if self.stale_seconds <= 0:
+            return
+        try:
+            age = time.time() - self.path.stat().st_mtime
+        except FileNotFoundError:
+            return
+        if age < self.stale_seconds:
+            return
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            fail(f"failed to remove stale lock {self.path}: {exc}")
 
     def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
         if self.acquired:
@@ -564,7 +623,23 @@ def inspect_target(path: Path, original: bytes, encoding: EncodingInfo, text: st
     }
 
 
-def atomic_replace(path: Path, data: bytes, keep_backup: bool) -> Optional[str]:
+def make_backup_path(path: Path, backup_dir: Optional[str], backup_suffix: str) -> Path:
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    suffix = backup_suffix.replace("{timestamp}", timestamp)
+    if any(part in suffix for part in ("/", "\\")):
+        fail("--backup-suffix must not contain path separators")
+    directory = Path(backup_dir) if backup_dir else path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{path.name}{suffix}"
+
+
+def atomic_replace(
+    path: Path,
+    data: bytes,
+    keep_backup: bool,
+    backup_dir: Optional[str],
+    backup_suffix: str,
+) -> Optional[str]:
     directory = path.parent
     prefix = f".{path.name}.safe-edit."
     fd = -1
@@ -582,8 +657,7 @@ def atomic_replace(path: Path, data: bytes, keep_backup: bool) -> Optional[str]:
         os.chmod(tmp_name, original_mode)
 
         if keep_backup:
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            backup_name = str(path.with_name(f"{path.name}.safe-edit-{timestamp}.bak"))
+            backup_name = str(make_backup_path(path, backup_dir, backup_suffix))
             shutil.copy2(path, backup_name)
 
         os.replace(tmp_name, path)
@@ -633,6 +707,9 @@ def load_batch_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]
 def command_to_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Optional[Path]]:
     if args.command == "batch":
         operations, base_dir = load_batch_operations(args)
+    elif args.command == "convert":
+        operations = []
+        base_dir = None
     else:
         stdin_taken: List[str] = []
         operation: Dict[str, Any] = {"op": args.command}
@@ -701,6 +778,7 @@ def build_parser() -> argparse.ArgumentParser:
         "command",
         choices=(
             "inspect",
+            "convert",
             "edit",
             "regex",
             "insert",
@@ -716,10 +794,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--encoding",
         default="auto",
-        help="auto, utf-8, utf-8-bom, gbk, shift-jis, big5, latin-1, utf-16-le, utf-16-be",
+        help="input decoding: auto, utf-8, utf-8-bom, gbk, shift-jis, big5, latin-1, utf-16-le, utf-16-be",
     )
+    parser.add_argument(
+        "--to-encoding",
+        default="preserve",
+        help="output encoding: preserve, utf-8, utf-8-bom, gbk, shift-jis, big5, latin-1, utf-16-le, utf-16-be",
+    )
+    parser.add_argument("--to-line-ending", choices=("preserve", "lf", "crlf", "cr"), default="preserve")
+    parser.add_argument("--final-newline", choices=("preserve", "ensure", "strip"), default="preserve")
+    parser.add_argument("--trim-trailing-whitespace", action="store_true")
     parser.add_argument("--arg-encoding", default="utf-8", help="encoding for --*-file and --ops-file")
     parser.add_argument("--backup", action="store_true")
+    parser.add_argument("--backup-dir")
+    parser.add_argument("--backup-suffix", default=".safe-edit-{timestamp}.bak")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force-write", action="store_true")
     parser.add_argument("--diff", action="store_true")
@@ -728,6 +816,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--follow-symlink", action="store_true")
     parser.add_argument("--max-bytes", type=int, default=50 * 1024 * 1024)
     parser.add_argument("--lock-timeout", type=float, default=10.0)
+    parser.add_argument("--lock-stale-seconds", type=float, default=0.0)
     parser.add_argument("--no-lock", action="store_true")
     parser.add_argument("--json", action="store_true")
 
@@ -774,7 +863,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         return inspect_target(path, original, encoding, text)
 
     operations, _base_dir = command_to_operations(args)
-    lock_context = NullLock() if args.no_lock or args.dry_run else FileLock(path, args.lock_timeout)
+    if args.command == "convert" and (
+        args.to_encoding == "preserve"
+        and args.to_line_ending == "preserve"
+        and args.final_newline == "preserve"
+        and not args.trim_trailing_whitespace
+    ):
+        fail("convert requires --to-encoding, --to-line-ending, --final-newline, or --trim-trailing-whitespace")
+    lock_context = NullLock() if args.no_lock or args.dry_run else FileLock(path, args.lock_timeout, args.lock_stale_seconds)
 
     with lock_context:
         original = read_target(path, args.max_bytes)
@@ -792,17 +888,30 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             new_text, changed, op = apply_operation(new_text, operation, newline)
             operation_results.append({"index": index, "op": op, "changed": changed})
 
-        output = encode_text(new_text, encoding)
+        new_text = apply_post_transforms(new_text, args, newline)
+        output_encoding = encoding_for_output(args.to_encoding, encoding)
+        output = encode_text(new_text, output_encoding)
+        output_line_ending, output_line_counts, output_mixed_line_endings = detect_line_ending(new_text)
         diff_text = generate_diff(path, text, new_text, args.context) if args.diff else ""
         summary: Dict[str, Any] = {
             "file": str(path),
             "command": args.command,
             "encoding": encoding.name,
+            "outputEncoding": output_encoding.name,
             "lineEnding": newline_style,
+            "outputLineEnding": output_line_ending,
             "mixedLineEndings": mixed_line_endings,
+            "outputMixedLineEndings": output_mixed_line_endings,
             "lineEndingCounts": line_counts,
+            "outputLineEndingCounts": output_line_counts,
             "changed": sum(item["changed"] for item in operation_results),
             "operations": operation_results,
+            "postTransforms": {
+                "toEncoding": args.to_encoding,
+                "toLineEnding": args.to_line_ending,
+                "finalNewline": args.final_newline,
+                "trimTrailingWhitespace": bool(args.trim_trailing_whitespace),
+            },
             "dryRun": args.dry_run,
             "backup": None,
             "written": False,
@@ -816,7 +925,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             if output == original and not args.force_write:
                 summary["skipped"] = True
             else:
-                backup = atomic_replace(path, output, args.backup)
+                backup = atomic_replace(path, output, args.backup, args.backup_dir, args.backup_suffix)
                 verification = path.read_bytes()
                 if verification != output:
                     fail("post-write verification failed: bytes on disk do not match intended output")
@@ -845,7 +954,8 @@ def emit_summary(summary: Dict[str, Any], as_json: bool) -> None:
         return
     print(
         f"{note}Done: {summary['command']} on {summary['file']} "
-        f"(encoding={summary['encoding']}, lineEnding={summary['lineEnding']}, "
+        f"(encoding={summary['encoding']}->{summary['outputEncoding']}, "
+        f"lineEnding={summary['lineEnding']}->{summary['outputLineEnding']}, "
         f"changed={summary['changed']})"
     )
     if summary.get("skipped"):
