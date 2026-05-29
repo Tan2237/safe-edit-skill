@@ -1,6 +1,6 @@
 ---
 name: safe-edit
-description: Safely edit existing text, source, and config files through one cross-platform Python script while preserving encoding, BOM, newline style, permissions, and atomic-write integrity. Use for literal replacements, explicit regex replacements, line insertions/deletions, line-range replacement, diff previews, and JSON batch edits when avoiding mojibake, truncated files, silent no-ops, or noisy Git diffs matters.
+description: Safely inspect and edit existing text, source, and config files through one cross-platform Python script while preserving encoding, BOM, newline style, permissions, and atomic-write integrity. Use for encoding/line-ending inspection, literal replacements, explicit regex replacements, line prepends/appends/insertions/deletions, line-range replacement, diff previews, and JSON batch edits when avoiding mojibake, truncated files, silent no-ops, unnecessary writes, or noisy Git diffs matters.
 ---
 
 # safe-edit
@@ -11,8 +11,11 @@ Use `safe_edit.py` as the single implementation and single documented entry poin
 
 ```bash
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --expected-count 1
+python safe_edit.py inspect --file path/to/file --json
 python safe_edit.py regex --file path/to/file --pattern "foo\\d+" --replacement "bar" --expected-count 1
 python safe_edit.py insert --file path/to/file --line 10 --text "new line"
+python safe_edit.py prepend --file path/to/file --text-file header.txt
+python safe_edit.py append --file path/to/file --text-file footer.txt
 python safe_edit.py delete --file path/to/file --line 10
 python safe_edit.py replace-lines --file path/to/file --start 10 --end 20 --text-file block.txt
 python safe_edit.py delete-lines --file path/to/file --start 10 --end 20
@@ -28,15 +31,19 @@ On Windows, `py -3 safe_edit.py ...` is acceptable when `python` is not on `PATH
 3. Treat any nonzero exit as "file unchanged"; the script writes a same-directory temp file, atomically replaces the target, and verifies bytes after writing.
 4. Prefer `--expected-count N` for replacements so wrong matches fail loudly.
 5. Use `--dry-run --diff` before risky edits.
-6. Use `--backup` when the user wants a retained timestamped `.bak` copy.
-7. For pure ASCII files in GBK/Shift-JIS/Big5 projects, pass `--encoding gbk`, `--encoding shift-jis`, or `--encoding big5` before inserting non-ASCII text. ASCII is otherwise detected as UTF-8.
-8. Do not use this skill for binary files, huge generated files, symlinks, or non-text formats unless the user explicitly accepts those risks.
+6. Run `inspect --json` before uncertain edits to verify encoding, line endings, and binary risk.
+7. Use `--backup` when the user wants a retained timestamped `.bak` copy.
+8. For pure ASCII files in GBK/Shift-JIS/Big5 projects, pass `--encoding gbk`, `--encoding shift-jis`, or `--encoding big5` before inserting non-ASCII text. ASCII is otherwise detected as UTF-8.
+9. Do not use this skill for binary files, huge generated files, symlinks, or non-text formats unless the user explicitly accepts those risks.
 
 ## Commands
 
+- `inspect`: report encoding, BOM, line ending counts, file size, line count, NUL presence, and permission bits without writing.
 - `edit --old TEXT --new TEXT`: replace literal text. Empty `--new ""` is allowed; empty `--old ""` is refused.
 - `regex --pattern PATTERN --replacement TEXT`: replace with Python `re.sub` semantics. Flags: `i`, `m`, `s`, `x`, `a`. Use `--literal-replacement` when backreferences must not be interpreted.
 - `insert --line N --text TEXT`: insert before 1-based line `N`.
+- `prepend --text TEXT`: add text at the beginning of the file.
+- `append --text TEXT`: add text at the end of the file.
 - `delete --line N`: delete one 1-based line.
 - `replace-lines --start N --end M --text TEXT`: replace an inclusive 1-based line range.
 - `delete-lines --start N --end M`: delete an inclusive 1-based line range.
@@ -70,7 +77,9 @@ Use batch when an edit needs multiple transformations but should read and write 
 [
   {"op": "edit", "old": "foo", "new": "bar", "expected_count": 1},
   {"op": "regex", "pattern": "version = \"[^\"]+\"", "replacement": "version = \"1.2.3\"", "expected_count": 1},
+  {"op": "prepend", "text_file": "header.txt"},
   {"op": "replace-lines", "start": 10, "end": 12, "text_file": "block.txt"},
+  {"op": "append", "text": "done"},
   {"op": "delete-lines", "start": 30, "end": 35}
 ]
 ```
@@ -84,6 +93,7 @@ Batch accepts a JSON list or an object with `operations` / `ops`. Relative `*_fi
 - Preserves ordinary file permissions where the platform allows it.
 - Refuses unknown encodings, decoded NUL characters, symlinks, missing matches, invalid lines, oversized files, and concurrent safe-edit lock conflicts by default.
 - Performs same-directory temp-file writes followed by atomic replacement and byte-for-byte post-write verification.
+- Skips the write when transformed bytes are identical to the original, unless `--force-write` is set.
 
 ## Useful Options
 
@@ -93,6 +103,7 @@ Batch accepts a JSON list or an object with `operations` / `ops`. Relative `*_fi
 - `--count N`: regex replacement limit; `0` means all.
 - `--no-op-ok`: allow replacement text or pattern not to be found.
 - `--dry-run`: validate and transform in memory without writing.
+- `--force-write`: write even when output bytes are identical to the original.
 - `--diff --context N`: emit unified diff preview.
 - `--backup`: keep a timestamped backup before replacement.
 - `--allow-nul`: allow decoded NUL characters.

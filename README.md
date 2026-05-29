@@ -1,19 +1,22 @@
 # safe-edit skill
 
-通用的安全文本编辑 Agent Skill。它用一个跨平台 Python 脚本编辑已有文本文件，并尽量保留原文件的编码、BOM、行尾格式、普通权限和写入完整性。
+通用的安全文本编辑 Agent Skill。它用一个跨平台 Python 脚本检查和编辑已有文本文件，并尽量保留原文件的编码、BOM、行尾格式、普通权限和写入完整性。
 
 适合 Agent 修改源代码、配置文件、中文项目文件、MSVC/Windows 项目文件，以及任何不希望被 `cat`、`sed`、`Set-Content` 或临时脚本弄乱编码和 Git diff 的场景。
 
 ## 特性
 
 - 单文件 Python 标准库实现，Windows/Linux/macOS 通用。
+- `inspect` 只检查不写入，可输出编码、BOM、行尾统计、文件大小、行数、NUL 字符和权限位。
 - 自动检测并保留 `utf-8`、`utf-8-bom`、`gbk`、UTF-16 BOM，以及清晰 NUL 模式下的无 BOM UTF-16。
 - 支持手动指定 `shift-jis`、`big5`、`latin-1`、`utf-16-le`、`utf-16-be`。
 - 自动检测并保留 CRLF、LF、CR 行尾风格。
-- 支持字面量替换、显式正则替换、插入行、删除行、替换行范围、删除行范围。
+- 支持字面量替换、显式正则替换、插入行、文件头追加、文件尾追加、删除行、替换行范围、删除行范围。
 - 支持 `--old-file`、`--new-file`、`--text-file`、stdin 等方式传入大段/多行内容。
 - 支持 `--dry-run --diff` 预览、`--expected-count` 防误匹配、`--backup` 备份、JSON batch 一次读写多步编辑。
 - 同目录临时文件写入、原子替换、写后字节校验，并带有协作锁以降低并发写入风险。
+- 如果变换后的字节和原文件完全一致，默认跳过写入，避免无意义的 mtime 和 Git 状态变化。
+- 附带 `unittest` 测试套件和 GitHub Actions，覆盖 Windows、Linux、macOS。
 
 ## 安装
 
@@ -49,9 +52,12 @@ skills/safe-edit/
 直接运行 Python 脚本即可。Windows 上如果 `python` 不在 `PATH`，可以用 `py -3` 替代。
 
 ```bash
+python safe_edit.py inspect --file path/to/file --json
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --expected-count 1
 python safe_edit.py regex --file path/to/file --pattern "foo\\d+" --replacement "bar" --expected-count 1
 python safe_edit.py insert --file path/to/file --line 10 --text "new line"
+python safe_edit.py prepend --file path/to/file --text-file header.txt
+python safe_edit.py append --file path/to/file --text-file footer.txt
 python safe_edit.py delete --file path/to/file --line 10
 python safe_edit.py replace-lines --file path/to/file --start 10 --end 20 --text-file block.txt
 python safe_edit.py delete-lines --file path/to/file --start 10 --end 20
@@ -63,6 +69,8 @@ python safe_edit.py batch --file path/to/file --ops-file ops.json
 建议在风险较高的修改前使用：
 
 ```bash
+python safe_edit.py inspect --file src/main.cpp --json
+
 python safe_edit.py edit \
   --file src/main.cpp \
   --old "oldName" \
@@ -81,6 +89,8 @@ python safe_edit.py edit \
 ```bash
 python safe_edit.py edit --file a.cpp --old-file old.txt --new-file new.txt
 python safe_edit.py insert --file a.cpp --line 5 --text-file block.txt
+python safe_edit.py prepend --file a.cpp --text-file header.txt
+python safe_edit.py append --file a.cpp --text-file footer.txt
 python safe_edit.py regex --file a.cpp --pattern-file pattern.txt --replacement-file replacement.txt
 ```
 
@@ -108,7 +118,9 @@ python safe_edit.py regex \
 [
   {"op": "edit", "old": "foo", "new": "bar", "expected_count": 1},
   {"op": "regex", "pattern": "version = \"[^\"]+\"", "replacement": "version = \"1.2.3\"", "expected_count": 1},
+  {"op": "prepend", "text_file": "header.txt"},
   {"op": "replace-lines", "start": 10, "end": 12, "text_file": "block.txt"},
+  {"op": "append", "text": "done"},
   {"op": "delete-lines", "start": 30, "end": 35}
 ]
 ```
@@ -131,6 +143,15 @@ python safe_edit.py edit --encoding shift-jis --file a.cpp --old "name" --new "�
 python safe_edit.py edit --encoding big5 --file a.cpp --old "name" --new "繁體"
 ```
 
+## 测试
+
+```bash
+python -m py_compile skills/safe-edit/safe_edit.py
+python -m unittest discover -s tests -v
+```
+
+GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
+
 ## 常用选项
 
 | 选项 | 说明 |
@@ -141,6 +162,7 @@ python safe_edit.py edit --encoding big5 --file a.cpp --old "name" --new "繁體
 | `--count N` | 正则替换数量限制，`0` 表示全部 |
 | `--no-op-ok` | 允许没有匹配 |
 | `--dry-run` | 只验证和预览，不写入 |
+| `--force-write` | 即使输出字节相同也强制写入 |
 | `--diff --context N` | 输出 unified diff |
 | `--backup` | 写入前创建时间戳备份 |
 | `--json` | 输出机器可读状态 |

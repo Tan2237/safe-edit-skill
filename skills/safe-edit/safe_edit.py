@@ -372,6 +372,24 @@ def apply_insert(text: str, operation: Dict[str, Any], newline: str) -> Tuple[st
     return (join_records(records[:index] + to_insert + records[index:]), len(to_insert))
 
 
+def apply_prepend(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int]:
+    records = split_records(text)
+    text_value = str(operation["text"])
+    final_sep = newline if records else (newline if text_value.endswith(("\n", "\r")) else "")
+    to_insert = block_records(text_value, newline, final_sep)
+    return (join_records(to_insert + records), len(to_insert))
+
+
+def apply_append(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int]:
+    records = split_records(text)
+    text_value = str(operation["text"])
+    final_sep = newline if text_value.endswith(("\n", "\r")) else ""
+    to_insert = block_records(text_value, newline, final_sep)
+    if records and records[-1][1] == "":
+        records[-1] = (records[-1][0], newline)
+    return (join_records(records + to_insert), len(to_insert))
+
+
 def apply_delete_line(text: str, operation: Dict[str, Any]) -> Tuple[str, int]:
     records = split_records(text)
     line = int(operation["line"])
@@ -418,6 +436,10 @@ def apply_operation(text: str, operation: Dict[str, Any], newline: str) -> Tuple
         new_text, changed = apply_regex_edit(text, operation, newline)
     elif op == "insert":
         new_text, changed = apply_insert(text, operation, newline)
+    elif op == "prepend":
+        new_text, changed = apply_prepend(text, operation, newline)
+    elif op == "append":
+        new_text, changed = apply_append(text, operation, newline)
     elif op == "delete":
         new_text, changed = apply_delete_line(text, operation)
     elif op == "delete-lines":
@@ -513,6 +535,35 @@ def read_target(path: Path, max_bytes: int) -> bytes:
     return path.read_bytes()
 
 
+def inspect_target(path: Path, original: bytes, encoding: EncodingInfo, text: str) -> Dict[str, Any]:
+    newline_style, line_counts, mixed_line_endings = detect_line_ending(text)
+    records = split_records(text)
+    mode = stat.S_IMODE(path.stat().st_mode)
+    return {
+        "file": str(path),
+        "command": "inspect",
+        "sizeBytes": len(original),
+        "encoding": encoding.name,
+        "codec": encoding.codec,
+        "hasBom": bool(encoding.bom),
+        "bomBytes": encoding.bom.hex("-") if encoding.bom else "",
+        "lineEnding": newline_style,
+        "mixedLineEndings": mixed_line_endings,
+        "lineEndingCounts": line_counts,
+        "lineCount": len(records),
+        "endsWithNewline": bool(text.endswith(("\n", "\r"))),
+        "hasNul": "\x00" in text,
+        "permissionsOctal": oct(mode),
+        "dryRun": True,
+        "changed": 0,
+        "operations": [],
+        "backup": None,
+        "written": False,
+        "skipped": True,
+        "wouldChangeBytes": False,
+    }
+
+
 def atomic_replace(path: Path, data: bytes, keep_backup: bool) -> Optional[str]:
     directory = path.parent
     prefix = f".{path.name}.safe-edit."
@@ -600,10 +651,12 @@ def command_to_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]
             operation["first"] = args.first
             operation["no_op_ok"] = args.no_op_ok
             operation["literal_replacement"] = args.literal_replacement
-        elif args.command == "insert":
+        elif args.command in ("insert", "prepend", "append"):
             if args.line is None:
-                fail("missing --line")
-            operation["line"] = args.line
+                if args.command == "insert":
+                    fail("missing --line")
+            if args.command == "insert":
+                operation["line"] = args.line
             operation["text"] = resolve_cli_value(args, "text", True, stdin_taken=stdin_taken)
         elif args.command == "delete":
             if args.line is None:
@@ -636,7 +689,7 @@ def command_to_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]
         elif op == "regex":
             current["pattern"] = resolve_operation_value(current, "pattern", True, args.arg_encoding, base_dir)
             current["replacement"] = resolve_operation_value(current, "replacement", True, args.arg_encoding, base_dir)
-        elif op in ("insert", "replace-lines"):
+        elif op in ("insert", "prepend", "append", "replace-lines"):
             current["text"] = resolve_operation_value(current, "text", True, args.arg_encoding, base_dir)
         resolved.append(current)
     return resolved, base_dir
@@ -646,7 +699,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Safely edit one text file.")
     parser.add_argument(
         "command",
-        choices=("edit", "regex", "insert", "delete", "replace-lines", "delete-lines", "batch"),
+        choices=(
+            "inspect",
+            "edit",
+            "regex",
+            "insert",
+            "prepend",
+            "append",
+            "delete",
+            "replace-lines",
+            "delete-lines",
+            "batch",
+        ),
     )
     parser.add_argument("--file", required=True)
     parser.add_argument(
@@ -657,6 +721,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--arg-encoding", default="utf-8", help="encoding for --*-file and --ops-file")
     parser.add_argument("--backup", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force-write", action="store_true")
     parser.add_argument("--diff", action="store_true")
     parser.add_argument("--context", type=int, default=3)
     parser.add_argument("--allow-nul", action="store_true")
@@ -701,8 +766,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> Dict[str, Any]:
-    operations, _base_dir = command_to_operations(args)
     path = resolve_target_path(args.file, args.follow_symlink)
+    if args.command == "inspect":
+        original = read_target(path, args.max_bytes)
+        encoding = detect_encoding(original, args.encoding)
+        text = strict_decode(original, encoding)
+        return inspect_target(path, original, encoding, text)
+
+    operations, _base_dir = command_to_operations(args)
     lock_context = NullLock() if args.no_lock or args.dry_run else FileLock(path, args.lock_timeout)
 
     with lock_context:
@@ -734,16 +805,23 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "operations": operation_results,
             "dryRun": args.dry_run,
             "backup": None,
+            "written": False,
+            "skipped": False,
+            "wouldChangeBytes": output != original,
         }
         if args.diff:
             summary["diff"] = diff_text
 
         if not args.dry_run:
-            backup = atomic_replace(path, output, args.backup)
-            verification = path.read_bytes()
-            if verification != output:
-                fail("post-write verification failed: bytes on disk do not match intended output")
-            summary["backup"] = backup
+            if output == original and not args.force_write:
+                summary["skipped"] = True
+            else:
+                backup = atomic_replace(path, output, args.backup)
+                verification = path.read_bytes()
+                if verification != output:
+                    fail("post-write verification failed: bytes on disk do not match intended output")
+                summary["backup"] = backup
+                summary["written"] = True
         return summary
 
 
@@ -754,11 +832,24 @@ def emit_summary(summary: Dict[str, Any], as_json: bool) -> None:
     if "diff" in summary and summary["diff"]:
         print(summary["diff"])
     note = "DRY-RUN " if summary["dryRun"] else ""
+    if summary.get("command") == "inspect":
+        print(
+            f"Inspect: {summary['file']} "
+            f"(encoding={summary['encoding']}, lineEnding={summary['lineEnding']}, "
+            f"lines={summary['lineCount']}, bytes={summary['sizeBytes']})"
+        )
+        if summary["mixedLineEndings"]:
+            print(f"Warning: mixed line endings detected: {summary['lineEndingCounts']}", file=sys.stderr)
+        if summary["hasNul"]:
+            print("Warning: decoded text contains NUL bytes", file=sys.stderr)
+        return
     print(
         f"{note}Done: {summary['command']} on {summary['file']} "
         f"(encoding={summary['encoding']}, lineEnding={summary['lineEnding']}, "
         f"changed={summary['changed']})"
     )
+    if summary.get("skipped"):
+        print("Skipped write: output bytes are identical to the original")
     if summary["mixedLineEndings"]:
         print(f"Warning: mixed line endings detected: {summary['lineEndingCounts']}", file=sys.stderr)
     if summary["backup"]:
