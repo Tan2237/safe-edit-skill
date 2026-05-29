@@ -18,6 +18,11 @@
 - 支持备份目录/后缀自定义，以及 stale lock 自动清理。
 - 同目录临时文件写入、原子替换、写后字节校验，并带有协作锁以降低并发写入风险。
 - 如果变换后的字节和原文件完全一致，默认跳过写入，避免无意义的 mtime 和 Git 状态变化。
+- `stat` 简洁摘要，只显示编码、行尾、大小、行数，适合 AI Agent 快速查看。
+- `--explain-match-failure` 匹配失败时显示详细诊断，可视化空白差异。
+- `--anchor-pattern` 锚点定位替换，配合 `--offset-start/end` 实现相对行号定位。
+- `--interactive/-i` 交互确认模式，类似 `git add -p` 的 y/n/a/q/? 提示。
+- `--ignore-indent`、`--ignore-eol`、`--normalize-whitespace` 可控空白匹配放宽。
 - 附带 `unittest` 测试套件和 GitHub Actions，覆盖 Windows、Linux、macOS。
 
 ## 安装
@@ -55,6 +60,7 @@ skills/safe-edit/
 
 ```bash
 python safe_edit.py inspect --file path/to/file --json
+python safe_edit.py stat --file path/to/file
 python safe_edit.py convert --file path/to/file --to-encoding utf-8-bom --to-line-ending crlf --final-newline ensure
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --expected-count 1
 python safe_edit.py regex --file path/to/file --pattern "foo\\d+" --replacement "bar" --expected-count 1
@@ -63,7 +69,9 @@ python safe_edit.py prepend --file path/to/file --text-file header.txt
 python safe_edit.py append --file path/to/file --text-file footer.txt
 python safe_edit.py delete --file path/to/file --line 10
 python safe_edit.py replace-lines --file path/to/file --start 10 --end 20 --text-file block.txt
+python safe_edit.py replace-lines --file path/to/file --anchor-pattern "keyword" --offset-start +2 --offset-end +4 --text "new line"
 python safe_edit.py delete-lines --file path/to/file --start 10 --end 20
+python safe_edit.py edit --file path/to/file --old "foo" --new "bar" -i
 python safe_edit.py batch --file path/to/file --ops-file ops.json
 ```
 
@@ -97,6 +105,68 @@ python safe_edit.py convert --file a.cpp --trim-trailing-whitespace
 ```
 
 这些后处理选项也可以和 `edit`、`regex`、`batch` 等写入命令组合，做到一次读写内完成内容修改和格式规范化。
+
+## 锚点定位替换
+
+使用 `--anchor-pattern` 替代绝对行号，防止文件变动后改错位置：
+
+```bash
+python safe_edit.py replace-lines \
+  --file a.cpp \
+  --anchor-pattern "AcGePoint3d ptCenter" \
+  --offset-start +2 \
+  --offset-end +4 \
+  --text "new line"
+```
+
+可选参数：
+- `--anchor-occurrence N` - 当锚点匹配多处时指定第 N 个
+- `--offset-start +N/-N` - 相对锚点的起始偏移
+- `--offset-end +N/-N` - 相对锚点的结束偏移
+
+## 可控空白匹配
+
+放宽匹配条件，但保持行为可控：
+
+```bash
+python safe_edit.py edit --file a.cpp --old "    foo" --new "bar" --ignore-indent
+python safe_edit.py edit --file a.cpp --old "foo\r\nbar" --new "baz" --ignore-eol
+python safe_edit.py edit --file a.cpp --old "foo   bar" --new "baz" --normalize-whitespace
+```
+
+**原则**：只影响匹配，不影响替换内容。
+
+## 交互确认
+
+类似 `git add -p` 的交互模式：
+
+```bash
+python safe_edit.py edit --file a.cpp --old "foo" --new "bar" -i
+```
+
+提示选项：
+- `y` - 应用此修改
+- `n` - 跳过此修改
+- `a` - 应用全部剩余修改
+- `q` - 退出
+- `?` - 显示帮助
+
+## 匹配失败诊断
+
+```bash
+python safe_edit.py edit --file a.cpp --old "    foo" --new "bar" --explain-match-failure
+```
+
+输出：
+```
+Closest match found at line 284:
+EXPECTED:
+[SP][SP][SP][SP]foo
+ACTUAL:
+[TAB]foo
+Differences:
+- indentation uses tabs instead of spaces
+```
 
 ## 多行内容
 
@@ -181,6 +251,17 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 | `--first` | 只替换第一个匹配 |
 | `--count N` | 正则替换数量限制，`0` 表示全部 |
 | `--no-op-ok` | 允许没有匹配 |
+| `-i, --interactive` | 交互确认，y/n/a/q/? |
+| `--explain-match-failure` | 匹配失败时显示诊断 |
+| `--anchor-pattern` | 锚点定位模式 |
+| `--offset-start` | 起始偏移（如 +2、-1） |
+| `--offset-end` | 结束偏移 |
+| `--anchor-occurrence` | 消除锚点歧义 |
+| `--ignore-indent` | 匹配时忽略缩进 |
+| `--ignore-eol` | 匹配时忽略行尾 |
+| `--normalize-whitespace` | 连续空白视为相同 |
+| `--param-encoding` | `--arg-encoding` 别名 |
+| `--input-encoding` | `--arg-encoding` 别名 |
 | `--dry-run` | 只验证和预览，不写入 |
 | `--force-write` | 即使输出字节相同也强制写入 |
 | `--diff --context N` | 输出 unified diff |
