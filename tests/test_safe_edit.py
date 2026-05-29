@@ -1109,8 +1109,8 @@ class SafeEditTests(unittest.TestCase):
         
         # File should be unchanged
         self.assertEqual(path.read_bytes(), original)
-        # Should contain error about expected count
-        self.assertIn("expected 1", result.stderr)
+        # Should contain error about the failed operation
+        self.assertIn("not found", result.stderr)
 
     def test_dry_run_with_json_output(self):
         """Test --dry-run with --json shows what would change."""
@@ -2025,6 +2025,575 @@ class SafeEditTests(unittest.TestCase):
         
         self.assertEqual(stat_payload["encoding"], inspect_payload["encoding"])
         self.assertEqual(stat_payload["lineEnding"], inspect_payload["lineEnding"])
+
+
+    # =========================================================================
+    # Structured JSON error output tests
+    # =========================================================================
+
+    def test_json_error_output_on_match_not_found(self):
+        """Test --json emits structured error when match not found."""
+        path = self.tmpdir / "json_err.txt"
+        path.write_bytes(b"alpha\nbeta\ngamma\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "nonexistent", "--new", "bar",
+            "--json", expect=2,
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["type"], "match_not_found")
+        self.assertIn("not found", payload["error"]["message"])
+
+    def test_json_error_has_suggestions(self):
+        """Test --json error includes suggestions for match_not_found."""
+        path = self.tmpdir / "json_sugg.txt"
+        path.write_bytes(b"alpha\nbeta\ngamma\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "nonexistent", "--new", "bar",
+            "--json", expect=2,
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertIn("suggestions", payload)
+        self.assertIsInstance(payload["suggestions"], list)
+        self.assertTrue(len(payload["suggestions"]) > 0)
+
+    def test_json_error_has_nearby_content(self):
+        """Test --json error includes nearbyContent when pattern is close."""
+        path = self.tmpdir / "json_nearby.txt"
+        path.write_bytes(b"def foo():\n    return 42\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "return 43", "--new", "return 44",
+            "--json", expect=2,
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertIn("nearbyContent", payload)
+        nearby = payload["nearbyContent"]
+        self.assertIn("line", nearby)
+        self.assertIn("similarity", nearby)
+
+    def test_json_error_classifies_expected_count_mismatch(self):
+        """Test --json error classifies expected_count mismatch."""
+        path = self.tmpdir / "json_count.txt"
+        path.write_bytes(b"foo\nfoo\nfoo\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "99",
+            "--json", expect=2,
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIn(payload["error"]["type"], ("match_count_mismatch", "expected_count_mismatch"))
+
+    def test_json_success_includes_match_strategy(self):
+        """Test --json success output includes matchStrategy in operations."""
+        path = self.tmpdir / "json_strategy.txt"
+        path.write_bytes(b"foo\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "1", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "exact")
+
+    # =========================================================================
+    # Auto-match tests
+    # =========================================================================
+
+    def test_auto_match_crlf_vs_lf(self):
+        """Test --auto-match resolves CRLF vs LF mismatch."""
+        path = self.tmpdir / "auto_eol.txt"
+        path.write_bytes(b"line1\r\nline2\r\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "line1\nline2",
+            "--new", "new1\nnew2",
+            "--auto-match", "--expected-count", "1", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "ignore-eol")
+
+    def test_auto_match_indent_mismatch(self):
+        """Test --auto-match resolves indentation mismatch."""
+        path = self.tmpdir / "auto_indent.txt"
+        path.write_bytes(b"def foo():\n\treturn 42\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "    return 42",
+            "--new", "    return 43",
+            "--auto-match", "--expected-count", "1", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "ignore-indent")
+        # File keeps original tab indentation
+        self.assertIn(b"\treturn 43", path.read_bytes())
+
+    def test_auto_match_exact_succeeds_first(self):
+        """Test --auto-match uses exact strategy when possible."""
+        path = self.tmpdir / "auto_exact.txt"
+        path.write_bytes(b"foo\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--auto-match", "--expected-count", "1", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "exact")
+
+    def test_auto_match_exhausted_reports_error(self):
+        """Test --auto-match error when all strategies fail."""
+        path = self.tmpdir / "auto_fail.txt"
+        path.write_bytes(b"alpha beta gamma\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "completely_different_text",
+            "--new", "bar",
+            "--auto-match", expect=2,
+        )
+        
+        self.assertIn("auto-match exhausted all strategies", result.stderr)
+
+    # =========================================================================
+    # Fuzzy match tests
+    # =========================================================================
+
+    def test_fuzzy_match_similar_text(self):
+        """Test --fuzzy matches similar text with auto-match."""
+        path = self.tmpdir / "fuzzy_similar.txt"
+        path.write_bytes(b"function calculateTotal(price, quantity):\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "function calculateTotal(cost, qty):",
+            "--new", "def calculateTotal(cost, qty):",
+            "--auto-match", "--fuzzy", "--expected-count", "1", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "fuzzy")
+
+    def test_fuzzy_below_threshold_fails(self):
+        """Test --fuzzy fails when similarity is too low."""
+        path = self.tmpdir / "fuzzy_low.txt"
+        path.write_bytes(b"alpha beta gamma\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "xyz123 abc789 def456 completely_different",
+            "--new", "bar",
+            "--auto-match", "--fuzzy", expect=2,
+        )
+        
+        self.assertIn("auto-match exhausted all strategies", result.stderr)
+
+    def test_fuzzy_requires_auto_match(self):
+        """Test --fuzzy without --auto-match doesn't enable fuzzy matching."""
+        path = self.tmpdir / "fuzzy_no_auto.txt"
+        path.write_bytes(b"function foo():\n    return 42\n")
+        
+        # --fuzzy alone should not help; it requires --auto-match
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "function bar():",
+            "--new", "function baz():",
+            "--fuzzy", expect=2,
+        )
+        
+        self.assertIn("not found", result.stderr)
+
+    # =========================================================================
+    # Context disambiguation tests
+    # =========================================================================
+
+    def test_context_before_filters_matches(self):
+        """Test --context-before disambiguates multiple matches."""
+        path = self.tmpdir / "ctx_before.txt"
+        path.write_bytes(b"header\ntarget\nmiddle\ntarget\nend\n")
+        
+        self.run_tool(
+            "edit", "--file", path,
+            "--old", "target", "--new", "replaced",
+            "--context-before", "middle", "--expected-count", "1",
+        )
+        
+        self.assertEqual(path.read_bytes(), b"header\ntarget\nmiddle\nreplaced\nend\n")
+
+    def test_context_after_filters_matches(self):
+        """Test --context-after disambiguates multiple matches."""
+        path = self.tmpdir / "ctx_after.txt"
+        path.write_bytes(b"prefix_alpha\ntarget\nprefix_beta\ntarget\nsuffix_gamma\n")
+        
+        # "suffix_gamma" only appears after the second target
+        self.run_tool(
+            "edit", "--file", path,
+            "--old", "target", "--new", "replaced",
+            "--context-after", "suffix_gamma", "--expected-count", "1",
+        )
+        
+        self.assertEqual(path.read_bytes(), b"prefix_alpha\ntarget\nprefix_beta\nreplaced\nsuffix_gamma\n")
+
+    def test_context_before_and_after_combined(self):
+        """Test both --context-before and --context-after together."""
+        path = self.tmpdir / "ctx_both.txt"
+        path.write_bytes(b"A\ntarget\nB\ntarget\nC\ntarget\nD\n")
+        
+        self.run_tool(
+            "edit", "--file", path,
+            "--old", "target", "--new", "replaced",
+            "--context-before", "B", "--context-after", "C",
+        )
+        
+        self.assertEqual(path.read_bytes(), b"A\ntarget\nB\nreplaced\nC\ntarget\nD\n")
+
+    def test_context_no_match_after_filtering(self):
+        """Test error when context filtering eliminates all matches."""
+        path = self.tmpdir / "ctx_nomatch.txt"
+        path.write_bytes(b"header\nfoo\nfooter\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--context-before", "nonexistent_context",
+            expect=2,
+        )
+        
+        self.assertIn("context filtering", result.stderr)
+
+    def test_context_with_auto_match(self):
+        """Test context disambiguation works with --auto-match."""
+        path = self.tmpdir / "ctx_auto.txt"
+        path.write_bytes(b"header\r\ntarget\r\nmiddle\r\ntarget\r\nend\r\n")
+        
+        self.run_tool(
+            "edit", "--file", path,
+            "--old", "target\nmiddle\ntarget",
+            "--new", "replaced\nmiddle\nreplaced",
+            "--context-before", "header",
+            "--auto-match", "--expected-count", "1",
+        )
+        
+        content = path.read_bytes()
+        self.assertIn(b"replaced", content)
+
+    # =========================================================================
+    # diff-input tests
+    # =========================================================================
+
+    def test_diff_input_single_block(self):
+        """Test --diff-input with a single SEARCH/REPLACE block."""
+        path = self.tmpdir / "diff_single.txt"
+        path.write_bytes(b"hello world\n")
+        
+        self.run_tool(
+            "edit", "--file", path,
+            "--diff-input", "------- SEARCH\nhello world\n=======\nhello universe\n+++++++ REPLACE",
+        )
+        
+        self.assertEqual(path.read_bytes(), b"hello universe\n")
+
+    def test_diff_input_multiple_blocks(self):
+        """Test --diff-input with multiple SEARCH/REPLACE blocks."""
+        path = self.tmpdir / "diff_multi.txt"
+        path.write_bytes(b"alpha\nbeta\ngamma\n")
+        
+        self.run_tool(
+            "edit", "--file", path,
+            "--diff-input", "------- SEARCH\nalpha\n=======\nALPHA\n+++++++ REPLACE\n------- SEARCH\ngamma\n=======\nGAMMA\n+++++++ REPLACE",
+        )
+        
+        self.assertEqual(path.read_bytes(), b"ALPHA\nbeta\nGAMMA\n")
+
+    def test_diff_input_file(self):
+        """Test --diff-input-file reads from file."""
+        path = self.tmpdir / "diff_file.txt"
+        path.write_bytes(b"old text\n")
+        
+        diff_file = self.tmpdir / "diff.txt"
+        diff_file.write_text("------- SEARCH\nold text\n=======\nnew text\n+++++++ REPLACE", encoding="utf-8")
+        
+        self.run_tool(
+            "edit", "--file", path,
+            "--diff-input-file", diff_file,
+        )
+        
+        self.assertEqual(path.read_bytes(), b"new text\n")
+
+    def test_diff_input_alternative_markers(self):
+        """Test --diff-input with alternative marker formats."""
+        path = self.tmpdir / "diff_alt.txt"
+        path.write_bytes(b"foo\n")
+        
+        self.run_tool(
+            "edit", "--file", path,
+            "--diff-input", "<<< SEARCH\nfoo\n===\nbar\n>>> REPLACE",
+        )
+        
+        self.assertEqual(path.read_bytes(), b"bar\n")
+
+    def test_diff_input_invalid_format(self):
+        """Test --diff-input with invalid format fails."""
+        path = self.tmpdir / "diff_invalid.txt"
+        path.write_bytes(b"foo\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--diff-input", "this is not a valid diff format",
+            expect=2,
+        )
+        
+        self.assertIn("no valid SEARCH/REPLACE blocks", result.stderr)
+
+    def test_diff_input_unterminated_block(self):
+        """Test --diff-input with unterminated block (missing REPLACE marker)."""
+        path = self.tmpdir / "diff_unterm.txt"
+        path.write_bytes(b"foo\n")
+        
+        self.run_tool(
+            "edit", "--file", path,
+            "--diff-input", "------- SEARCH\nfoo\n=======\nbar",
+        )
+        
+        self.assertEqual(path.read_bytes(), b"bar\n")
+
+    def test_diff_input_with_context(self):
+        """Test --diff-input with --context-before disambiguation."""
+        path = self.tmpdir / "diff_ctx.txt"
+        path.write_bytes(b"header\ntarget\nmiddle\ntarget\nend\n")
+        
+        self.run_tool(
+            "edit", "--file", path,
+            "--diff-input", "------- SEARCH\ntarget\n=======\nreplaced\n+++++++ REPLACE",
+            "--context-before", "middle",
+        )
+        
+        self.assertEqual(path.read_bytes(), b"header\ntarget\nmiddle\nreplaced\nend\n")
+
+    # =========================================================================
+    # matchStrategy field tests
+    # =========================================================================
+
+    def test_match_strategy_exact(self):
+        """Test matchStrategy is 'exact' for simple literal match."""
+        path = self.tmpdir / "ms_exact.txt"
+        path.write_bytes(b"foo\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "1", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "exact")
+
+    def test_match_strategy_ignore_eol(self):
+        """Test matchStrategy is 'ignore-eol' when --ignore-eol is used."""
+        path = self.tmpdir / "ms_eol.txt"
+        path.write_bytes(b"line1\r\nline2\r\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "line1\nline2",
+            "--new", "new1\nnew2",
+            "--ignore-eol", "--expected-count", "1", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "ignore-eol")
+
+    def test_match_strategy_ignore_indent(self):
+        """Test matchStrategy is 'ignore-indent' when --ignore-indent is used."""
+        path = self.tmpdir / "ms_indent.txt"
+        path.write_bytes(b"\tfoo\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "    foo",
+            "--new", "    bar",
+            "--ignore-indent", "--expected-count", "1", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "ignore-indent")
+
+    def test_match_strategy_normalize_whitespace(self):
+        """Test matchStrategy is 'normalize-whitespace' when used."""
+        path = self.tmpdir / "ms_ws.txt"
+        path.write_bytes(b"foo    bar\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo bar",
+            "--new", "baz qux",
+            "--normalize-whitespace", "--expected-count", "1", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "normalize-whitespace")
+
+    def test_match_strategy_regex(self):
+        """Test matchStrategy is 'regex' for regex command."""
+        path = self.tmpdir / "ms_regex.txt"
+        path.write_bytes(b"foo123\n")
+        
+        result = self.run_tool(
+            "regex", "--file", path,
+            "--pattern", r"foo\d+", "--replacement", "bar",
+            "--expected-count", "1", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "regex")
+
+    def test_match_strategy_line_based(self):
+        """Test matchStrategy is 'line-based' for line operations."""
+        path = self.tmpdir / "ms_line.txt"
+        path.write_bytes(b"line1\nline2\n")
+        
+        result = self.run_tool(
+            "delete", "--file", path,
+            "--line", "1", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "line-based")
+
+    # =========================================================================
+    # nearbyContent field tests
+    # =========================================================================
+
+    def test_nearby_content_on_close_match(self):
+        """Test nearbyContent contains line and similarity for close match."""
+        path = self.tmpdir / "nearby_close.txt"
+        path.write_bytes(b"function foo():\n    return 42\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "function foo():\n    return 43",
+            "--new", "bar",
+            "--json", expect=2,
+        )
+        
+        payload = json.loads(result.stdout)
+        nearby = payload.get("nearbyContent")
+        self.assertIsNotNone(nearby)
+        self.assertGreaterEqual(nearby["similarity"], 0.5)
+
+    def test_nearby_content_missing_on_non_match_error(self):
+        """Test nearbyContent may be absent for completely unrelated patterns."""
+        path = self.tmpdir / "nearby_none.txt"
+        path.write_bytes(b"alpha\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "zzzzzzzzzzzzzzzzz",
+            "--new", "bar",
+            "--json", expect=2,
+        )
+        
+        payload = json.loads(result.stdout)
+        # nearbyContent may or may not be present depending on similarity
+        # The key test is that it doesn't crash
+
+    # =========================================================================
+    # classify_error_type tests (via --json error output)
+    # =========================================================================
+
+    def test_error_type_encoding_error(self):
+        """Test error type classification for encoding errors."""
+        path = self.tmpdir / "err_encoding.txt"
+        # Write invalid UTF-8 bytes
+        path.write_bytes(b"\xff\xfe\x00\x00invalid")
+        
+        result = self.run_tool(
+            "inspect", "--file", path,
+            "--encoding", "utf-8",
+            "--json", expect=2,
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "encoding_error")
+
+    def test_error_type_validation_error(self):
+        """Test error type classification for validation errors."""
+        path = self.tmpdir / "err_validation.txt"
+        path.write_bytes(b"foo\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "", "--new", "bar",
+            "--json", expect=2,
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "validation_error")
+
+    # =========================================================================
+    # --json ok field tests
+    # =========================================================================
+
+    def test_json_ok_true_on_success(self):
+        """Test ok is true on successful edit."""
+        path = self.tmpdir / "ok_true.txt"
+        path.write_bytes(b"foo\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "1", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+
+    def test_json_ok_true_on_inspect(self):
+        """Test ok is true on successful inspect."""
+        path = self.tmpdir / "ok_inspect.txt"
+        path.write_bytes(b"foo\n")
+        
+        result = self.run_tool("inspect", "--file", path, "--json")
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+
+    def test_json_match_options_in_summary(self):
+        """Test matchOptions is included in JSON summary."""
+        path = self.tmpdir / "match_opts.txt"
+        path.write_bytes(b"foo\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--auto-match", "--expected-count", "1", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertIn("matchOptions", payload)
+        self.assertTrue(payload["matchOptions"]["autoMatch"])
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@
 
 - 单文件 Python 标准库实现，Windows/Linux/macOS 通用。
 - `inspect` 只检查不写入，可输出编码、BOM、行尾统计、文件大小、行数、NUL 字符和权限位。
+- `stat` 简洁摘要，只显示编码、行尾、大小、行数，适合 AI Agent 快速查看。
 - `convert` 显式转换编码、行尾、最终换行，或清理尾随空白；普通编辑默认仍保留原格式。
 - 自动检测并保留 `utf-8`、`utf-8-bom`、`gbk`、UTF-16 BOM，以及清晰 NUL 模式下的无 BOM UTF-16。
 - 支持手动指定 `shift-jis`、`big5`、`latin-1`、`utf-16-le`、`utf-16-be`。
@@ -15,10 +16,14 @@
 - 支持字面量替换、显式正则替换、插入行、文件头追加、文件尾追加、删除行、替换行范围、删除行范围。
 - 支持 `--old-file`、`--new-file`、`--text-file`、stdin 等方式传入大段/多行内容。
 - 支持 `--dry-run --diff` 预览、`--expected-count` 防误匹配、`--backup` 备份、JSON batch 一次读写多步编辑。
+- **结构化 JSON 错误输出**：`--json` 模式下错误也输出 JSON，包含错误类型分类、建议和附近内容片段。
+- **匹配级别报告**：成功时在 operations 中报告 `matchStrategy`（exact、ignore-eol、ignore-indent、fuzzy 等）。
+- **自动容错匹配**：`--auto-match` 精确匹配失败后自动尝试宽松匹配（ignore-eol → ignore-indent → normalize-whitespace），`--fuzzy` 启用模糊匹配。
+- **上下文消歧**：`--context-before` / `--context-after` 辅助多匹配消歧。
+- **SEARCH/REPLACE 输入格式**：`--diff-input` / `--diff-input-file` 支持 Agent 友好的 diff 格式输入。
 - 支持备份目录/后缀自定义，以及 stale lock 自动清理。
 - 同目录临时文件写入、原子替换、写后字节校验，并带有协作锁以降低并发写入风险。
 - 如果变换后的字节和原文件完全一致，默认跳过写入，避免无意义的 mtime 和 Git 状态变化。
-- `stat` 简洁摘要，只显示编码、行尾、大小、行数，适合 AI Agent 快速查看。
 - `--explain-match-failure` 匹配失败时显示详细诊断，可视化空白差异。
 - `--anchor-pattern` 锚点定位替换，配合 `--offset-start/end` 实现相对行号定位。
 - `--interactive/-i` 交互确认模式，类似 `git add -p` 的 y/n/a/q/? 提示。
@@ -63,6 +68,12 @@ python safe_edit.py inspect --file path/to/file --json
 python safe_edit.py stat --file path/to/file
 python safe_edit.py convert --file path/to/file --to-encoding utf-8-bom --to-line-ending crlf --final-newline ensure
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --expected-count 1
+python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --expected-count 1
+python safe_edit.py edit --file path/to/file --diff-input "------- SEARCH
+foo
+=======
+bar
++++++++ REPLACE"
 python safe_edit.py regex --file path/to/file --pattern "foo\\d+" --replacement "bar" --expected-count 1
 python safe_edit.py insert --file path/to/file --line 10 --text "new line"
 python safe_edit.py prepend --file path/to/file --text-file header.txt
@@ -74,6 +85,87 @@ python safe_edit.py delete-lines --file path/to/file --start 10 --end 20
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" -i
 python safe_edit.py batch --file path/to/file --ops-file ops.json
 ```
+
+## 自动容错匹配
+
+精确匹配失败时，使用 `--auto-match` 自动尝试宽松匹配策略：
+
+```bash
+# 自动尝试: exact → ignore-eol → ignore-indent → normalize-whitespace
+python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --expected-count 1
+```
+
+启用模糊匹配作为最后手段（相似度 ≥ 0.6）：
+
+```bash
+python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --fuzzy --expected-count 1
+```
+
+**关键安全约束**：自动容错在输出中报告使用的匹配级别（`matchStrategy` 字段），不会静默降级。
+
+## 结构化 JSON 输出
+
+`--json` 模式下，成功和失败都输出结构化 JSON：
+
+```bash
+# 成功时包含 matchStrategy
+python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --expected-count 1 --json
+
+# 失败时输出错误类型、建议和附近内容
+python safe_edit.py edit --file path/to/file --old "missing" --new "bar" --json
+```
+
+错误类型包括：`match_not_found`、`match_ambiguous`、`match_count_mismatch`、`encoding_error`、`file_error`、`lock_error`、`validation_error`、`format_error`、`unknown`。
+
+## 上下文消歧
+
+当 `--old` 出现多次时，用上下文文本过滤：
+
+```bash
+# 只替换 "target" 前面有 "middle" 的那次
+python safe_edit.py edit --file path/to/file --old "target" --new "replaced" \
+  --context-before "middle" --expected-count 1
+
+# 只替换 "target" 后面有 "suffix" 的那次
+python safe_edit.py edit --file path/to/file --old "target" --new "replaced" \
+  --context-after "suffix" --expected-count 1
+```
+
+上下文匹配在匹配位置附近的窗口内搜索（不搜索整个文件），使用子串包含。
+
+## SEARCH/REPLACE 输入格式
+
+Agent 友好的 diff 格式，一个字符串包含所有编辑信息：
+
+```bash
+python safe_edit.py edit --file path/to/file --diff-input "------- SEARCH
+old text
+=======
+new text
++++++++ REPLACE"
+```
+
+支持多块编辑：
+
+```bash
+python safe_edit.py edit --file path/to/file --diff-input "------- SEARCH
+first_old
+=======
+first_new
++++++++ REPLACE
+------- SEARCH
+second_old
+=======
+second_new
++++++++ REPLACE"
+```
+
+也支持从文件读取：`--diff-input-file diff.txt`
+
+标记格式灵活（3个以上 `-`/`<`/`=`/`+`/`>` 均可，不区分大小写）：
+- 搜索开始：`------- SEARCH` / `<<< SEARCH`
+- 分隔符：`=======` / `===`
+- 替换结束：`+++++++ REPLACE` / `>>> REPLACE`
 
 ## 预览和防误操作
 
@@ -306,6 +398,12 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 | `--no-op-ok` | 允许没有匹配 |
 | `-i, --interactive` | 交互确认，y/n/a/q/? |
 | `--explain-match-failure` | 匹配失败时显示诊断 |
+| `--auto-match` | 自动容错匹配（exact → ignore-eol → ignore-indent → normalize-whitespace） |
+| `--fuzzy` | 启用模糊匹配（需配合 `--auto-match`，相似度 ≥ 0.6） |
+| `--context-before T` | 匹配位置前面必须包含的文本 |
+| `--context-after T` | 匹配位置后面必须包含的文本 |
+| `--diff-input TEXT` | SEARCH/REPLACE 格式输入 |
+| `--diff-input-file PATH` | 从文件读取 SEARCH/REPLACE 格式 |
 | `--anchor-pattern` | 锚点定位模式 |
 | `--offset-start` | 起始偏移（如 +2、-1） |
 | `--offset-end` | 结束偏移 |
@@ -321,7 +419,7 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 | `--backup` | 写入前创建时间戳备份 |
 | `--backup-dir DIR` | 把备份放到指定目录 |
 | `--backup-suffix SUFFIX` | 自定义备份后缀，支持 `{timestamp}` |
-| `--json` | 输出机器可读状态 |
+| `--json` | 输出机器可读状态（成功和失败均输出 JSON） |
 | `--follow-symlink` | 编辑符号链接目标 |
 | `--max-bytes N` | 覆盖默认 50 MiB 文件大小限制 |
 | `--lock-timeout N` | 等待 safe-edit 协作锁，默认 10 秒 |

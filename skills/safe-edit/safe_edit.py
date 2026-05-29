@@ -46,6 +46,74 @@ def fail(message: str) -> None:
     raise SafeEditError(message)
 
 
+def classify_error_type(message: str) -> str:
+    """Classify a SafeEditError message into a structured error type.
+    
+    Returns one of:
+    - "match_not_found": old text / regex pattern not found in file
+    - "match_ambiguous": multiple matches when one expected
+    - "match_count_mismatch": expected_count doesn't match actual
+    - "encoding_error": encoding/decoding failure
+    - "file_error": file I/O or path issue
+    - "validation_error": invalid arguments or constraint violation
+    - "lock_error": file lock contention
+    - "unknown": unclassified error
+    """
+    msg = message.lower()
+    if "was not found" in msg or "not found" in msg and "refusing" in msg:
+        return "match_not_found"
+    if "anchor pattern found" in msg and "times" in msg:
+        return "match_ambiguous"
+    if "expected" in msg and "occurrence" in msg or "match" in msg and "found" in msg:
+        return "match_count_mismatch"
+    if "decode" in msg or "encode" in msg or "encoding" in msg or "bom" in msg:
+        return "encoding_error"
+    if "file not found" in msg or "not a regular" in msg or "symlink" in msg or "failed to read" in msg or "failed to" in msg and "file" in msg:
+        return "file_error"
+    if "lock" in msg:
+        return "lock_error"
+    if "diff-input format" in msg or "search/replace" in msg:
+        return "format_error"
+    if "must" in msg or "requires" in msg or "missing" in msg or "unsupported" in msg or "invalid" in msg or "out of range" in msg:
+        return "validation_error"
+    return "unknown"
+
+
+def emit_json_error(
+    exc: SafeEditError,
+    file_path: str = "",
+    command: str = "",
+    *,
+    suggestions: Optional[List[Dict[str, Any]]] = None,
+    nearby_content: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Emit a structured JSON error object to stdout for Agent consumption.
+    
+    This ensures that even on failure, --json mode returns parseable JSON
+    with actionable information for automatic retry.
+    """
+    error_type = classify_error_type(str(exc))
+    error_obj: Dict[str, Any] = {
+        "ok": False,
+        "error": {
+            "type": error_type,
+            "message": str(exc),
+        },
+        "file": file_path,
+        "command": command,
+        "changed": 0,
+        "operations": [],
+        "dryRun": False,
+        "written": False,
+        "skipped": False,
+    }
+    if suggestions:
+        error_obj["suggestions"] = suggestions
+    if nearby_content:
+        error_obj["nearbyContent"] = nearby_content
+    print(json.dumps(error_obj, ensure_ascii=False, sort_keys=True))
+
+
 def visualize_whitespace(text: str) -> str:
     """Convert whitespace characters to visible symbols for debugging."""
     return (
@@ -127,6 +195,49 @@ def find_closest_match(text: str, pattern: str, max_lines: int = 10) -> Optional
         return (best_start + 1, fragment_text)  # 1-based line number
     
     return None
+
+
+def extract_nearby_content(
+    text: str,
+    pattern: str,
+    context_lines: int = 5,
+) -> Optional[Dict[str, Any]]:
+    """Extract content near the closest match for Agent retry.
+    
+    Returns a dict with:
+    - line: 1-based line number of closest match
+    - content: the nearby content snippet
+    - similarity: 0.0-1.0 similarity score
+    
+    Or None if no reasonable match found.
+    """
+    result = find_closest_match(text, pattern)
+    if result is None:
+        return None
+    
+    line_num, fragment = result
+    text_lines = text.splitlines()
+    
+    # Calculate similarity score
+    pattern_lines = pattern.splitlines()
+    if len(pattern_lines) == 1:
+        matcher = difflib.SequenceMatcher(None, pattern, fragment)
+        similarity = matcher.ratio()
+    else:
+        fragment_lines = fragment.splitlines()
+        matcher = difflib.SequenceMatcher(None, pattern_lines, fragment_lines)
+        similarity = matcher.ratio()
+    
+    # Extract context around the match
+    start = max(0, line_num - 1 - context_lines)
+    end = min(len(text_lines), line_num - 1 + len(pattern_lines) + context_lines)
+    context = "\n".join(text_lines[start:end])
+    
+    return {
+        "line": line_num,
+        "content": context,
+        "similarity": round(similarity, 3),
+    }
 
 
 def explain_match_failure(expected: str, actual_text: str, context_lines: int = 3) -> str:
@@ -556,29 +667,309 @@ def resolve_operation_value(
     return read_argument_file(str(file_path), arg_encoding)
 
 
+def _determine_match_strategy(ignore_indent: bool, ignore_eol: bool, normalize_whitespace: bool) -> str:
+    """Return a human-readable match strategy label for JSON output."""
+    if normalize_whitespace:
+        return "normalize-whitespace"
+    if ignore_indent and ignore_eol:
+        return "ignore-indent+ignore-eol"
+    if ignore_indent:
+        return "ignore-indent"
+    if ignore_eol:
+        return "ignore-eol"
+    return "exact"
+
+
+# The auto-match cascade: each entry is (strategy_label, ignore_indent, ignore_eol, normalize_whitespace)
+_AUTO_MATCH_PIPELINE: List[Tuple[str, bool, bool, bool]] = [
+    ("exact", False, False, False),
+    ("ignore-eol", False, True, False),
+    ("ignore-indent", True, False, False),
+    ("ignore-indent+ignore-eol", True, True, False),
+    ("normalize-whitespace", False, False, True),
+]
+
+
+def apply_literal_edit_cascade(
+    text: str,
+    operation: Dict[str, Any],
+    newline: str,
+    explain: bool = False,
+    fuzzy: bool = False,
+    context_before: Optional[str] = None,
+    context_after: Optional[str] = None,
+) -> Tuple[str, int, str]:
+    """Apply a literal edit with automatic progressive relaxation of match strictness.
+    
+    Tries each match strategy in order from most strict to most relaxed:
+      exact → ignore-eol → ignore-indent → ignore-indent+ignore-eol → normalize-whitespace
+    
+    If --fuzzy is enabled and all above fail, attempts a fuzzy match using
+    find_closest_match() with similarity >= 0.6.
+    
+    Returns (new_text, changed_count, match_strategy) where match_strategy
+    indicates which level succeeded.
+    
+    Raises SafeEditError if no level can find a match.
+    """
+    last_error: Optional[SafeEditError] = None
+    
+    for strategy_label, ignore_indent, ignore_eol, normalize_whitespace in _AUTO_MATCH_PIPELINE:
+        try:
+            new_text, changed, _ = apply_literal_edit(
+                text, operation, newline,
+                explain=False,  # suppress per-level explanation; we'll report the final one
+                ignore_indent=ignore_indent,
+                ignore_eol=ignore_eol,
+                normalize_whitespace=normalize_whitespace,
+                match_strategy=strategy_label,
+                context_before=context_before,
+                context_after=context_after,
+            )
+            # Success — return with the strategy that worked
+            return (new_text, changed, strategy_label)
+        except SafeEditError as exc:
+            # Only catch "not found" errors; let other errors (count mismatch, etc.) propagate
+            if "was not found" not in str(exc) and "not found" not in str(exc):
+                raise
+            last_error = exc
+            continue
+    
+    # All normalization levels failed — try fuzzy if enabled
+    if fuzzy:
+        old = str(operation["old"])
+        result = find_closest_match(text, old)
+        if result is not None:
+            line_num, fragment = result
+            pattern_lines = old.splitlines()
+            if len(pattern_lines) == 1:
+                matcher = difflib.SequenceMatcher(None, old, fragment)
+                similarity = matcher.ratio()
+            else:
+                fragment_lines = fragment.splitlines()
+                matcher = difflib.SequenceMatcher(None, pattern_lines, fragment_lines)
+                similarity = matcher.ratio()
+            
+            if similarity >= 0.6:
+                # Fuzzy match found — replace the closest match
+                new = normalize_user_newlines(str(operation["new"]), newline)
+                new_text = text.replace(fragment, new, 1)
+                return (new_text, 1, "fuzzy")
+    
+    # Nothing worked — raise the original error (with explanation if requested)
+    if last_error is not None:
+        if explain:
+            old = str(operation["old"])
+            explanation = explain_match_failure(old, text)
+            fail(f"old text was not found (auto-match exhausted all strategies); refusing a silent no-op\n\n{explanation}")
+        else:
+            fail("old text was not found (auto-match exhausted all strategies); refusing a silent no-op")
+    raise last_error  # type: ignore[misc]
+
+
+def parse_diff_input(diff_text: str) -> List[Dict[str, Any]]:
+    """Parse SEARCH/REPLACE diff format into a list of edit operations.
+    
+    Supported marker formats (case-insensitive, flexible marker length):
+      ------- SEARCH  /  =======  /  +++++++ REPLACE
+      --- SEARCH      /  ===      /  +++ REPLACE
+      <<< SEARCH      /  ===      /  >>> REPLACE
+    
+    Multiple SEARCH/REPLACE blocks are allowed in one input.
+    
+    Returns:
+        List of {"op": "edit", "old": "...", "new": "..."} dicts.
+    
+    Raises:
+        SafeEditError if format is invalid or no valid blocks found.
+    """
+    operations: List[Dict[str, Any]] = []
+    lines = diff_text.split('\n')
+    
+    search_open_re = re.compile(r'^[-<]{3,}\s*SEARCH\s*$', re.IGNORECASE)
+    separator_re = re.compile(r'^={3,}\s*$', re.IGNORECASE)
+    replace_close_re = re.compile(r'^[+>]{3,}\s*REPLACE\s*$', re.IGNORECASE)
+    
+    state = 'outside'
+    old_lines: List[str] = []
+    new_lines: List[str] = []
+    
+    for line in lines:
+        if state == 'outside':
+            if search_open_re.match(line):
+                state = 'search'
+                old_lines = []
+                new_lines = []
+        elif state == 'search':
+            if separator_re.match(line):
+                state = 'replace'
+            else:
+                old_lines.append(line)
+        elif state == 'replace':
+            if replace_close_re.match(line):
+                old_text = '\n'.join(old_lines)
+                new_text = '\n'.join(new_lines)
+                if old_text:
+                    operations.append({"op": "edit", "old": old_text, "new": new_text})
+                state = 'outside'
+            else:
+                new_lines.append(line)
+    
+    # Handle unterminated block (missing REPLACE marker)
+    if state == 'replace' and old_lines:
+        old_text = '\n'.join(old_lines)
+        new_text = '\n'.join(new_lines)
+        if old_text:
+            operations.append({"op": "edit", "old": old_text, "new": new_text})
+    
+    if not operations:
+        fail("invalid diff-input format: no valid SEARCH/REPLACE blocks found")
+    
+    return operations
+
+
+def _apply_edit_with_context(
+    text: str,
+    old: str,
+    new: str,
+    normalized_text: str,
+    normalized_old: str,
+    operation: Dict[str, Any],
+    effective_strategy: str,
+    explain: bool,
+    ignore_indent: bool,
+    ignore_eol: bool,
+    normalize_whitespace: bool,
+    context_before: str,
+    context_after: str,
+) -> Tuple[str, int, str]:
+    """Apply a literal edit with context-based disambiguation.
+    
+    When --context-before or --context-after is specified, find all matches,
+    filter by context text, and replace only context-matching occurrences.
+    Context matching uses substring containment (``in`` operator).
+    """
+    # Find all match positions
+    if ignore_indent or ignore_eol or normalize_whitespace:
+        positions: List[Tuple[int, int]] = []
+        search_start = 0
+        search_start_orig = 0
+        while True:
+            norm_pos = normalized_text.find(normalized_old, search_start)
+            if norm_pos < 0:
+                break
+            original_pos, original_len = find_original_position(
+                text, normalized_text, norm_pos, normalized_old, old,
+                ignore_indent, ignore_eol, normalize_whitespace,
+                start_search_pos=search_start_orig,
+            )
+            if original_pos >= 0:
+                positions.append((original_pos, original_len))
+                search_start_orig = original_pos + original_len
+            search_start = norm_pos + len(normalized_old)
+    else:
+        positions = []
+        start = 0
+        while True:
+            pos = text.find(old, start)
+            if pos < 0:
+                break
+            positions.append((pos, len(old)))
+            start = pos + len(old)
+    
+    # Filter by context (search within a window near the match, not the entire file)
+    old_line_count = max(1, old.count('\n') + 1)
+    ctx_window = max(old_line_count, 2)  # lines of context to check
+    filtered: List[Tuple[int, int]] = []
+    for pos, length in positions:
+        if context_before:
+            # Check only the few lines immediately before the match
+            before_text = text[:pos]
+            before_lines = before_text.split('\n')
+            window = '\n'.join(before_lines[-ctx_window:])
+            if context_before not in window:
+                continue
+        if context_after:
+            # Check only the few lines immediately after the match
+            after_text = text[pos + length:]
+            after_lines = after_text.split('\n')
+            window = '\n'.join(after_lines[:ctx_window])
+            if context_after not in window:
+                continue
+        filtered.append((pos, length))
+    
+    # Check expected_count against filtered matches
+    expected = operation.get("expected_count")
+    # When filtered is empty, always report "not found" regardless of expected_count
+    if len(filtered) == 0 and not bool(operation.get("no_op_ok", False)):
+        if explain:
+            explanation = explain_match_failure(old, text)
+            fail(f"old text was not found (after context filtering); refusing a silent no-op\n\n{explanation}")
+        else:
+            fail("old text was not found (after context filtering); refusing a silent no-op")
+    if expected is not None and len(filtered) != int(expected):
+        fail(f"expected {expected} occurrence(s) after context filtering, found {len(filtered)}")
+    
+    # Apply --first if specified
+    use_first = bool(operation.get("first", False))
+    matches_to_replace = filtered[:1] if use_first else filtered
+    
+    # Replace from end to start to preserve positions
+    result_text = text
+    count_replaced = 0
+    for pos, length in sorted(matches_to_replace, key=lambda x: x[0], reverse=True):
+        original_matched = result_text[pos:pos + length]
+        adjusted_new = adjust_replacement_for_indent(original_matched, new, ignore_indent)
+        result_text = result_text[:pos] + adjusted_new + result_text[pos + length:]
+        count_replaced += 1
+    
+    return (result_text, count_replaced, effective_strategy)
+
+
 def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, explain: bool = False, 
-                        ignore_indent: bool = False, ignore_eol: bool = False, normalize_whitespace: bool = False) -> Tuple[str, int]:
+                        ignore_indent: bool = False, ignore_eol: bool = False, normalize_whitespace: bool = False,
+                        match_strategy: Optional[str] = None, context_before: Optional[str] = None,
+                        context_after: Optional[str] = None) -> Tuple[str, int, str]:
+    """Apply a literal text replacement.
+    
+    Returns (new_text, changed_count, match_strategy).
+    match_strategy indicates how the match was performed (e.g. "exact", "ignore-eol").
+    """
     old = str(operation["old"])
     new = normalize_user_newlines(str(operation["new"]), newline)
     if old == "":
         fail("old text must not be empty")
+    
+    # Determine and record the effective match strategy
+    effective_strategy = match_strategy or _determine_match_strategy(ignore_indent, ignore_eol, normalize_whitespace)
     
     # Apply controlled whitespace normalization for matching only
     # The replacement text (new) is NOT normalized - it's used as-is
     normalized_text = normalize_for_match(text, ignore_indent, ignore_eol, normalize_whitespace)
     normalized_old = normalize_for_match(old, ignore_indent, ignore_eol, normalize_whitespace)
     
+    # If context filtering is needed, delegate to position-based approach
+    if context_before or context_after:
+        return _apply_edit_with_context(
+            text, old, new, normalized_text, normalized_old,
+            operation, effective_strategy, explain,
+            ignore_indent, ignore_eol, normalize_whitespace,
+            context_before, context_after,
+        )
+    
     # Count matches using normalized versions
     actual = normalized_text.count(normalized_old)
     expected = operation.get("expected_count")
-    if expected is not None and actual != int(expected):
-        fail(f"expected {expected} occurrence(s), found {actual}")
+    # When actual is 0, always report "not found" regardless of expected_count
+    # (the real problem is missing text, not wrong count)
     if actual == 0 and not bool(operation.get("no_op_ok", False)):
         if explain:
             explanation = explain_match_failure(old, text)
             fail(f"old text was not found; refusing a silent no-op\n\n{explanation}")
         else:
             fail("old text was not found; refusing a silent no-op")
+    if expected is not None and actual != int(expected):
+        fail(f"expected {expected} occurrence(s), found {actual}")
     
     # Perform replacement on original text (not normalized)
     # We need to find the actual positions in the original text
@@ -634,11 +1025,11 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
                 result_text = result_text[:original_pos] + adjusted_new + result_text[original_pos + original_len:]
                 count_replaced += 1
         
-        return (result_text, count_replaced)
+        return (result_text, count_replaced, effective_strategy)
     else:
         # No normalization - use original simple logic
         count = 1 if bool(operation.get("first", False)) else -1
-        return (text.replace(old, new, count), min(actual, 1) if count == 1 else actual)
+        return (text.replace(old, new, count), min(actual, 1) if count == 1 else actual, effective_strategy)
 
 
 def find_original_position(original_text: str, normalized_text: str, norm_pos: int, 
@@ -727,7 +1118,7 @@ def adjust_replacement_for_indent(original_matched: str, new_text: str, ignore_i
     return new_text
 
 
-def apply_regex_edit(text: str, operation: Dict[str, Any], newline: str, explain: bool = False) -> Tuple[str, int]:
+def apply_regex_edit(text: str, operation: Dict[str, Any], newline: str, explain: bool = False) -> Tuple[str, int, str]:
     pattern = str(operation["pattern"])
     replacement = normalize_user_newlines(str(operation["replacement"]), newline)
     flags = parse_regex_flags(str(operation.get("flags", "")))
@@ -752,14 +1143,16 @@ def apply_regex_edit(text: str, operation: Dict[str, Any], newline: str, explain
     if bool(operation.get("first", False)):
         count = 1
     if bool(operation.get("literal_replacement", False)):
-        return compiled.subn(lambda _match: replacement, text, count=count)
+        new_text, n = compiled.subn(lambda _match: replacement, text, count=count)
+        return (new_text, n, "regex")
     try:
-        return compiled.subn(replacement, text, count=count)
+        new_text, n = compiled.subn(replacement, text, count=count)
+        return (new_text, n, "regex")
     except re.error as exc:
         fail(f"invalid regex replacement: {exc}")
 
 
-def apply_insert(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int]:
+def apply_insert(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int, str]:
     records = split_records(text)
     line = int(operation["line"])
     line_count = len(records)
@@ -774,35 +1167,35 @@ def apply_insert(text: str, operation: Dict[str, Any], newline: str) -> Tuple[st
     index = line - 1
     if records and index == len(records) and records[-1][1] == "":
         records[-1] = (records[-1][0], newline)
-    return (join_records(records[:index] + to_insert + records[index:]), len(to_insert))
+    return (join_records(records[:index] + to_insert + records[index:]), len(to_insert), "line-based")
 
 
-def apply_prepend(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int]:
+def apply_prepend(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int, str]:
     records = split_records(text)
     text_value = str(operation["text"])
     final_sep = newline if records else (newline if text_value.endswith(("\n", "\r")) else "")
     to_insert = block_records(text_value, newline, final_sep)
-    return (join_records(to_insert + records), len(to_insert))
+    return (join_records(to_insert + records), len(to_insert), "line-based")
 
 
-def apply_append(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int]:
+def apply_append(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int, str]:
     records = split_records(text)
     text_value = str(operation["text"])
     final_sep = newline if text_value.endswith(("\n", "\r")) else ""
     to_insert = block_records(text_value, newline, final_sep)
     if records and records[-1][1] == "":
         records[-1] = (records[-1][0], newline)
-    return (join_records(records + to_insert), len(to_insert))
+    return (join_records(records + to_insert), len(to_insert), "line-based")
 
 
-def apply_delete_line(text: str, operation: Dict[str, Any]) -> Tuple[str, int]:
+def apply_delete_line(text: str, operation: Dict[str, Any]) -> Tuple[str, int, str]:
     records = split_records(text)
     line = int(operation["line"])
     line_count = len(records)
     if line < 1 or line > line_count:
         fail(f"line must be between 1 and {line_count}, got {line}")
     index = line - 1
-    return (join_records(records[:index] + records[index + 1 :]), 1)
+    return (join_records(records[:index] + records[index + 1 :]), 1, "line-based")
 
 
 def range_bounds(operation: Dict[str, Any], records: List[Tuple[str, str]], text: str = "") -> Tuple[int, int]:
@@ -854,45 +1247,59 @@ def range_bounds(operation: Dict[str, Any], records: List[Tuple[str, str]], text
     return (start - 1, end)
 
 
-def apply_delete_lines(text: str, operation: Dict[str, Any]) -> Tuple[str, int]:
+def apply_delete_lines(text: str, operation: Dict[str, Any]) -> Tuple[str, int, str]:
     records = split_records(text)
     start, end = range_bounds(operation, records, text)
-    return (join_records(records[:start] + records[end:]), end - start)
+    return (join_records(records[:start] + records[end:]), end - start, "line-based")
 
 
-def apply_replace_lines(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int]:
+def apply_replace_lines(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int, str]:
     records = split_records(text)
     start, end = range_bounds(operation, records, text)
     following_exists = end < len(records)
     original_final_sep = records[end - 1][1] if end > start else newline
     final_sep = newline if following_exists else original_final_sep
     replacement = block_records(str(operation["text"]), newline, final_sep)
-    return (join_records(records[:start] + replacement + records[end:]), end - start)
+    return (join_records(records[:start] + replacement + records[end:]), end - start, "line-based")
 
 
 def apply_operation(text: str, operation: Dict[str, Any], newline: str, explain: bool = False,
-                    ignore_indent: bool = False, ignore_eol: bool = False, normalize_whitespace: bool = False) -> Tuple[str, int, str]:
+                    ignore_indent: bool = False, ignore_eol: bool = False, normalize_whitespace: bool = False,
+                    auto_match: bool = False, fuzzy: bool = False,
+                    context_before: Optional[str] = None, context_after: Optional[str] = None) -> Tuple[str, int, str, str]:
+    """Apply a single operation and return (new_text, changed_count, op_name, match_strategy).
+    
+    match_strategy is "exact", "ignore-eol", "ignore-indent", "normalize-whitespace",
+    "regex", "line-based", or "fuzzy" — indicating how matching was performed.
+    """
     op = str(operation.get("op") or operation.get("command") or "").replace("_", "-")
+    match_strategy = "exact"  # default
     if op == "edit":
-        new_text, changed = apply_literal_edit(text, operation, newline, explain, 
-                                                ignore_indent, ignore_eol, normalize_whitespace)
+        if auto_match:
+            new_text, changed, match_strategy = apply_literal_edit_cascade(
+                text, operation, newline, explain=explain, fuzzy=fuzzy,
+                context_before=context_before, context_after=context_after)
+        else:
+            new_text, changed, match_strategy = apply_literal_edit(text, operation, newline, explain, 
+                                                    ignore_indent, ignore_eol, normalize_whitespace,
+                                                    context_before=context_before, context_after=context_after)
     elif op == "regex":
-        new_text, changed = apply_regex_edit(text, operation, newline, explain)
+        new_text, changed, match_strategy = apply_regex_edit(text, operation, newline, explain)
     elif op == "insert":
-        new_text, changed = apply_insert(text, operation, newline)
+        new_text, changed, match_strategy = apply_insert(text, operation, newline)
     elif op == "prepend":
-        new_text, changed = apply_prepend(text, operation, newline)
+        new_text, changed, match_strategy = apply_prepend(text, operation, newline)
     elif op == "append":
-        new_text, changed = apply_append(text, operation, newline)
+        new_text, changed, match_strategy = apply_append(text, operation, newline)
     elif op == "delete":
-        new_text, changed = apply_delete_line(text, operation)
+        new_text, changed, match_strategy = apply_delete_line(text, operation)
     elif op == "delete-lines":
-        new_text, changed = apply_delete_lines(text, operation)
+        new_text, changed, match_strategy = apply_delete_lines(text, operation)
     elif op == "replace-lines":
-        new_text, changed = apply_replace_lines(text, operation, newline)
+        new_text, changed, match_strategy = apply_replace_lines(text, operation, newline)
     else:
         fail(f"unknown operation: {op or '<missing>'}")
-    return (new_text, changed, op)
+    return (new_text, changed, op, match_strategy)
 
 
 def apply_post_transforms(text: str, args: argparse.Namespace, newline: str) -> str:
@@ -1085,6 +1492,7 @@ def inspect_target(path: Path, original: bytes, encoding: EncodingInfo, text: st
     records = split_records(text)
     mode = stat.S_IMODE(path.stat().st_mode)
     return {
+        "ok": True,
         "file": str(path),
         "command": "inspect",
         "sizeBytes": len(original),
@@ -1114,6 +1522,7 @@ def stat_target(path: Path, original: bytes, encoding: EncodingInfo, text: str) 
     newline_style, _line_counts, _mixed_line_endings = detect_line_ending(text)
     records = split_records(text)
     return {
+        "ok": True,
         "file": str(path),
         "command": "stat",
         "encoding": encoding.name,
@@ -1212,6 +1621,44 @@ def load_batch_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]
 
 
 def command_to_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Optional[Path]]:
+    # Handle --diff-input: parse SEARCH/REPLACE format into edit operations
+    diff_input = getattr(args, 'diff_input', None)
+    diff_input_file = getattr(args, 'diff_input_file', None)
+    if diff_input or diff_input_file:
+        if diff_input and diff_input_file:
+            fail("use only one of --diff-input or --diff-input-file")
+        if diff_input:
+            raw_diff = diff_input
+            base_dir = None
+        else:
+            diff_path = Path(diff_input_file)
+            raw_diff = read_argument_file(str(diff_path), args.arg_encoding)
+            base_dir = diff_path.parent
+        operations = parse_diff_input(raw_diff)
+        # Add context_before/context_after and expected_count/first/no_op_ok to each operation
+        for op in operations:
+            if getattr(args, 'context_before', None):
+                op["context_before"] = args.context_before
+            if getattr(args, 'context_after', None):
+                op["context_after"] = args.context_after
+            if args.expected_count is not None:
+                op["expected_count"] = args.expected_count
+            if args.first:
+                op["first"] = True
+            if args.no_op_ok:
+                op["no_op_ok"] = True
+        # Resolve file-based values in each operation
+        resolved: List[Dict[str, Any]] = []
+        for operation in operations:
+            current = dict(operation)
+            op = str(current.get("op") or "").replace("_", "-")
+            current["op"] = op
+            if op == "edit":
+                current["old"] = resolve_operation_value(current, "old", True, args.arg_encoding, base_dir)
+                current["new"] = resolve_operation_value(current, "new", True, args.arg_encoding, base_dir)
+            resolved.append(current)
+        return resolved, base_dir
+    
     if args.command == "batch":
         operations, base_dir = load_batch_operations(args)
     elif args.command == "convert":
@@ -1226,6 +1673,10 @@ def command_to_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]
             operation["expected_count"] = args.expected_count
             operation["first"] = args.first
             operation["no_op_ok"] = args.no_op_ok
+            if getattr(args, 'context_before', None):
+                operation["context_before"] = args.context_before
+            if getattr(args, 'context_after', None):
+                operation["context_after"] = args.context_after
         elif args.command == "regex":
             operation["pattern"] = resolve_cli_value(args, "pattern", True, stdin_taken=stdin_taken)
             operation["replacement"] = resolve_cli_value(args, "replacement", True, stdin_taken=stdin_taken)
@@ -1382,6 +1833,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help="ignore line ending differences when matching (CRLF vs LF)")
     parser.add_argument("--normalize-whitespace", action="store_true",
                         help="treat consecutive whitespace as equivalent when matching")
+    parser.add_argument("--auto-match", action="store_true",
+                        help="automatically try progressively relaxed matching: exact → ignore-eol → ignore-indent → normalize-whitespace")
+    parser.add_argument("--fuzzy", action="store_true",
+                        help="enable fuzzy matching as last resort (requires --auto-match, similarity >= 0.6)")
+    parser.add_argument("--context-before",
+                        help="text that must appear before the match for disambiguation")
+    parser.add_argument("--context-after",
+                        help="text that must appear after the match for disambiguation")
+    parser.add_argument("--diff-input",
+                        help="SEARCH/REPLACE diff format input for edit operations")
+    parser.add_argument("--diff-input-file",
+                        help="read SEARCH/REPLACE diff from file")
 
     parser.add_argument("--line", type=int)
     parser.add_argument("--start", type=int)
@@ -1451,10 +1914,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         ignore_indent = getattr(args, "ignore_indent", False)
         ignore_eol = getattr(args, "ignore_eol", False)
         normalize_whitespace = getattr(args, "normalize_whitespace", False)
+        auto_match = getattr(args, "auto_match", False)
+        fuzzy = getattr(args, "fuzzy", False)
+        context_before = getattr(args, "context_before", None)
+        context_after = getattr(args, "context_after", None)
         for index, operation in enumerate(operations, start=1):
-            new_text, changed, op = apply_operation(new_text, operation, newline, explain,
-                                                     ignore_indent, ignore_eol, normalize_whitespace)
-            operation_results.append({"index": index, "op": op, "changed": changed})
+            # Per-operation context_before/context_after overrides global
+            op_ctx_before = operation.get("context_before", context_before)
+            op_ctx_after = operation.get("context_after", context_after)
+            new_text, changed, op, match_strategy = apply_operation(new_text, operation, newline, explain,
+                                                     ignore_indent, ignore_eol, normalize_whitespace,
+                                                     auto_match=auto_match, fuzzy=fuzzy,
+                                                     context_before=op_ctx_before, context_after=op_ctx_after)
+            operation_results.append({"index": index, "op": op, "changed": changed, "matchStrategy": match_strategy})
 
         new_text = apply_post_transforms(new_text, args, newline)
         output_encoding = encoding_for_output(args.to_encoding, encoding)
@@ -1462,6 +1934,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         output_line_ending, output_line_counts, output_mixed_line_endings = detect_line_ending(new_text)
         diff_text = generate_diff(path, text, new_text, args.context) if args.diff else ""
         summary: Dict[str, Any] = {
+            "ok": True,
             "file": str(path),
             "command": args.command,
             "encoding": encoding.name,
@@ -1479,6 +1952,13 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 "toLineEnding": args.to_line_ending,
                 "finalNewline": args.final_newline,
                 "trimTrailingWhitespace": bool(args.trim_trailing_whitespace),
+            },
+            "matchOptions": {
+                "autoMatch": auto_match,
+                "fuzzy": fuzzy,
+                "ignoreIndent": ignore_indent,
+                "ignoreEol": ignore_eol,
+                "normalizeWhitespace": normalize_whitespace,
             },
             "dryRun": args.dry_run,
             "backup": None,
@@ -1571,7 +2051,51 @@ def main(argv: List[str]) -> int:
         emit_summary(summary, args.json)
         return 0
     except SafeEditError as exc:
-        print(f"safe-edit: {exc}", file=sys.stderr)
+        if args.json:
+            # When --json is active, emit structured JSON error for Agent consumption
+            file_path = args.file if hasattr(args, 'file') else ""
+            command = args.command if hasattr(args, 'command') else ""
+            
+            suggestions = None
+            nearby_content = None
+            
+            # For match_not_found errors, extract nearby content for retry
+            error_type = classify_error_type(str(exc))
+            if error_type == "match_not_found":
+                suggestions = [
+                    {"action": "retry_with_ignore_eol", "description": "Retry with --ignore-eol to tolerate CRLF/LF differences"},
+                    {"action": "retry_with_ignore_indent", "description": "Retry with --ignore-indent to tolerate indentation differences"},
+                    {"action": "retry_with_normalize_whitespace", "description": "Retry with --normalize-whitespace to tolerate whitespace differences"},
+                ]
+                # Try to extract nearby content from the file
+                try:
+                    path = resolve_target_path(file_path, getattr(args, 'follow_symlink', False))
+                    original = read_target(path, getattr(args, 'max_bytes', 50 * 1024 * 1024))
+                    encoding = detect_encoding(original, getattr(args, 'encoding', 'auto'))
+                    text = strict_decode(original, encoding)
+                    
+                    # Determine the search pattern from the operation
+                    pattern = ""
+                    if command == "edit":
+                        pattern = getattr(args, 'old', '') or ""
+                    elif command == "regex":
+                        pattern = getattr(args, 'pattern', '') or ""
+                    
+                    if pattern:
+                        nearby_content = extract_nearby_content(text, pattern)
+                except Exception:
+                    # If we can't read the file for nearby content, just skip it
+                    pass
+            
+            emit_json_error(
+                exc,
+                file_path=file_path,
+                command=command,
+                suggestions=suggestions,
+                nearby_content=nearby_content,
+            )
+        else:
+            print(f"safe-edit: {exc}", file=sys.stderr)
         return 2
 
 
