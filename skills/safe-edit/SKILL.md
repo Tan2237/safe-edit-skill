@@ -122,6 +122,7 @@ The same post-transform flags can be combined with `edit`, `regex`, `batch`, and
 - `--first`: replace only the first literal/regex match.
 - `--count N`: regex replacement limit; `0` means all.
 - `--no-op-ok`: allow replacement text or pattern not to be found.
+- `--explain-match-failure`: show detailed diagnostics when a match fails (see below).
 - `--dry-run`: validate and transform in memory without writing.
 - `--force-write`: write even when output bytes are identical to the original.
 - `--diff --context N`: emit unified diff preview.
@@ -135,3 +136,94 @@ The same post-transform flags can be combined with `edit`, `regex`, `batch`, and
 - `--lock-stale-seconds N`: remove a safe-edit lock older than `N` seconds.
 - `--no-lock`: skip the cooperative lock.
 - `--json`: emit machine-readable status.
+
+## Match Failure Diagnostics
+
+When `--old` text is not found, use `--explain-match-failure` to get detailed diagnostics:
+
+```bash
+python safe_edit.py edit --file code.cpp --old "    return 42" --new "    return 43" --explain-match-failure
+```
+
+Output example when the file uses tabs instead of spaces:
+
+```
+safe-edit: old text was not found; refusing a silent no-op
+
+Match failed. Closest match found:
+  at line 2:
+
+EXPECTED:
+  [SP][SP][SP][SP]return[SP]42
+
+ACTUAL:
+  [TAB]return[SP]42
+
+Differences:
+  - line 1: indentation uses tabs instead of spaces
+```
+
+The diagnostic shows:
+- Line number of the closest match
+- Expected pattern with whitespace visualized (`[SP]` = space, `[TAB]` = tab, `[CR]` = carriage return, `[LF]` = line feed)
+- Actual content at that location
+- Specific differences detected (indentation type, line endings, etc.)
+
+## Anchor-Based Line Positioning
+
+For `replace-lines` and `delete-lines`, use anchor patterns to position relative to a context line instead of absolute line numbers:
+
+```bash
+# Replace lines relative to an anchor pattern
+python safe_edit.py replace-lines --file code.cpp \
+    --anchor-pattern "AcGePoint3d ptCenter" \
+    --offset-start "+2" \
+    --offset-end "+3" \
+    --text "new_line"
+
+# Delete lines relative to an anchor
+python safe_edit.py delete-lines --file code.cpp \
+    --anchor-pattern "AcGePoint3d ptCenter" \
+    --offset-start "+2" \
+    --offset-end "+3"
+```
+
+### Anchor Options
+
+- `--anchor-pattern "PATTERN"`: Literal text to search for as the anchor point.
+- `--offset-start +N/-N`: Start line offset from anchor. `+2` means 2 lines after anchor; `-1` means 1 line before.
+- `--offset-end +N/-N`: End line offset from anchor (inclusive).
+- `--anchor-occurrence N`: Use the Nth occurrence when the pattern appears multiple times (1-based).
+
+### Example
+
+Given a file:
+```
+header
+AcGePoint3d ptCenter
+line1
+line2
+line3
+footer
+```
+
+The command `--anchor-pattern "AcGePoint3d ptCenter" --offset-start "+2" --offset-end "+3"` targets lines 4-5 (line2 and line3), because:
+- Anchor "AcGePoint3d ptCenter" is at line 2
+- `+2` offset = line 4
+- `+3` offset = line 5
+
+### Disambiguation
+
+When the anchor pattern appears multiple times, use `--anchor-occurrence`:
+
+```bash
+# Use the second occurrence of the pattern
+python safe_edit.py replace-lines --file code.cpp \
+    --anchor-pattern "pattern" \
+    --anchor-occurrence 2 \
+    --offset-start "+1" \
+    --offset-end "+1" \
+    --text "new"
+```
+
+Without `--anchor-occurrence`, the command fails with a message showing all match locations.

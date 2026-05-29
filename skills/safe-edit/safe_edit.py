@@ -46,6 +46,189 @@ def fail(message: str) -> None:
     raise SafeEditError(message)
 
 
+def visualize_whitespace(text: str) -> str:
+    """Convert whitespace characters to visible symbols for debugging."""
+    return (
+        text.replace("\t", "[TAB]")
+        .replace(" ", "[SP]")
+        .replace("\r", "[CR]")
+        .replace("\n", "[LF]\n")
+    )
+
+
+def find_closest_match(text: str, pattern: str, max_lines: int = 10) -> Optional[Tuple[int, str]]:
+    """Find the closest matching fragment in text for a pattern.
+    
+    Returns (line_number, fragment) or None if no reasonable match found.
+    Uses difflib to find the most similar substring.
+    """
+    if not pattern or not text:
+        return None
+    
+    # Split pattern into lines for comparison
+    pattern_lines = pattern.splitlines()
+    if not pattern_lines:
+        return None
+    
+    text_lines = text.splitlines()
+    pattern_len = len(pattern_lines)
+    
+    # For single-line patterns, do character-level comparison with each line
+    if pattern_len == 1:
+        best_score = 0.0
+        best_line = 0
+        best_fragment = ""
+        
+        for i, line in enumerate(text_lines):
+            # Check if pattern is substring of line
+            if pattern in line:
+                return (i + 1, line)
+            
+            # Check if line is substring of pattern
+            if line in pattern:
+                score = len(line) / len(pattern)
+                if score > best_score:
+                    best_score = score
+                    best_line = i
+                    best_fragment = line
+                continue
+            
+            # Character-level similarity
+            matcher = difflib.SequenceMatcher(None, pattern, line)
+            score = matcher.ratio()
+            if score > best_score:
+                best_score = score
+                best_line = i
+                best_fragment = line
+        
+        # Lower threshold for single-line patterns (30% instead of 50%)
+        if best_score >= 0.3:
+            return (best_line + 1, best_fragment)
+        
+        return None
+    
+    # Multi-line pattern matching
+    best_score = 0.0
+    best_start = 0
+    
+    for i in range(len(text_lines) - pattern_len + 1):
+        fragment = text_lines[i:i + pattern_len]
+        # Calculate similarity using SequenceMatcher
+        matcher = difflib.SequenceMatcher(None, pattern_lines, fragment)
+        score = matcher.ratio()
+        if score > best_score:
+            best_score = score
+            best_start = i
+    
+    # Only return if we found something reasonably close (>= 50% similar)
+    if best_score >= 0.5:
+        fragment_lines = text_lines[best_start:best_start + pattern_len]
+        fragment_text = "\n".join(fragment_lines)
+        return (best_start + 1, fragment_text)  # 1-based line number
+    
+    return None
+
+
+def explain_match_failure(expected: str, actual_text: str, context_lines: int = 3) -> str:
+    """Generate a detailed explanation of why a match failed."""
+    lines = []
+    lines.append("Match failed. Closest match found:")
+    
+    result = find_closest_match(actual_text, expected)
+    if result:
+        line_num, fragment = result
+        lines.append(f"  at line {line_num}:")
+        lines.append("")
+        lines.append("EXPECTED:")
+        for line in expected.splitlines()[:context_lines]:
+            lines.append(f"  {visualize_whitespace(line)}")
+        if len(expected.splitlines()) > context_lines:
+            lines.append("  ...")
+        
+        lines.append("")
+        lines.append("ACTUAL:")
+        for line in fragment.splitlines()[:context_lines]:
+            lines.append(f"  {visualize_whitespace(line)}")
+        if len(fragment.splitlines()) > context_lines:
+            lines.append("  ...")
+        
+        # Analyze differences
+        lines.append("")
+        lines.append("Differences:")
+        
+        expected_lines = expected.splitlines()
+        actual_lines = fragment.splitlines()
+        
+        # Check indentation
+        for i, (e, a) in enumerate(zip(expected_lines[:3], actual_lines[:3])):
+            e_indent = len(e) - len(e.lstrip())
+            a_indent = len(a) - len(a.lstrip())
+            if e_indent != a_indent:
+                e_ws = e[:e_indent]
+                a_ws = a[:a_indent]
+                if '\t' in a_ws and '\t' not in e_ws:
+                    lines.append(f"  - line {i+1}: indentation uses tabs instead of spaces")
+                elif ' ' in a_ws and '\t' not in a_ws and '\t' in e_ws:
+                    lines.append(f"  - line {i+1}: indentation uses spaces instead of tabs")
+                else:
+                    lines.append(f"  - line {i+1}: indentation differs ({e_indent} vs {a_indent} chars)")
+        
+        # Check line ending
+        if '\r\n' in expected and '\r\n' not in fragment:
+            lines.append("  - line ending differs (expected CRLF, found LF)")
+        elif '\r\n' not in expected and '\r\n' in fragment:
+            lines.append("  - line ending differs (expected LF, found CRLF)")
+        
+        # Check for missing/extra lines
+        if len(expected_lines) != len(actual_lines):
+            lines.append(f"  - line count differs (expected {len(expected_lines)}, found {len(actual_lines)})")
+    else:
+        lines.append("  No close match found in file.")
+    
+    return "\n".join(lines)
+
+
+def find_context_anchor(text: str, context_pattern: str, occurrence: Optional[int] = None) -> int:
+    """Find the line number of a context anchor pattern.
+    
+    Args:
+        text: The file content
+        context_pattern: The pattern to search for (literal match)
+        occurrence: Which occurrence to use (1-based). If None and multiple matches, raises error.
+    
+    Returns:
+        1-based line number where the anchor was found
+    
+    Raises:
+        SafeEditError if pattern not found or ambiguous
+    """
+    lines = text.splitlines()
+    matches = []
+    
+    for i, line in enumerate(lines):
+        if context_pattern in line:
+            matches.append(i + 1)  # 1-based line number
+    
+    if len(matches) == 0:
+        fail(f"anchor pattern not found: {context_pattern}")
+    
+    if occurrence is None:
+        if len(matches) > 1:
+            fail(
+                f"anchor pattern found {len(matches)} times at lines {matches}; "
+                f"use --anchor-occurrence to disambiguate"
+            )
+        return matches[0]
+    
+    if occurrence < 1 or occurrence > len(matches):
+        fail(
+            f"anchor-occurrence {occurrence} out of range; "
+            f"pattern found {len(matches)} times at lines {matches}"
+        )
+    
+    return matches[occurrence - 1]
+
+
 def normalize_encoding(value: Optional[str]) -> str:
     value = (value or "auto").lower().replace("_", "-")
     aliases = {
@@ -343,7 +526,7 @@ def resolve_operation_value(
     return read_argument_file(str(file_path), arg_encoding)
 
 
-def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int]:
+def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, explain: bool = False) -> Tuple[str, int]:
     old = str(operation["old"])
     new = normalize_user_newlines(str(operation["new"]), newline)
     if old == "":
@@ -353,12 +536,16 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str) -> Tu
     if expected is not None and actual != int(expected):
         fail(f"expected {expected} occurrence(s), found {actual}")
     if actual == 0 and not bool(operation.get("no_op_ok", False)):
-        fail("old text was not found; refusing a silent no-op")
+        if explain:
+            explanation = explain_match_failure(old, text)
+            fail(f"old text was not found; refusing a silent no-op\n\n{explanation}")
+        else:
+            fail("old text was not found; refusing a silent no-op")
     count = 1 if bool(operation.get("first", False)) else -1
     return (text.replace(old, new, count), min(actual, 1) if count == 1 else actual)
 
 
-def apply_regex_edit(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int]:
+def apply_regex_edit(text: str, operation: Dict[str, Any], newline: str, explain: bool = False) -> Tuple[str, int]:
     pattern = str(operation["pattern"])
     replacement = normalize_user_newlines(str(operation["replacement"]), newline)
     flags = parse_regex_flags(str(operation.get("flags", "")))
@@ -372,7 +559,12 @@ def apply_regex_edit(text: str, operation: Dict[str, Any], newline: str) -> Tupl
     if expected is not None and actual != int(expected):
         fail(f"expected {expected} regex match(es), found {actual}")
     if actual == 0 and not bool(operation.get("no_op_ok", False)):
-        fail("regex pattern was not found; refusing a silent no-op")
+        if explain:
+            # Try to find closest match using the pattern as literal text
+            explanation = explain_match_failure(pattern, text)
+            fail(f"regex pattern was not found; refusing a silent no-op\n\n{explanation}")
+        else:
+            fail("regex pattern was not found; refusing a silent no-op")
 
     count = int(operation.get("count", 0) or 0)
     if bool(operation.get("first", False)):
@@ -431,9 +623,46 @@ def apply_delete_line(text: str, operation: Dict[str, Any]) -> Tuple[str, int]:
     return (join_records(records[:index] + records[index + 1 :]), 1)
 
 
-def range_bounds(operation: Dict[str, Any], records: List[Tuple[str, str]]) -> Tuple[int, int]:
-    start = int(operation["start"])
-    end = int(operation["end"])
+def range_bounds(operation: Dict[str, Any], records: List[Tuple[str, str]], text: str = "") -> Tuple[int, int]:
+    """Calculate start and end bounds for line operations.
+    
+    Supports both absolute line numbers and anchor-based offsets.
+    """
+    # Check if anchor-based positioning is used
+    anchor_pattern = operation.get("anchor_pattern")
+    if anchor_pattern:
+        occurrence = operation.get("anchor_occurrence")
+        anchor_line = find_context_anchor(text, anchor_pattern, occurrence)
+        
+        # Parse offset values (can be like "+2", "-1", or absolute)
+        offset_start = operation.get("offset_start", 0)
+        offset_end = operation.get("offset_end", 0)
+        
+        # Convert string offsets to integers
+        if isinstance(offset_start, str):
+            if offset_start.startswith("+"):
+                start = anchor_line + int(offset_start[1:])
+            elif offset_start.startswith("-"):
+                start = anchor_line - int(offset_start[1:])
+            else:
+                start = int(offset_start)
+        else:
+            start = anchor_line + int(offset_start)
+        
+        if isinstance(offset_end, str):
+            if offset_end.startswith("+"):
+                end = anchor_line + int(offset_end[1:])
+            elif offset_end.startswith("-"):
+                end = anchor_line - int(offset_end[1:])
+            else:
+                end = int(offset_end)
+        else:
+            end = anchor_line + int(offset_end)
+    else:
+        # Traditional absolute line numbers
+        start = int(operation["start"])
+        end = int(operation["end"])
+    
     if start < 1:
         fail(f"start must be >= 1, got {start}")
     if end < start:
@@ -445,13 +674,13 @@ def range_bounds(operation: Dict[str, Any], records: List[Tuple[str, str]]) -> T
 
 def apply_delete_lines(text: str, operation: Dict[str, Any]) -> Tuple[str, int]:
     records = split_records(text)
-    start, end = range_bounds(operation, records)
+    start, end = range_bounds(operation, records, text)
     return (join_records(records[:start] + records[end:]), end - start)
 
 
 def apply_replace_lines(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int]:
     records = split_records(text)
-    start, end = range_bounds(operation, records)
+    start, end = range_bounds(operation, records, text)
     following_exists = end < len(records)
     original_final_sep = records[end - 1][1] if end > start else newline
     final_sep = newline if following_exists else original_final_sep
@@ -459,12 +688,12 @@ def apply_replace_lines(text: str, operation: Dict[str, Any], newline: str) -> T
     return (join_records(records[:start] + replacement + records[end:]), end - start)
 
 
-def apply_operation(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int, str]:
+def apply_operation(text: str, operation: Dict[str, Any], newline: str, explain: bool = False) -> Tuple[str, int, str]:
     op = str(operation.get("op") or operation.get("command") or "").replace("_", "-")
     if op == "edit":
-        new_text, changed = apply_literal_edit(text, operation, newline)
+        new_text, changed = apply_literal_edit(text, operation, newline, explain)
     elif op == "regex":
-        new_text, changed = apply_regex_edit(text, operation, newline)
+        new_text, changed = apply_regex_edit(text, operation, newline, explain)
     elif op == "insert":
         new_text, changed = apply_insert(text, operation, newline)
     elif op == "prepend":
@@ -740,16 +969,38 @@ def command_to_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]
                 fail("missing --line")
             operation["line"] = args.line
         elif args.command == "replace-lines":
-            if args.start is None or args.end is None:
-                fail("replace-lines requires --start and --end")
-            operation["start"] = args.start
-            operation["end"] = args.end
+            if args.start is None and args.end is None:
+                # Check if anchor-based positioning is used
+                if args.anchor_pattern is None:
+                    fail("replace-lines requires --start and --end, or --anchor-pattern with --offset-start and --offset-end")
+                if args.offset_start is None or args.offset_end is None:
+                    fail("replace-lines with --anchor-pattern requires --offset-start and --offset-end")
+                operation["anchor_pattern"] = args.anchor_pattern
+                operation["offset_start"] = args.offset_start
+                operation["offset_end"] = args.offset_end
+                operation["anchor_occurrence"] = args.anchor_occurrence
+            else:
+                if args.start is None or args.end is None:
+                    fail("replace-lines requires --start and --end")
+                operation["start"] = args.start
+                operation["end"] = args.end
             operation["text"] = resolve_cli_value(args, "text", True, stdin_taken=stdin_taken)
         elif args.command == "delete-lines":
-            if args.start is None or args.end is None:
-                fail("delete-lines requires --start and --end")
-            operation["start"] = args.start
-            operation["end"] = args.end
+            if args.start is None and args.end is None:
+                # Check if anchor-based positioning is used
+                if args.anchor_pattern is None:
+                    fail("delete-lines requires --start and --end, or --anchor-pattern with --offset-start and --offset-end")
+                if args.offset_start is None or args.offset_end is None:
+                    fail("delete-lines with --anchor-pattern requires --offset-start and --offset-end")
+                operation["anchor_pattern"] = args.anchor_pattern
+                operation["offset_start"] = args.offset_start
+                operation["offset_end"] = args.offset_end
+                operation["anchor_occurrence"] = args.anchor_occurrence
+            else:
+                if args.start is None or args.end is None:
+                    fail("delete-lines requires --start and --end")
+                operation["start"] = args.start
+                operation["end"] = args.end
         else:
             fail(f"unknown command: {args.command}")
         operations = [operation]
@@ -840,6 +1091,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-count", type=int)
     parser.add_argument("--first", action="store_true")
     parser.add_argument("--no-op-ok", action="store_true")
+    parser.add_argument("--explain-match-failure", action="store_true",
+                        help="show detailed diagnostics when match fails")
 
     parser.add_argument("--line", type=int)
     parser.add_argument("--start", type=int)
@@ -847,6 +1100,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text")
     parser.add_argument("--text-file")
     parser.add_argument("--text-stdin", action="store_true")
+    
+    parser.add_argument("--anchor-pattern", 
+                        help="context anchor pattern for relative line positioning")
+    parser.add_argument("--offset-start", 
+                        help="offset from anchor for start line (e.g., +2, -1)")
+    parser.add_argument("--offset-end",
+                        help="offset from anchor for end line (e.g., +4, -1)")
+    parser.add_argument("--anchor-occurrence", type=int,
+                        help="which occurrence of anchor pattern to use (1-based)")
 
     parser.add_argument("--ops")
     parser.add_argument("--ops-file")
@@ -884,8 +1146,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
         new_text = text
         operation_results: List[Dict[str, Any]] = []
+        explain = getattr(args, "explain_match_failure", False)
         for index, operation in enumerate(operations, start=1):
-            new_text, changed, op = apply_operation(new_text, operation, newline)
+            new_text, changed, op = apply_operation(new_text, operation, newline, explain)
             operation_results.append({"index": index, "op": op, "changed": changed})
 
         new_text = apply_post_transforms(new_text, args, newline)
