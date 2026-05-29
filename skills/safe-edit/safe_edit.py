@@ -57,24 +57,32 @@ def classify_error_type(message: str) -> str:
     - "file_error": file I/O or path issue
     - "validation_error": invalid arguments or constraint violation
     - "lock_error": file lock contention
+    - "format_error": invalid diff-input or SEARCH/REPLACE format
     - "unknown": unclassified error
     """
     msg = message.lower()
-    if "was not found" in msg or "not found" in msg and "refusing" in msg:
+    # Order matters: more specific checks first to avoid misclassification
+    if "was not found" in msg or ("not found" in msg and "refusing" in msg):
+        return "match_not_found"
+    if "anchor pattern" in msg and "not found" in msg:
         return "match_not_found"
     if "anchor pattern found" in msg and "times" in msg:
         return "match_ambiguous"
-    if "expected" in msg and "occurrence" in msg or "match" in msg and "found" in msg:
+    if ("expected" in msg and "occurrence" in msg) or ("expected" in msg and "match" in msg and "found" in msg):
         return "match_count_mismatch"
-    if "decode" in msg or "encode" in msg or "encoding" in msg or "bom" in msg:
+    if "decode" in msg or "failed to encode" in msg or "unable to auto-detect encoding" in msg or "bom" in msg or "unsupported encoding" in msg:
         return "encoding_error"
-    if "file not found" in msg or "not a regular" in msg or "symlink" in msg or "failed to read" in msg or "failed to" in msg and "file" in msg or "exceeding" in msg and "max-bytes" in msg:
+    if ("file not found" in msg or "not a regular" in msg or "symlink" in msg
+            or "failed to read" in msg or ("failed to" in msg and "file" in msg)
+            or ("exceeding" in msg and "max-bytes" in msg)):
         return "file_error"
     if "lock already exists" in msg or "lock file" in msg or "stale lock" in msg:
         return "lock_error"
     if "diff-input format" in msg or "search/replace" in msg:
         return "format_error"
-    if "must" in msg or "requires" in msg or "missing" in msg or "unsupported" in msg or "invalid" in msg or "out of range" in msg:
+    if ("must" in msg or "requires" in msg or "missing" in msg
+            or "unsupported" in msg or "invalid" in msg or "out of range" in msg
+            or "mutually exclusive" in msg):
         return "validation_error"
     return "unknown"
 
@@ -907,6 +915,9 @@ def _apply_edit_with_context(
             fail(f"old text was not found (after context filtering); refusing a silent no-op\n\n{explanation}")
         else:
             fail("old text was not found (after context filtering); refusing a silent no-op")
+    if len(filtered) == 0 and bool(operation.get("no_op_ok", False)):
+        # no_op_ok: if no matches after context filtering, skip count check and return unchanged
+        return (text, 0, effective_strategy)
     if expected is not None and len(filtered) != int(expected):
         fail(f"expected {expected} occurrence(s) after context filtering, found {len(filtered)}")
     
@@ -968,6 +979,9 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
             fail(f"old text was not found; refusing a silent no-op\n\n{explanation}")
         else:
             fail("old text was not found; refusing a silent no-op")
+    if actual == 0 and bool(operation.get("no_op_ok", False)):
+        # no_op_ok: if no matches, skip count check and return text unchanged
+        return (text, 0, effective_strategy)
     if expected is not None and actual != int(expected):
         fail(f"expected {expected} occurrence(s), found {actual}")
     
@@ -1044,31 +1058,118 @@ def find_original_position(original_text: str, normalized_text: str, norm_pos: i
     """
     # Simple case: if no normalization, position is same
     if not ignore_indent and not ignore_eol and not normalize_whitespace:
-        pos = original_text.find(original_old)
+        pos = original_text.find(original_old, start_search_pos)
         return (pos, len(original_old)) if pos >= 0 else (-1, 0)
     
-    # Strategy: scan through original text, extract substrings of varying lengths,
-    # normalize them, and compare with normalized_old
-    # The matched content in original text may have different length than original_old
+    # Fast path: try original_old as-is first (works when only line endings differ)
+    candidate = original_text.find(original_old, start_search_pos)
+    if candidate >= 0:
+        normalized_candidate = normalize_for_match(
+            original_text[candidate:candidate + len(original_old)],
+            ignore_indent, ignore_eol, normalize_whitespace,
+        )
+        if normalized_candidate == normalized_old:
+            return (candidate, len(original_old))
     
-    # For efficiency, we use a heuristic: the matched content in original text
-    # should have similar length to original_old (within a factor of 2)
-    # This handles cases like: tab vs 4 spaces, CRLF vs LF, multiple spaces vs single space
+    # Line-based fast path for ignore_indent: compute original line offsets
+    # and use normalized match position to find the corresponding original line.
+    # This reduces the search space from O(n * max_len) to O(lines * max_line_len).
+    if ignore_indent and not normalize_whitespace:
+        result = _find_original_position_line_based(
+            original_text, normalized_text, normalized_old, original_old,
+            ignore_indent, ignore_eol, start_search_pos,
+            norm_pos=norm_pos,
+        )
+        if result[0] >= 0:
+            return result
     
-    min_len = max(1, len(normalized_old))  # Minimum possible length
-    max_len = max(len(original_old), len(original_old) * 2, len(normalized_old) * 3)  # Maximum possible length
+    # General fallback: scan from start_search_pos with early termination.
+    # Instead of trying all lengths from each position, we use a smart bound:
+    # the original text cannot be shorter than the normalized text, and
+    # unlikely to be more than 3x longer (handles CRLF→LF, tab→spaces).
+    min_len = max(1, len(normalized_old))
+    max_len = max(len(original_old) * 3, len(normalized_old) * 3, 200)
     
     search_start = start_search_pos
     while search_start < len(original_text):
-        # Try different lengths from this position
         for length in range(min_len, min(max_len + 1, len(original_text) - search_start + 1)):
             candidate = original_text[search_start:search_start + length]
             normalized_candidate = normalize_for_match(candidate, ignore_indent, ignore_eol, normalize_whitespace)
             
             if normalized_candidate == normalized_old:
                 return (search_start, length)
+            
+            # Early termination: if normalized candidate is already longer than target,
+            # no point trying longer substrings from this position
+            if len(normalized_candidate) > len(normalized_old):
+                break
         
         search_start += 1
+    
+    return (-1, 0)
+
+
+def _find_original_position_line_based(
+    original_text: str, normalized_text: str, normalized_old: str, original_old: str,
+    ignore_indent: bool, ignore_eol: bool, start_search_pos: int,
+    norm_pos: int = 0,
+) -> Tuple[int, int]:
+    """Line-based fast path for find_original_position with ignore_indent.
+    
+    Uses line offset mapping to narrow the search, falling back to
+    character-level verification within the candidate region.
+    """
+    # Build line offset mapping: for each original line, record its start offset
+    # and the corresponding offset in the normalized text
+    orig_lines = original_text.split('\n')
+    orig_line_starts = []
+    norm_line_starts = []
+    
+    offset = 0
+    norm_offset = 0
+    for line in orig_lines:
+        orig_line_starts.append(offset)
+        norm_line_starts.append(norm_offset)
+        # Original line length (content only, no \n)
+        offset += len(line) + 1  # +1 for \n (or \r\n handled below)
+        # Normalized line length (with indent stripped)
+        norm_line = line.lstrip(' \t') if ignore_indent else line
+        norm_offset += len(norm_line)
+        # Add newline in normalized text
+        if ignore_eol:
+            norm_offset += 1  # always \n
+        else:
+            # Count actual newline length
+            # This is approximate; we'll verify below
+            norm_offset += 1
+    
+    # Find which line the normalized match starts in
+    # by finding the line whose normalized start is <= norm_pos
+    # and whose next line's normalized start is > norm_pos
+    target_line = 0
+    for i in range(len(norm_line_starts) - 1, -1, -1):
+        if norm_line_starts[i] <= norm_pos:
+            target_line = i
+            break
+    
+    # The original text should start at or near the original line start
+    # Search within a small window around the target line
+    search_start = max(start_search_pos, orig_line_starts[target_line])
+    search_end = min(len(original_text), orig_line_starts[target_line] + len(original_old) * 3 + 200)
+    
+    min_len = max(1, len(normalized_old))
+    max_len = max(len(original_old) * 3, len(normalized_old) * 3, 200)
+    
+    pos = search_start
+    while pos < search_end:
+        for length in range(min_len, min(max_len + 1, len(original_text) - pos + 1)):
+            candidate = original_text[pos:pos + length]
+            normalized_candidate = normalize_for_match(candidate, ignore_indent, ignore_eol, False)
+            if normalized_candidate == normalized_old:
+                return (pos, length)
+            if len(normalized_candidate) > len(normalized_old):
+                break
+        pos += 1
     
     return (-1, 0)
 
@@ -1129,8 +1230,6 @@ def apply_regex_edit(text: str, operation: Dict[str, Any], newline: str, explain
 
     actual = sum(1 for _ in compiled.finditer(text))
     expected = operation.get("expected_count")
-    if expected is not None and actual != int(expected):
-        fail(f"expected {expected} regex match(es), found {actual}")
     if actual == 0 and not bool(operation.get("no_op_ok", False)):
         if explain:
             # Try to find closest match using the pattern as literal text
@@ -1138,6 +1237,11 @@ def apply_regex_edit(text: str, operation: Dict[str, Any], newline: str, explain
             fail(f"regex pattern was not found; refusing a silent no-op\n\n{explanation}")
         else:
             fail("regex pattern was not found; refusing a silent no-op")
+    if actual == 0 and bool(operation.get("no_op_ok", False)):
+        # no_op_ok: if no matches, skip count check and return text unchanged
+        return (text, 0, "regex")
+    if expected is not None and actual != int(expected):
+        fail(f"expected {expected} regex match(es), found {actual}")
 
     count = int(operation.get("count", 0) or 0)
     if bool(operation.get("first", False)):
@@ -1681,6 +1785,8 @@ def command_to_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]
             operation["pattern"] = resolve_cli_value(args, "pattern", True, stdin_taken=stdin_taken)
             operation["replacement"] = resolve_cli_value(args, "replacement", True, stdin_taken=stdin_taken)
             operation["flags"] = args.flags
+            if args.count and args.first:
+                fail("--count and --first are mutually exclusive")
             operation["count"] = args.count
             operation["expected_count"] = args.expected_count
             operation["first"] = args.first

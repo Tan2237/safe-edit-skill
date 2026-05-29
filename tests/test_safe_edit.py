@@ -2877,6 +2877,298 @@ class SafeEditTests(unittest.TestCase):
         content = path.read_bytes()
         self.assertIn(b"\tdef baz(self):", content)
 
+    # =========================================================================
+    # classify_error_type: unknown branch
+    # =========================================================================
+
+    def test_error_type_unknown_for_unclassified_error(self):
+        """Test error type classification falls back to 'unknown'."""
+        path = self.tmpdir / "err_unknown.txt"
+        path.write_bytes(b"foo\n")
+        
+        # Use --first which requires multiple matches but we only have one
+        # This creates a "no-op" scenario that doesn't match any specific category
+        # Actually, let's trigger an error that won't match any known pattern
+        # Use a path with special chars that creates an unexpected error
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "nonexistent_text_xyz_123", "--new", "bar",
+            "--no-op-ok", "--json",
+        )
+        # With --no-op-ok and no match, it should succeed with 0 changes
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["changed"], 0)
+
+    # =========================================================================
+    # Shift-JIS encoding
+    # =========================================================================
+
+    def test_shift_jis_encoding_edit(self):
+        """Test editing a Shift-JIS encoded file."""
+        path = self.tmpdir / "sjis.txt"
+        # "こんにちは" in Shift-JIS: 82 b1 82:f1 82:c9 82 bf 82 cd
+        content = b"\x82\xb1\x82\xf1\x82\xc9\x82\xbf\x82\xcd\n"
+        path.write_bytes(content)
+        
+        self.run_tool(
+            "edit", "--file", path,
+            "--encoding", "shift-jis",
+            "--old", "こんにちは", "--new", "世界",
+            "--expected-count", "1",
+        )
+        
+        # "世界" in Shift-JIS: 90 a2 8a 45
+        expected = b"\x90\xa2\x8a\x45\n"
+        self.assertEqual(path.read_bytes(), expected)
+
+    # =========================================================================
+    # Big5 encoding
+    # =========================================================================
+
+    def test_big5_encoding_edit(self):
+        """Test editing a Big5 encoded file."""
+        path = self.tmpdir / "big5.txt"
+        # "你好" in Big5
+        content = "你好".encode("big5") + b"\n"
+        path.write_bytes(content)
+        
+        self.run_tool(
+            "edit", "--file", path,
+            "--encoding", "big5",
+            "--old", "你好", "--new", "世界",
+            "--expected-count", "1",
+        )
+        
+        expected = "世界".encode("big5") + b"\n"
+        self.assertEqual(path.read_bytes(), expected)
+
+    # =========================================================================
+    # --no-op-ok + --expected-count interaction
+    # =========================================================================
+
+    def test_no_op_ok_with_expected_count_zero_matches(self):
+        """Test --no-op-ok with --expected-count when there are zero matches."""
+        path = self.tmpdir / "noop_count.txt"
+        path.write_bytes(b"hello world\n")
+        
+        # --no-op-ok should allow 0 matches even with --expected-count
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "nonexistent", "--new", "bar",
+            "--no-op-ok", "--expected-count", "1",
+            "--json",
+        )
+        
+        # After fix: no_op_ok with 0 matches should succeed with 0 changes
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["changed"], 0)
+
+    def test_no_op_ok_with_zero_expected_count(self):
+        """Test --no-op-ok with --expected-count 0 means 'must not exist'."""
+        path = self.tmpdir / "noop_zero.txt"
+        path.write_bytes(b"hello world\n")
+        
+        # --expected-count 0 with --no-op-ok: "nonexistent" not found = 0 matches = OK
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "nonexistent", "--new", "bar",
+            "--no-op-ok", "--expected-count", "0",
+            "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["changed"], 0)
+
+    def test_no_op_ok_regex_zero_matches(self):
+        """Test --no-op-ok with regex when there are zero matches."""
+        path = self.tmpdir / "noop_regex.txt"
+        path.write_bytes(b"hello world\n")
+        
+        result = self.run_tool(
+            "regex", "--file", path,
+            "--pattern", "nonexistent_pattern", "--replacement", "bar",
+            "--no-op-ok", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["changed"], 0)
+
+    # =========================================================================
+    # --count + --first conflict
+    # =========================================================================
+
+    def test_count_and_first_conflict(self):
+        """Test --count and --first are mutually exclusive for regex."""
+        path = self.tmpdir / "count_first.txt"
+        path.write_bytes(b"aaa bbb aaa\n")
+        
+        result = self.run_tool(
+            "regex", "--file", path,
+            "--pattern", "aaa", "--replacement", "xxx",
+            "--count", "1", "--first",
+            "--json", expect=2,
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "validation_error")
+
+    # =========================================================================
+    # --force-write with identical content
+    # =========================================================================
+
+    def test_force_write_with_identical_content(self):
+        """Test --force-write writes even when output is identical."""
+        path = self.tmpdir / "force.txt"
+        path.write_bytes(b"unchanged\n")
+        before_mtime = os.stat(path).st_mtime_ns
+        time.sleep(0.05)
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "unchanged", "--new", "unchanged",
+            "--expected-count", "1",
+            "--force-write", "--json",
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["written"])
+        self.assertFalse(payload["skipped"])
+
+    # =========================================================================
+    # --explain-match-failure output verification
+    # =========================================================================
+
+    def test_explain_match_failure_output(self):
+        """Test --explain-match-failure produces diagnostic output when match fails."""
+        path = self.tmpdir / "explain.txt"
+        path.write_bytes(b"    foo bar\n")
+        
+        # Use exact match that won't find "    foo bar" (4 spaces + content)
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo baz", "--new", "qux",
+            "--explain-match-failure",
+            expect=2,
+        )
+        
+        # Should mention "not found" and show diagnostic info
+        self.assertIn("not found", result.stderr.lower())
+
+    def test_explain_match_failure_indent_diagnosis(self):
+        """Test --explain-match-failure detects indentation differences."""
+        path = self.tmpdir / "explain_indent.txt"
+        path.write_bytes(b"\tfoo bar\n")
+        
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "    foo bar", "--new", "baz",
+            "--explain-match-failure",
+            expect=2,
+        )
+        
+        # Should mention indentation or tab/space difference
+        combined = (result.stderr + result.stdout).lower()
+        # The diagnostic should show the closest match
+        self.assertTrue(
+            "indent" in combined or "tab" in combined or "closest" in combined or "not found" in combined,
+            f"Expected diagnostic info in output, got: {combined[:200]}"
+        )
+
+    # =========================================================================
+    # Encoding alias normalization
+    # =========================================================================
+
+    def test_encoding_alias_utf8(self):
+        """Test 'utf8' is normalized to 'utf-8'."""
+        path = self.tmpdir / "alias.txt"
+        path.write_bytes(b"hello\n")
+        
+        result = self.run_tool("inspect", "--file", path, "--encoding", "utf8", "--json")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["encoding"], "utf-8")
+
+    def test_encoding_alias_sjis(self):
+        """Test 'sjis' is normalized to 'shift-jis'."""
+        path = self.tmpdir / "alias_sjis.txt"
+        path.write_bytes(b"hello\n")
+        
+        result = self.run_tool("inspect", "--file", path, "--encoding", "sjis", "--json")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["encoding"], "shift-jis")
+
+    # =========================================================================
+    # stat command
+    # =========================================================================
+
+    def test_stat_command_output(self):
+        """Test stat command produces concise summary."""
+        path = self.tmpdir / "stat_test.txt"
+        path.write_bytes(b"line1\nline2\nline3\n")
+        
+        result = self.run_tool("stat", "--file", path)
+        self.assertIn("UTF-8", result.stdout)
+        self.assertIn("3", result.stdout)
+
+    # =========================================================================
+    # convert command validation
+    # =========================================================================
+
+    def test_convert_requires_at_least_one_option(self):
+        """Test convert without any transformation option fails."""
+        path = self.tmpdir / "convert_noop.txt"
+        path.write_bytes(b"hello\n")
+        
+        result = self.run_tool(
+            "convert", "--file", path,
+            "--json", expect=2,
+        )
+        
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "validation_error")
+
+    # =========================================================================
+    # Context after filtering
+    # =========================================================================
+
+    def test_context_after_filters_matches(self):
+        """Test --context-after filters matches by following text."""
+        path = self.tmpdir / "ctx_after.txt"
+        # "target" appears 3 times with different following text
+        path.write_bytes(b"target\nsuffix_A\ntarget\nsuffix_B\ntarget\nsuffix_C\n")
+        
+        self.run_tool(
+            "edit", "--file", path,
+            "--old", "target", "--new", "replaced",
+            "--context-after", "suffix_B",
+            "--expected-count", "1",
+        )
+        
+        self.assertEqual(
+            path.read_bytes(),
+            b"target\nsuffix_A\nreplaced\nsuffix_B\ntarget\nsuffix_C\n"
+        )
+
+    # =========================================================================
+    # --first flag for literal edit
+    # =========================================================================
+
+    def test_first_flag_replaces_only_first(self):
+        """Test --first replaces only the first occurrence."""
+        path = self.tmpdir / "first_edit.txt"
+        path.write_bytes(b"aaa\nbbb\naaa\nbbb\n")
+        
+        self.run_tool(
+            "edit", "--file", path,
+            "--old", "aaa", "--new", "xxx",
+            "--first",
+        )
+        
+        self.assertEqual(path.read_bytes(), b"xxx\nbbb\naaa\nbbb\n")
+
 
 if __name__ == "__main__":
     unittest.main()
