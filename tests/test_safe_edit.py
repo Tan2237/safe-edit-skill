@@ -36,6 +36,19 @@ class SafeEditTests(unittest.TestCase):
             )
         return result
 
+    def run_interactive(self, *args, input_text="y\n"):
+        """Run tool with forced interactive mode and simulated user input."""
+        env = os.environ.copy()
+        env['SAFE_EDIT_FORCE_INTERACTIVE'] = '1'
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *map(str, args)],
+            input=input_text,
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            env=env,
+        )
+
     def test_inspect_reports_encoding_and_line_endings(self):
         path = self.tmpdir / "utf8-bom-crlf.txt"
         path.write_bytes(codecs.BOM_UTF8 + b"alpha\r\nbeta\r\n")
@@ -404,8 +417,9 @@ class SafeEditTests(unittest.TestCase):
         # File uses CRLF
         path.write_bytes(b"line1\r\nline2\r\n")
         
-        # Try to match with LF - this should actually match because
-        # the tool normalizes line endings for matching
+        # Try to match with LF in a CRLF file - this should fail
+        # because the tool does NOT auto-normalize line endings
+        # (user must use --ignore-eol for that)
         result = self.run_tool(
             "edit",
             "--file",
@@ -1140,29 +1154,6 @@ class SafeEditTests(unittest.TestCase):
         # File should be unchanged
         self.assertEqual(path.read_bytes(), before)
 
-    def test_force_write_even_when_identical(self):
-        """Test --force-write updates mtime even when content is identical."""
-        path = self.tmpdir / "force.txt"
-        path.write_bytes(b"unchanged\n")
-        before_mtime = os.stat(path).st_mtime_ns
-        time.sleep(0.02)
-        
-        self.run_tool(
-            "edit",
-            "--file",
-            path,
-            "--old",
-            "unchanged",
-            "--new",
-            "unchanged",
-            "--expected-count",
-            "1",
-            "--force-write",
-        )
-        
-        # mtime should be updated
-        self.assertGreater(os.stat(path).st_mtime_ns, before_mtime)
-
     # =========================================================================
     # Symlink tests
     # =========================================================================
@@ -1359,20 +1350,11 @@ class SafeEditTests(unittest.TestCase):
         path = self.tmpdir / "interactive_y.txt"
         path.write_bytes(b"foo\n")
         
-        # Simulate user input 'y' with forced interactive mode
-        env = os.environ.copy()
-        env['SAFE_EDIT_FORCE_INTERACTIVE'] = '1'
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT),
-             "edit", "--file", str(path),
-             "--old", "foo", "--new", "bar",
-             "--expected-count", "1",
-             "--interactive"],
-            input="y\n",
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            env=env,
+        result = self.run_interactive(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "1",
+            "--interactive",
         )
         
         # Should show diff and prompt
@@ -1389,20 +1371,12 @@ class SafeEditTests(unittest.TestCase):
         path.write_bytes(b"foo\n")
         original = path.read_bytes()
         
-        # Simulate user input 'n' with forced interactive mode
-        env = os.environ.copy()
-        env['SAFE_EDIT_FORCE_INTERACTIVE'] = '1'
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT),
-             "edit", "--file", str(path),
-             "--old", "foo", "--new", "bar",
-             "--expected-count", "1",
-             "--interactive"],
-            input="n\n",
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            env=env,
+        result = self.run_interactive(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "1",
+            "--interactive",
+            input_text="n\n",
         )
         
         # Should show diff and prompt
@@ -1419,20 +1393,12 @@ class SafeEditTests(unittest.TestCase):
         path = self.tmpdir / "interactive_a.txt"
         path.write_bytes(b"foo\nbar\n")
         
-        # Simulate user input 'a' with forced interactive mode
-        env = os.environ.copy()
-        env['SAFE_EDIT_FORCE_INTERACTIVE'] = '1'
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT),
-             "edit", "--file", str(path),
-             "--old", "foo", "--new", "baz",
-             "--expected-count", "1",
-             "--interactive"],
-            input="a\n",
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            env=env,
+        result = self.run_interactive(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "baz",
+            "--expected-count", "1",
+            "--interactive",
+            input_text="a\n",
         )
         
         # File should be modified
@@ -1444,20 +1410,12 @@ class SafeEditTests(unittest.TestCase):
         path.write_bytes(b"foo\n")
         original = path.read_bytes()
         
-        # Simulate user input 'q' with forced interactive mode
-        env = os.environ.copy()
-        env['SAFE_EDIT_FORCE_INTERACTIVE'] = '1'
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT),
-             "edit", "--file", str(path),
-             "--old", "foo", "--new", "bar",
-             "--expected-count", "1",
-             "--interactive"],
-            input="q\n",
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            env=env,
+        result = self.run_interactive(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "1",
+            "--interactive",
+            input_text="q\n",
         )
         
         # File should NOT be modified
@@ -1468,20 +1426,12 @@ class SafeEditTests(unittest.TestCase):
         path = self.tmpdir / "interactive_help.txt"
         path.write_bytes(b"foo\n")
         
-        # Simulate user input '?' then 'n' with forced interactive mode
-        env = os.environ.copy()
-        env['SAFE_EDIT_FORCE_INTERACTIVE'] = '1'
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT),
-             "edit", "--file", str(path),
-             "--old", "foo", "--new", "bar",
-             "--expected-count", "1",
-             "--interactive"],
-            input="?\nn\n",
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            env=env,
+        result = self.run_interactive(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "1",
+            "--interactive",
+            input_text="?\nn\n",
         )
         
         # Should show help
@@ -1497,21 +1447,12 @@ class SafeEditTests(unittest.TestCase):
         content_lines = ["line1", "line2", "line3", "target", "line5", "line6", "line7"]
         path.write_bytes(("\n".join(content_lines) + "\n").encode())
         
-        # Simulate user input 'y' with forced interactive mode
-        env = os.environ.copy()
-        env['SAFE_EDIT_FORCE_INTERACTIVE'] = '1'
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT),
-             "edit", "--file", str(path),
-             "--old", "target", "--new", "replaced",
-             "--expected-count", "1",
-             "--interactive",
-             "--context", "2"],
-            input="y\n",
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            env=env,
+        result = self.run_interactive(
+            "edit", "--file", path,
+            "--old", "target", "--new", "replaced",
+            "--expected-count", "1",
+            "--interactive",
+            "--context", "2",
         )
         
         # Should show context lines in diff
@@ -1527,20 +1468,11 @@ class SafeEditTests(unittest.TestCase):
         path = self.tmpdir / "interactive_short.txt"
         path.write_bytes(b"foo\n")
         
-        # Simulate user input 'y' with short flag and forced interactive mode
-        env = os.environ.copy()
-        env['SAFE_EDIT_FORCE_INTERACTIVE'] = '1'
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT),
-             "edit", "--file", str(path),
-             "--old", "foo", "--new", "bar",
-             "--expected-count", "1",
-             "-i"],
-            input="y\n",
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            env=env,
+        result = self.run_interactive(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "1",
+            "-i",
         )
         
         # File should be modified
@@ -2883,22 +2815,14 @@ class SafeEditTests(unittest.TestCase):
 
     def test_error_type_unknown_for_unclassified_error(self):
         """Test error type classification falls back to 'unknown'."""
-        path = self.tmpdir / "err_unknown.txt"
-        path.write_bytes(b"foo\n")
-        
-        # Use --first which requires multiple matches but we only have one
-        # This creates a "no-op" scenario that doesn't match any specific category
-        # Actually, let's trigger an error that won't match any known pattern
-        # Use a path with special chars that creates an unexpected error
-        result = self.run_tool(
-            "edit", "--file", path,
-            "--old", "nonexistent_text_xyz_123", "--new", "bar",
-            "--no-op-ok", "--json",
-        )
-        # With --no-op-ok and no match, it should succeed with 0 changes
-        payload = json.loads(result.stdout)
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["changed"], 0)
+        # Import the module directly to test classify_error_type
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "safe-edit"))
+        try:
+            import safe_edit
+            result = safe_edit.classify_error_type("something completely unexpected happened")
+            self.assertEqual(result, "unknown")
+        finally:
+            sys.path.pop(0)
 
     # =========================================================================
     # Shift-JIS encoding

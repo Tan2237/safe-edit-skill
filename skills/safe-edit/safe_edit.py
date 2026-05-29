@@ -2078,12 +2078,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         if not args.dry_run:
             # Interactive mode: prompt before writing
             interactive = getattr(args, 'interactive', False)
-            apply_all = False
             
-            if interactive and not apply_all:
-                # Show diff and prompt
-                diff_for_prompt = generate_diff(path, text, new_text, args.context) if not args.diff else diff_text
-                apply_this, apply_all = prompt_interactive(path, text, new_text, args.context)
+            if interactive:
+                apply_this, _apply_all = prompt_interactive(path, text, new_text, args.context)
                 if not apply_this:
                     summary["skipped"] = True
                     summary["interactiveSkipped"] = True
