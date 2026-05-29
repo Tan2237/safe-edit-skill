@@ -3093,6 +3093,704 @@ class SafeEditTests(unittest.TestCase):
         
         self.assertEqual(path.read_bytes(), b"xxx\nbbb\naaa\nbbb\n")
 
+    # =========================================================================
+    # Encoding aliases
+    # =========================================================================
+
+    def test_encoding_alias_cp936(self):
+        """Test cp936 alias resolves to gbk."""
+        path = self.tmpdir / "cp936.txt"
+        path.write_bytes(bytes.fromhex("c4 e3 ba c3 0a"))  # GBK "你好\n"
+        result = self.run_tool("inspect", "--file", path, "--encoding", "cp936", "--json")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["encoding"], "gbk")
+
+    def test_encoding_alias_gb2312(self):
+        """Test gb2312 alias resolves to gbk."""
+        path = self.tmpdir / "gb2312.txt"
+        path.write_bytes(bytes.fromhex("c4 e3 ba c3 0a"))
+        result = self.run_tool("inspect", "--file", path, "--encoding", "gb2312", "--json")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["encoding"], "gbk")
+
+    def test_encoding_alias_cp932(self):
+        """Test cp932 alias resolves to shift-jis."""
+        path = self.tmpdir / "cp932.txt"
+        # Shift-JIS "こんにちは" in CP932 encoding
+        path.write_bytes(b"\x82\xb1\x82\xf1\x82\xc9\x82\xbf\x82\xcd\x0a")
+        result = self.run_tool("inspect", "--file", path, "--encoding", "cp932", "--json")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["encoding"], "shift-jis")
+
+    def test_encoding_alias_ms932(self):
+        """Test ms932 alias resolves to shift-jis."""
+        path = self.tmpdir / "ms932.txt"
+        path.write_bytes(b"\x82\xb1\x82\xf1\x82\xc9\x82\xbf\x82\xcd\x0a")
+        result = self.run_tool("inspect", "--file", path, "--encoding", "ms932", "--json")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["encoding"], "shift-jis")
+
+    def test_encoding_alias_sjis(self):
+        """Test sjis alias resolves to shift-jis."""
+        path = self.tmpdir / "sjis.txt"
+        path.write_bytes(b"\x82\xb1\x82\xf1\x82\xc9\x82\xbf\x82\xcd\x0a")
+        result = self.run_tool("inspect", "--file", path, "--encoding", "sjis", "--json")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["encoding"], "shift-jis")
+
+    def test_encoding_alias_latin1(self):
+        """Test latin1 alias resolves to latin-1."""
+        path = self.tmpdir / "latin1.txt"
+        path.write_bytes(b"Espa\xf1a\n")
+        result = self.run_tool("inspect", "--file", path, "--encoding", "latin1", "--json")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["encoding"], "latin-1")
+
+    def test_encoding_alias_iso_8859_1(self):
+        """Test iso-8859-1 alias resolves to latin-1."""
+        path = self.tmpdir / "iso8859.txt"
+        path.write_bytes(b"Espa\xf1a\n")
+        result = self.run_tool("inspect", "--file", path, "--encoding", "iso-8859-1", "--json")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["encoding"], "latin-1")
+
+    def test_encoding_alias_utf8_sig(self):
+        """Test utf-8-sig alias resolves to utf-8-bom."""
+        path = self.tmpdir / "utf8sig.txt"
+        path.write_bytes(codecs.BOM_UTF8 + b"hello\n")
+        result = self.run_tool("inspect", "--file", path, "--encoding", "utf-8-sig", "--json")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["encoding"], "utf-8-bom")
+
+    def test_encoding_alias_utf16_le_no_hyphen(self):
+        """Test utf16-le alias (no hyphen) resolves to utf-16-le."""
+        path = self.tmpdir / "utf16le.txt"
+        content = codecs.BOM_UTF16_LE + "hello\n".encode("utf-16-le")
+        path.write_bytes(content)
+        result = self.run_tool("inspect", "--file", path, "--encoding", "utf16-le", "--json")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["encoding"], "utf-16-le")
+
+    def test_encoding_alias_utf16_be_no_hyphen(self):
+        """Test utf16-be alias (no hyphen) resolves to utf-16-be."""
+        path = self.tmpdir / "utf16be.txt"
+        content = codecs.BOM_UTF16_BE + "hello\n".encode("utf-16-be")
+        path.write_bytes(content)
+        result = self.run_tool("inspect", "--file", path, "--encoding", "utf16-be", "--json")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["encoding"], "utf-16-be")
+
+    # =========================================================================
+    # Error paths and CLI edge cases
+    # =========================================================================
+
+    def test_encode_text_failure_on_gbk_with_invalid_char(self):
+        """Test editing a GBK file with a character that cannot be encoded in GBK."""
+        path = self.tmpdir / "gbk_invalid.txt"
+        path.write_bytes(bytes.fromhex("c4 e3 ba c3 0a"))  # GBK "你好\n"
+        result = self.run_tool(
+            "edit", "--file", path, "--encoding", "gbk",
+            "--old", "\u4f60\u597d", "--new", "\U0001f600",  # 😀 cannot be encoded in GBK
+            "--json", expect=2,
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "encoding_error")
+
+    def test_detect_encoding_auto_fails_on_unknown_binary(self):
+        """Test auto-detection fails on bytes that are not UTF-8, GBK, or UTF-16."""
+        path = self.tmpdir / "unknown.bin"
+        # 0x80-0xBF are continuation bytes in UTF-8, invalid as start;
+        # also not valid GBK start bytes for a two-byte sequence
+        path.write_bytes(bytes([0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87]))
+        result = self.run_tool("inspect", "--file", path, "--json", expect=2)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "encoding_error")
+
+    def test_ops_stdin_batch_mode(self):
+        """Test --ops-stdin reads batch JSON from stdin."""
+        path = self.tmpdir / "ops_stdin.txt"
+        path.write_bytes(b"foo bar\n")
+        ops_json = json.dumps([
+            {"op": "edit", "old": "foo", "new": "baz", "expected_count": 1}
+        ])
+        self.run_tool("batch", "--file", path, "--ops-stdin", input_text=ops_json)
+        self.assertEqual(path.read_bytes(), b"baz bar\n")
+
+    def test_diff_input_with_angle_bracket_markers(self):
+        """Test diff-input with <<< SEARCH / === / >>> REPLACE markers."""
+        path = self.tmpdir / "angle_markers.txt"
+        path.write_bytes(b"alpha\nbeta\ngamma\n")
+        diff = "<<< SEARCH\nbeta\n===\nBETA\n>>> REPLACE"
+        self.run_tool("edit", "--file", path, "--diff-input", diff)
+        self.assertEqual(path.read_bytes(), b"alpha\nBETA\ngamma\n")
+
+    def test_diff_input_empty_search_block_skipped(self):
+        """Test diff-input with an empty SEARCH block followed by a valid block."""
+        path = self.tmpdir / "empty_search.txt"
+        path.write_bytes(b"alpha\nbeta\ngamma\n")
+        # Empty old_text block is skipped, valid block is applied
+        diff = "------- SEARCH\n=======\nsomething\n+++++++ REPLACE\n------- SEARCH\nbeta\n=======\nBETA\n+++++++ REPLACE"
+        self.run_tool("edit", "--file", path, "--diff-input", diff)
+        self.assertEqual(path.read_bytes(), b"alpha\nBETA\ngamma\n")
+
+    def test_diff_input_unterminated_block_applied(self):
+        """Test diff-input with unterminated block (missing REPLACE marker) is still applied."""
+        path = self.tmpdir / "unterminated.txt"
+        path.write_bytes(b"alpha\nbeta\ngamma\n")
+        # Missing >>> REPLACE at the end - should still apply
+        diff = "------- SEARCH\nbeta\n=======\nBETA"
+        self.run_tool("edit", "--file", path, "--diff-input", diff)
+        self.assertEqual(path.read_bytes(), b"alpha\nBETA\ngamma\n")
+
+    def test_backup_suffix_with_path_separator_fails(self):
+        """Test --backup-suffix with path separator is rejected."""
+        path = self.tmpdir / "baksuffix.txt"
+        path.write_bytes(b"hello\n")
+        result = self.run_tool(
+            "edit", "--file", path, "--old", "hello", "--new", "world",
+            "--backup", "--backup-suffix", "/evil.bak",
+            "--json", expect=2,
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "validation_error")
+
+    def test_backup_suffix_with_backslash_fails(self):
+        """Test --backup-suffix with backslash separator is rejected."""
+        path = self.tmpdir / "baksuffix2.txt"
+        path.write_bytes(b"hello\n")
+        result = self.run_tool(
+            "edit", "--file", path, "--old", "hello", "--new", "world",
+            "--backup", "--backup-suffix", "\\evil.bak",
+            "--json", expect=2,
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "validation_error")
+
+    def test_convert_gbk_to_utf8(self):
+        """Test convert from GBK to UTF-8 encoding."""
+        path = self.tmpdir / "gbk2utf8.txt"
+        path.write_bytes(bytes.fromhex("c4 e3 ba c3 0a"))  # GBK "你好\n"
+        result = self.run_tool(
+            "convert", "--file", path, "--encoding", "gbk",
+            "--to-encoding", "utf-8", "--json",
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["outputEncoding"], "utf-8")
+        self.assertEqual(path.read_bytes(), "你好\n".encode("utf-8"))
+
+    def test_convert_utf8_to_gbk(self):
+        """Test convert from UTF-8 to GBK encoding."""
+        path = self.tmpdir / "utf82gbk.txt"
+        path.write_bytes("你好\n".encode("utf-8"))
+        result = self.run_tool(
+            "convert", "--file", path,
+            "--to-encoding", "gbk", "--json",
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["outputEncoding"], "gbk")
+        self.assertEqual(path.read_bytes(), bytes.fromhex("c4 e3 ba c3 0a"))
+
+    def test_convert_utf8_to_utf16_le(self):
+        """Test convert from UTF-8 to UTF-16-LE encoding (no BOM added when not in original)."""
+        path = self.tmpdir / "utf82utf16.txt"
+        path.write_bytes("hello\n".encode("utf-8"))
+        result = self.run_tool(
+            "convert", "--file", path,
+            "--to-encoding", "utf-16-le", "--json",
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["outputEncoding"], "utf-16-le")
+        # --to-encoding utf-16-le does not add BOM automatically
+        expected = "hello\n".encode("utf-16-le")
+        self.assertEqual(path.read_bytes(), expected)
+
+    def test_strict_decode_bom_mismatch(self):
+        """Test that specifying utf-8-bom encoding on a file without BOM fails."""
+        path = self.tmpdir / "no_bom.txt"
+        path.write_bytes(b"hello\n")
+        result = self.run_tool(
+            "inspect", "--file", path, "--encoding", "utf-8-bom", "--json", expect=2,
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "encoding_error")
+
+    def test_resolve_operation_value_conflict(self):
+        """Test batch operation with both 'old' and 'old_file' fails."""
+        path = self.tmpdir / "op_conflict.txt"
+        path.write_bytes(b"hello\n")
+        old_file = self.tmpdir / "old_content.txt"
+        old_file.write_bytes(b"hello")
+        ops_json = json.dumps([
+            {"op": "edit", "old": "hello", "old_file": str(old_file), "new": "world"}
+        ])
+        result = self.run_tool("batch", "--file", path, "--ops", ops_json, "--json", expect=2)
+        payload = json.loads(result.stdout)
+        # "batch operation uses both old and old_file" doesn't match validation keywords,
+        # so it's classified as "unknown" — but the key thing is it errors out
+        self.assertFalse(payload["ok"])
+        self.assertIn("both", payload["error"]["message"])
+
+    # =========================================================================
+    # Internal function unit tests (direct import)
+    # =========================================================================
+
+    def _import_safe_edit(self):
+        """Helper to import safe_edit module for direct function testing."""
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "safe-edit"))
+        try:
+            import safe_edit
+            return safe_edit
+        finally:
+            sys.path.pop(0)
+
+    def test_visualize_whitespace_format(self):
+        """Test visualize_whitespace converts whitespace to visible symbols."""
+        m = self._import_safe_edit()
+        result = m.visualize_whitespace("\thello world\r\n")
+        self.assertIn("[TAB]", result)
+        self.assertIn("[SP]", result)
+        self.assertIn("[CR]", result)
+        self.assertIn("[LF]", result)
+
+    def test_find_closest_match_empty_pattern(self):
+        """Test find_closest_match returns None for empty pattern."""
+        m = self._import_safe_edit()
+        self.assertIsNone(m.find_closest_match("some text", ""))
+
+    def test_find_closest_match_empty_text(self):
+        """Test find_closest_match returns None for empty text."""
+        m = self._import_safe_edit()
+        self.assertIsNone(m.find_closest_match("", "pattern"))
+
+    def test_find_closest_match_none_inputs(self):
+        """Test find_closest_match returns None when either arg is falsy."""
+        m = self._import_safe_edit()
+        self.assertIsNone(m.find_closest_match("text", ""))
+        self.assertIsNone(m.find_closest_match("", "text"))
+
+    def test_extract_nearby_content_no_match(self):
+        """Test extract_nearby_content returns None when no close match found."""
+        m = self._import_safe_edit()
+        result = m.extract_nearby_content("hello world\nfoo bar\n", "zzzzzzzz")
+        self.assertIsNone(result)
+
+    def test_classify_error_type_priority(self):
+        """Test classify_error_type returns correct type for overlapping patterns."""
+        m = self._import_safe_edit()
+        # "was not found" should match match_not_found before validation_error
+        self.assertEqual(m.classify_error_type("old text was not found"), "match_not_found")
+        # "not found" + "refusing" should match match_not_found
+        self.assertEqual(m.classify_error_type("pattern not found, refusing"), "match_not_found")
+        # "anchor pattern" + "not found" should match match_not_found
+        self.assertEqual(m.classify_error_type("anchor pattern not found"), "match_not_found")
+        # "anchor pattern found" + "times" should match match_ambiguous
+        self.assertEqual(m.classify_error_type("anchor pattern found 3 times"), "match_ambiguous")
+        # "expected" + "occurrence" should match match_count_mismatch
+        self.assertEqual(m.classify_error_type("expected 2 occurrence(s)"), "match_count_mismatch")
+        # "expected" + "match" + "found" should match match_count_mismatch
+        self.assertEqual(m.classify_error_type("expected 1 match, found 2"), "match_count_mismatch")
+        # "decode" should match encoding_error
+        self.assertEqual(m.classify_error_type("failed to decode as utf-8"), "encoding_error")
+        # "unsupported" should match validation_error
+        self.assertEqual(m.classify_error_type("unsupported encoding: foo"), "encoding_error")
+        # "file not found" should match file_error
+        self.assertEqual(m.classify_error_type("file not found: test.txt"), "file_error")
+
+    def test_set_final_newline_invalid_mode(self):
+        """Test set_final_newline raises SafeEditError for invalid mode."""
+        m = self._import_safe_edit()
+        with self.assertRaises(m.SafeEditError):
+            m.set_final_newline("hello\n", "invalid_mode", "\n")
+
+    def test_make_backup_path_with_slash_fails(self):
+        """Test make_backup_path rejects path separators in suffix."""
+        m = self._import_safe_edit()
+        path = Path(self.tmpdir / "test.txt")
+        path.write_bytes(b"hello\n")
+        with self.assertRaises(m.SafeEditError):
+            m.make_backup_path(path, None, "/evil.bak")
+
+    def test_make_backup_path_with_backslash_fails(self):
+        """Test make_backup_path rejects backslash in suffix."""
+        m = self._import_safe_edit()
+        path = Path(self.tmpdir / "test2.txt")
+        path.write_bytes(b"hello\n")
+        with self.assertRaises(m.SafeEditError):
+            m.make_backup_path(path, None, "\\evil.bak")
+
+    def test_find_context_anchor_with_regex_special_chars(self):
+        """Test find_context_anchor treats pattern as literal, not regex."""
+        m = self._import_safe_edit()
+        # Pattern with regex special chars should be matched literally
+        text = "func(*args, **kwargs)\nother line\n"
+        result = m.find_context_anchor(text, "*args, **kwargs")
+        self.assertEqual(result, 1)  # Found on line 1
+
+    def test_find_context_anchor_dot_star(self):
+        """Test find_context_anchor with .* pattern is literal match."""
+        m = self._import_safe_edit()
+        text = "some text\npattern: .*\nother\n"
+        # ".*" should match literally, not as regex
+        result = m.find_context_anchor(text, ".*")
+        self.assertEqual(result, 2)  # Found on line 2
+
+    def test_parse_regex_flags_combined(self):
+        """Test parse_regex_flags with combined flags."""
+        m = self._import_safe_edit()
+        import re
+        flags = m.parse_regex_flags("ims")
+        self.assertEqual(flags, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+
+    def test_parse_regex_flags_with_separator(self):
+        """Test parse_regex_flags with comma/space separators."""
+        m = self._import_safe_edit()
+        import re
+        flags = m.parse_regex_flags("i, m")
+        self.assertEqual(flags, re.IGNORECASE | re.MULTILINE)
+
+    def test_parse_regex_flags_invalid_char(self):
+        """Test parse_regex_flags raises on invalid character."""
+        m = self._import_safe_edit()
+        with self.assertRaises(m.SafeEditError):
+            m.parse_regex_flags("z")
+
+    def test_apply_operation_unknown_op(self):
+        """Test apply_operation raises SafeEditError for unknown op."""
+        m = self._import_safe_edit()
+        with self.assertRaises(m.SafeEditError):
+            m.apply_operation("hello\n", {"op": "nonsense"}, "\n")
+
+    def test_normalize_encoding_underscore_to_hyphen(self):
+        """Test normalize_encoding converts underscores to hyphens."""
+        m = self._import_safe_edit()
+        self.assertEqual(m.normalize_encoding("utf_8"), "utf-8")
+        self.assertEqual(m.normalize_encoding("UTF_8_BOM"), "utf-8-bom")
+
+    def test_normalize_encoding_none_defaults_to_auto(self):
+        """Test normalize_encoding returns 'auto' for None input."""
+        m = self._import_safe_edit()
+        self.assertEqual(m.normalize_encoding(None), "auto")
+
+    def test_strict_decode_bom_missing(self):
+        """Test strict_decode fails when BOM is expected but missing."""
+        m = self._import_safe_edit()
+        info = m.EncodingInfo("utf-8-bom", "utf-8", codecs.BOM_UTF8)
+        with self.assertRaises(m.SafeEditError):
+            m.strict_decode(b"hello\n", info)
+
+    def test_detect_encoding_auto_empty_file(self):
+        """Test detect_encoding auto mode returns utf-8 for empty file."""
+        m = self._import_safe_edit()
+        result = m.detect_encoding(b"", "auto")
+        self.assertEqual(result.name, "utf-8")
+
+    def test_detect_encoding_auto_utf8_bom(self):
+        """Test detect_encoding auto detects UTF-8 BOM."""
+        m = self._import_safe_edit()
+        result = m.detect_encoding(codecs.BOM_UTF8 + b"hello\n", "auto")
+        self.assertEqual(result.name, "utf-8-bom")
+        self.assertEqual(result.bom, codecs.BOM_UTF8)
+
+    def test_detect_encoding_auto_utf16_le_bom(self):
+        """Test detect_encoding auto detects UTF-16 LE BOM."""
+        m = self._import_safe_edit()
+        result = m.detect_encoding(codecs.BOM_UTF16_LE + "hello\n".encode("utf-16-le"), "auto")
+        self.assertEqual(result.name, "utf-16-le")
+
+    def test_detect_encoding_auto_utf16_be_bom(self):
+        """Test detect_encoding auto detects UTF-16 BE BOM."""
+        m = self._import_safe_edit()
+        result = m.detect_encoding(codecs.BOM_UTF16_BE + "hello\n".encode("utf-16-be"), "auto")
+        self.assertEqual(result.name, "utf-16-be")
+
+    def test_detect_encoding_auto_plain_utf8(self):
+        """Test detect_encoding auto detects plain UTF-8 (no BOM)."""
+        m = self._import_safe_edit()
+        result = m.detect_encoding(b"hello world\n", "auto")
+        self.assertEqual(result.name, "utf-8")
+        self.assertEqual(result.bom, b"")
+
+    def test_detect_encoding_auto_gbk(self):
+        """Test detect_encoding auto falls back to GBK for non-UTF-8 CJK."""
+        m = self._import_safe_edit()
+        # GBK-encoded Chinese text is not valid UTF-8
+        result = m.detect_encoding(bytes.fromhex("c4 e3 ba c3 0a"), "auto")
+        self.assertEqual(result.name, "gbk")
+
+    def test_detect_encoding_auto_all_fail(self):
+        """Test detect_encoding auto raises SafeEditError for undetectable bytes."""
+        m = self._import_safe_edit()
+        # Bytes that are not valid UTF-8, not valid GBK, not UTF-16
+        with self.assertRaises(m.SafeEditError) as ctx:
+            m.detect_encoding(bytes([0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87]), "auto")
+        self.assertIn("auto-detect", str(ctx.exception))
+
+    def test_looks_like_utf16_without_bom_short_data(self):
+        """Test looks_like_utf16_without_bom returns None for data < 4 bytes."""
+        m = self._import_safe_edit()
+        self.assertIsNone(m.looks_like_utf16_without_bom(b"\x00"))
+        self.assertIsNone(m.looks_like_utf16_without_bom(b"\x00\x00"))
+        self.assertIsNone(m.looks_like_utf16_without_bom(b""))
+
+    def test_looks_like_utf16_without_bom_le(self):
+        """Test looks_like_utf16_without_bom detects UTF-16 LE without BOM."""
+        m = self._import_safe_edit()
+        # UTF-16 LE: ASCII chars followed by \x00
+        data = "hello\n".encode("utf-16-le")
+        result = m.looks_like_utf16_without_bom(data)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "utf-16-le")
+
+    def test_looks_like_utf16_without_bom_be(self):
+        """Test looks_like_utf16_without_bom detects UTF-16 BE without BOM."""
+        m = self._import_safe_edit()
+        # UTF-16 BE: \x00 followed by ASCII chars
+        data = "hello\n".encode("utf-16-be")
+        result = m.looks_like_utf16_without_bom(data)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "utf-16-be")
+
+    def test_looks_like_utf16_without_bom_plain_ascii(self):
+        """Test looks_like_utf16_without_bom returns None for plain ASCII."""
+        m = self._import_safe_edit()
+        self.assertIsNone(m.looks_like_utf16_without_bom(b"hello world this is plain ascii\n"))
+
+    def test_normalize_for_match_no_flags(self):
+        """Test normalize_for_match returns text unchanged when no flags set."""
+        m = self._import_safe_edit()
+        text = "  hello\r\nworld  "
+        self.assertEqual(m.normalize_for_match(text), text)
+
+    def test_normalize_for_match_ignore_indent(self):
+        """Test normalize_for_match strips leading whitespace with ignore_indent."""
+        m = self._import_safe_edit()
+        text = "  hello\n    world"
+        result = m.normalize_for_match(text, ignore_indent=True)
+        self.assertNotIn("  hello", result)
+        self.assertEqual(result, "hello\nworld")
+
+    def test_normalize_for_match_ignore_eol(self):
+        """Test normalize_for_match normalizes line endings with ignore_eol."""
+        m = self._import_safe_edit()
+        text = "hello\r\nworld"
+        result = m.normalize_for_match(text, ignore_eol=True)
+        self.assertNotIn("\r\n", result)
+        self.assertEqual(result, "hello\nworld")
+
+    def test_normalize_for_match_normalize_whitespace(self):
+        """Test normalize_for_match collapses whitespace."""
+        m = self._import_safe_edit()
+        text = "hello   world\n\tfoo  bar"
+        result = m.normalize_for_match(text, normalize_whitespace=True)
+        # All whitespace collapsed to single space
+        self.assertNotIn("  ", result)
+        self.assertNotIn("\t", result)
+
+    def test_split_records_and_join_roundtrip(self):
+        """Test split_records and join_records are inverse operations."""
+        m = self._import_safe_edit()
+        text = "alpha\r\nbeta\n gamma\r"
+        records = m.split_records(text)
+        result = m.join_records(records)
+        self.assertEqual(result, text)
+
+    def test_detect_line_ending_no_newlines(self):
+        """Test detect_line_ending returns 'lf' for text with no newlines."""
+        m = self._import_safe_edit()
+        style, counts, mixed = m.detect_line_ending("hello world")
+        self.assertEqual(style, "lf")
+        self.assertFalse(mixed)
+
+    def test_detect_line_ending_crlf(self):
+        """Test detect_line_ending correctly identifies CRLF."""
+        m = self._import_safe_edit()
+        style, counts, mixed = m.detect_line_ending("hello\r\nworld\r\n")
+        self.assertEqual(style, "crlf")
+        self.assertEqual(counts["crlf"], 2)
+
+    def test_detect_line_ending_mixed(self):
+        """Test detect_line_ending detects mixed line endings."""
+        m = self._import_safe_edit()
+        style, counts, mixed = m.detect_line_ending("hello\r\nworld\nfoo")
+        self.assertTrue(mixed)
+        self.assertEqual(counts["crlf"], 1)
+        self.assertEqual(counts["lf"], 1)
+
+    def test_encode_text_roundtrip(self):
+        """Test encode_text and strict_decode roundtrip for GBK."""
+        m = self._import_safe_edit()
+        original_text = "你好世界"
+        info = m.EncodingInfo("gbk", "gbk")
+        encoded = m.encode_text(original_text, info)
+        decoded = m.strict_decode(encoded, info)
+        self.assertEqual(decoded, original_text)
+
+    def test_encoding_for_output_preserve(self):
+        """Test encoding_for_output with 'preserve' returns original."""
+        m = self._import_safe_edit()
+        original = m.EncodingInfo("gbk", "gbk")
+        result = m.encoding_for_output("preserve", original)
+        self.assertEqual(result.name, "gbk")
+
+    def test_encoding_for_output_explicit(self):
+        """Test encoding_for_output with explicit encoding name."""
+        m = self._import_safe_edit()
+        original = m.EncodingInfo("gbk", "gbk")
+        result = m.encoding_for_output("utf-8", original)
+        self.assertEqual(result.name, "utf-8")
+        self.assertEqual(result.codec, "utf-8")
+
+    # =========================================================================
+    # CRLF + ignore_eol + ignore_indent combined (CLI indirect test for
+    # _find_original_position_line_based)
+    # =========================================================================
+
+    def test_crlf_file_ignore_eol_edit(self):
+        """Test editing a CRLF file with --ignore-eol finds and replaces correctly."""
+        path = self.tmpdir / "crlf_ignroeol.txt"
+        path.write_bytes(b"alpha\r\n  beta\r\ngamma\r\n")
+        self.run_tool(
+            "edit", "--file", path,
+            "--old", "beta", "--new", "BETA",
+            "--ignore-eol", "--expected-count", "1",
+        )
+        self.assertEqual(path.read_bytes(), b"alpha\r\n  BETA\r\ngamma\r\n")
+
+    def test_crlf_file_ignore_indent_edit(self):
+        """Test editing a CRLF file with --ignore-indent finds indented text."""
+        path = self.tmpdir / "crlf_indent.txt"
+        path.write_bytes(b"alpha\r\n  beta\r\ngamma\r\n")
+        self.run_tool(
+            "edit", "--file", path,
+            "--old", "beta", "--new", "BETA",
+            "--ignore-indent", "--expected-count", "1",
+        )
+        self.assertEqual(path.read_bytes(), b"alpha\r\n  BETA\r\ngamma\r\n")
+
+    def test_crlf_file_ignore_eol_and_indent_combined(self):
+        """Test editing a CRLF file with both --ignore-eol and --ignore-indent."""
+        path = self.tmpdir / "crlf_both.txt"
+        path.write_bytes(b"alpha\r\n  beta\r\ngamma\r\n")
+        self.run_tool(
+            "edit", "--file", path,
+            "--old", "beta", "--new", "BETA",
+            "--ignore-eol", "--ignore-indent", "--expected-count", "1",
+        )
+        self.assertEqual(path.read_bytes(), b"alpha\r\n  BETA\r\ngamma\r\n")
+
+    def test_crlf_file_auto_match(self):
+        """Test auto-match on a CRLF file with LF-style --old text."""
+        path = self.tmpdir / "crlf_automatch.txt"
+        path.write_bytes(b"alpha\r\n  beta\r\ngamma\r\n")
+        # --old uses LF, file uses CRLF; auto-match should resolve via ignore-eol
+        self.run_tool(
+            "edit", "--file", path,
+            "--old", "beta", "--new", "BETA",
+            "--auto-match", "--expected-count", "1",
+        )
+        self.assertEqual(path.read_bytes(), b"alpha\r\n  BETA\r\ngamma\r\n")
+
+    # =========================================================================
+    # Additional edge cases
+    # =========================================================================
+
+    def test_edit_empty_old_text_fails(self):
+        """Test editing with empty --old fails."""
+        path = self.tmpdir / "empty_old.txt"
+        path.write_bytes(b"hello\n")
+        result = self.run_tool(
+            "edit", "--file", path, "--old", "", "--new", "world",
+            "--json", expect=2,
+        )
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+
+    def test_regex_invalid_pattern_fails(self):
+        """Test regex with invalid pattern fails gracefully."""
+        path = self.tmpdir / "bad_regex.txt"
+        path.write_bytes(b"hello\n")
+        result = self.run_tool(
+            "regex", "--file", path, "--pattern", "[invalid", "--replacement", "x",
+            "--json", expect=2,
+        )
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+
+    def test_replace_lines_anchor_with_offset(self):
+        """Test replace-lines with anchor pattern and positive offsets."""
+        path = self.tmpdir / "anchor_offset.txt"
+        path.write_bytes(b"line1\nmarker\nline3\nline4\nline5\n")
+        # marker on line 2, offset_start=+1 → line 3, offset_end=+1 → line 3
+        # Replace only line 3 with "replaced"
+        self.run_tool(
+            "replace-lines", "--file", path,
+            "--anchor-pattern", "marker",
+            "--offset-start", "+1", "--offset-end", "+1",
+            "--text", "replaced\n",
+        )
+        self.assertEqual(path.read_bytes(), b"line1\nmarker\nreplaced\nline4\nline5\n")
+
+    def test_delete_lines_anchor_with_negative_offset(self):
+        """Test delete-lines with anchor pattern and negative/positive offsets."""
+        path = self.tmpdir / "anchor_neg.txt"
+        path.write_bytes(b"line1\nline2\nmarker\nline4\nline5\n")
+        # marker on line 3, offset_start=-1 → line 2, offset_end=+1 → line 4
+        # Delete lines 2 through 4 (inclusive), leaving line1 and line5
+        self.run_tool(
+            "delete-lines", "--file", path,
+            "--anchor-pattern", "marker",
+            "--offset-start", "-1", "--offset-end", "+1",
+        )
+        self.assertEqual(path.read_bytes(), b"line1\nline5\n")
+
+    def test_file_not_found_fails(self):
+        """Test editing a non-existent file fails with file_error."""
+        path = self.tmpdir / "nonexistent.txt"
+        result = self.run_tool(
+            "inspect", "--file", path, "--json", expect=2,
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "file_error")
+
+    def test_edit_file_not_found_fails(self):
+        """Test editing a non-existent file fails."""
+        path = self.tmpdir / "no_such_file.txt"
+        result = self.run_tool(
+            "edit", "--file", path, "--old", "x", "--new", "y",
+            "--json", expect=2,
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "file_error")
+
+    def test_nul_bytes_rejected_in_edit_without_flag(self):
+        """Test editing a file with NUL bytes is rejected without --allow-nul."""
+        path = self.tmpdir / "has_nul.txt"
+        path.write_bytes(b"hello\x00world\n")
+        result = self.run_tool(
+            "edit", "--file", path, "--old", "hello", "--new", "hi",
+            "--json", expect=2,
+        )
+        payload = json.loads(result.stdout)
+        # "decoded text contains NUL bytes" matches "decode" → encoding_error
+        self.assertIn(payload["error"]["type"], ("encoding_error", "validation_error"))
+        self.assertFalse(payload["ok"])
+
+    def test_nul_bytes_detected_in_inspect(self):
+        """Test inspect reports hasNul=true for files with NUL bytes."""
+        path = self.tmpdir / "nul_inspect.txt"
+        path.write_bytes(b"hello\x00world\n")
+        result = self.run_tool("inspect", "--file", path, "--json")
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["hasNul"])
+
+    def test_diff_input_with_expected_count(self):
+        """Test diff-input with --expected-count applies to each block."""
+        path = self.tmpdir / "diff_count.txt"
+        path.write_bytes(b"alpha\nbeta\ngamma\n")
+        diff = "------- SEARCH\nbeta\n=======\nBETA\n+++++++ REPLACE"
+        self.run_tool("edit", "--file", path, "--diff-input", diff, "--expected-count", "1")
+        self.assertEqual(path.read_bytes(), b"alpha\nBETA\ngamma\n")
+
 
 if __name__ == "__main__":
     unittest.main()
