@@ -168,6 +168,59 @@ Differences:
 - indentation uses tabs instead of spaces
 ```
 
+## Stdin 和跨平台传参
+
+不同 shell 对特殊字符的处理不同，safe-edit 提供多种传参方式避免转义问题。
+
+### Stdin 方式
+
+通过管道传入内容，避免 shell 解析特殊字符：
+
+**PowerShell (Windows):**
+```powershell
+# 避免 % 符号问题
+"foo bar" | py -3 safe_edit.py edit --file a.cpp --old-stdin --new "new text"
+
+# 从文件读取
+Get-Content old.txt | py -3 safe_edit.py edit --file a.cpp --old-stdin --new-file new.txt
+```
+
+**CMD (Windows):**
+```cmd
+type old.txt | py -3 safe_edit.py edit --file a.cpp --old-stdin --new-file new.txt
+```
+
+**Bash (Linux/macOS):**
+```bash
+cat old.txt | python3 safe_edit.py edit --file a.cpp --old-stdin --new-file new.txt
+```
+
+### 文件方式
+
+多行或大段内容推荐用文件传参：
+
+```bash
+python safe_edit.py edit --file a.cpp --old-file old.txt --new-file new.txt
+python safe_edit.py insert --file a.cpp --line 5 --text-file block.txt
+```
+
+### 特殊字符问题
+
+| Shell | 问题字符 | 示例 | 解决方案 |
+|-------|---------|------|---------|
+| PowerShell | `` ` `` `$` `%` | `"foo %VAR%"` | 用 stdin 或文件 |
+| CMD | `%` `^` | `%PATH%` | 用 stdin 或文件 |
+| Bash | `$` `` ` `` `\` | `$HOME` | 用单引号或文件 |
+
+### PowerShell 编码问题
+
+如果中文乱码，设置输出编码：
+
+```powershell
+$OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Get-Content old.txt | py -3 safe_edit.py edit --file a.cpp --old-stdin --new-file new.txt
+```
 ## 多行内容
 
 命令行参数不适合塞大段代码。推荐用文件或 stdin：

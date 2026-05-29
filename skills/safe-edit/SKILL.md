@@ -134,6 +134,185 @@ Available value sources:
 
 Argument files default to UTF-8; override with `--arg-encoding` (aliases: `--param-encoding`, `--input-encoding`).
 
+## Cross-Platform Shell Escaping
+
+Different shells have different quoting and escaping rules. When passing complex text through command-line arguments, special characters can cause unexpected behavior.
+
+### PowerShell (Windows)
+
+PowerShell interprets several special characters in double-quoted strings:
+
+- `` ` `` - Escape character (backtick)
+- `$` - Variable expansion (e.g., `$var`)
+- `%` - Environment variable expansion in CMD compatibility mode
+- Double quotes allow expansion, single quotes are literal
+
+**Problem examples:**
+```powershell
+# WRONG: ` gets interpreted as escape sequence
+py -3 safe_edit.py edit --file a.cpp --old "foo`bar" --new "baz"
+
+# WRONG: $var gets expanded to variable value
+py -3 safe_edit.py edit --file a.cpp --old "$variable" --new "bar"
+```
+
+### CMD (Windows)
+
+CMD has simpler but different rules:
+
+- `%` - Environment variable expansion
+- `^` - Escape character
+- Double quotes preserve most characters
+
+### Bash (Linux/macOS)
+
+Bash uses standard shell escaping:
+
+- `$` - Variable expansion
+- `\` - Escape character
+- Single quotes are literal (no expansion)
+
+### Recommended Solutions
+
+**1. Use stdin for complex text:**
+
+```powershell
+# PowerShell: Pipe text to avoid quoting issues
+"foo bar" | py -3 safe_edit.py edit --file a.cpp --old-stdin --new "new text"
+
+# Read old text from file
+Get-Content old.txt | py -3 safe_edit.py edit --file a.cpp --old-stdin --new-file new.txt
+```
+
+```cmd
+:: CMD: Use type command
+type old.txt | py -3 safe_edit.py edit --file a.cpp --old-stdin --new-file new.txt
+```
+
+```bash
+# Bash: Use cat command
+cat old.txt | python3 safe_edit.py edit --file a.cpp --old-stdin --new-file new.txt
+```
+
+**2. Use file-based arguments:**
+
+```bash
+# Works on all platforms
+python safe_edit.py edit --file a.cpp --old-file old.txt --new-file new.txt
+```
+
+**3. PowerShell encoding considerations:**
+
+PowerShell's default encoding may not match your file. Use explicit encoding:
+
+```powershell
+# Force UTF-8 output
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+"foo bar" | py -3 safe_edit.py edit --file a.cpp --old-stdin --new "bar"
+
+# Or use Out-File with encoding
+"old text" | Out-File -Encoding utf8 old.txt
+py -3 safe_edit.py edit --file a.cpp --old-file old.txt --new "new text"
+```
+
+### When to Use Each Approach
+
+| Scenario | Recommended Method |
+|----------|-------------------|
+| Simple ASCII text | Direct `--old` / `--new` arguments |
+| Text with special characters | Use `--old-stdin` / `--new-stdin` |
+| Multiline text | Use `--old-file` / `--new-file` |
+| Large text (>1KB) | Use `--old-file` / `--new-file` |
+| Cross-platform scripts | Use file-based arguments |
+
+
+## Common Issues and Solutions
+
+### Line Ending Mismatches
+
+When matching text fails due to line ending differences (CRLF vs LF), use `--ignore-eol`:
+
+```bash
+# File has CRLF, but your pattern uses LF
+python safe_edit.py edit --file code.cpp \
+    --old "line1\nline2" \
+    --new "new1\nnew2" \
+    --ignore-eol
+```
+
+This is common when:
+- Editing Windows files from WSL or Git Bash
+- Files were converted by Git's `autocrlf` setting
+- Copying text from web browsers or documentation
+
+### Encoding Issues
+
+**GBK/Shift-JIS/Big5 Projects:**
+
+For projects using legacy encodings, specify the encoding explicitly:
+
+```bash
+# Chinese project using GBK encoding
+python safe_edit.py edit --file source.cpp \
+    --encoding gbk \
+    --old "旧文本" \
+    --new "新文本"
+```
+
+**PowerShell Encoding Problems:**
+
+PowerShell 5.1 defaults to UTF-16LE for piping, which may cause issues. Solutions:
+
+```powershell
+# Solution 1: Use PowerShell 7+ (defaults to UTF-8)
+pwsh -Command '"text" | python safe_edit.py edit --file a.cpp --old-stdin --new "new"'
+
+# Solution 2: Write to file first
+"text" | Out-File -Encoding utf8 temp.txt
+python safe_edit.py edit --file a.cpp --old-file temp.txt --new "new"
+
+# Solution 3: Use .NET encoding
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+"text" | python safe_edit.py edit --file a.cpp --old-stdin --new "new"
+```
+
+### Whitespace and Indentation
+
+When indentation doesn't match (tabs vs spaces), use `--ignore-indent`:
+
+```bash
+# File uses tabs, pattern uses spaces
+python safe_edit.py edit --file code.cpp \
+    --old "    return 42" \
+    --new "    return 43" \
+    --ignore-indent
+```
+
+For multiple whitespace issues, combine flags:
+
+```bash
+python safe_edit.py edit --file code.cpp \
+    --old "foo    bar" \
+    --new "baz qux" \
+    --normalize-whitespace
+```
+
+### Match Failure Diagnostics
+
+When a match fails, use `--explain-match-failure` to understand why:
+
+```bash
+python safe_edit.py edit --file code.cpp \
+    --old "return 42" \
+    --new "return 43" \
+    --explain-match-failure
+```
+
+This shows:
+- Closest match location
+- Expected vs actual whitespace
+- Specific differences detected
+
 ## Batch JSON
 
 Use batch when an edit needs multiple transformations but should read and write the target only once:
