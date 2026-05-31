@@ -44,6 +44,8 @@ Need to edit a file?
 │
 ├─ Is it a text file? ─── No → STOP, use another tool
 │
+├─ ⚠️ Shell parses args first. Need escaping for special chars or newlines?
+│
 ├─ Do you know the encoding? ─── No → run `stat --file F --json`
 │
 ├─ What kind of edit?
@@ -222,13 +224,15 @@ Prompts: `y` (yes), `n` (no), `a` (all remaining), `q` (quit), `?` (help). Requi
 
 ## Cross-Platform Shell Escaping
 
-| Shell | Problem chars | Solution |
-|-------|--------------|----------|
-| PowerShell | `` ` `` `$` `%` | Use `--old-stdin` or `--old-file` |
-| CMD | `%` `^` | Use `--old-stdin` or `--old-file` |
-| Bash | `$` `` \ `` | Use single quotes or `--old-file` |
+| Shell | Escape char | Special chars | Example |
+|-------|-------------|---------------|---------|
+| Bash | `\` | `$` `` ` `` `"` `\` | `\$` or use single quotes |
+| PowerShell | `` ` `` | `` ` `` `$` `"` | `` `$ `` or use --old-file |
+| CMD | `^` | `%` `^` | `^%` or use --old-file |
 
-PowerShell encoding fix: `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8`
+**Safe alternative:** `--old-file`, `--new-file`, `--diff-input-file` bypass shell parsing entirely.
+
+**PowerShell encoding fix:** `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8`
 
 ## Appendix: Full Option Reference
 
