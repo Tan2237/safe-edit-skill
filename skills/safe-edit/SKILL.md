@@ -53,6 +53,116 @@ Need modification?
 
 ---
 
+## Structural Editing Rules
+
+These rules prevent the most common Agent editing mistakes.
+
+### 1. Command Selection Priority
+
+```
+Need modification?
+│
+├─ Replace exact text (within a line)?
+│      → edit --old X --new Y
+│
+├─ Replace entire function/class body?
+│      → replace-lines --anchor-pattern "unique_signature" --text T
+│
+├─ Replace known line range?
+│      → replace-lines --start N --end M --text T
+│
+├─ Add content at file boundaries?
+│      → prepend --text T  (beginning)
+│      → append --text T   (end)
+│
+├─ Delete lines?
+│      → delete --line N
+│      → delete-lines --start N --end M
+│
+└─ Insert near structural boundary (closing braces, etc.)?
+       → CAUTION: Use replace-lines on the boundary line instead
+```
+
+### 2. Avoid `insert` Near Structural Boundaries
+
+**Problem:** `insert --line N` inserts AFTER line N. Near closing braces `}`, agents often misjudge whether to insert before or after.
+
+**Bad:**
+```bash
+insert --line 18639  # inserts after "}" but where exactly?
+```
+
+**Good:** Replace the boundary line itself, preserving structure:
+```bash
+replace-lines --start 18639 --end 18639 --text "}
+new_function_here"
+```
+
+### 3. Verify Anchor Uniqueness Before Using
+
+**Problem:** `--anchor-pattern "iSoftTimes"` may match multiple locations (definition + calls).
+
+**Before using anchor-pattern:**
+```bash
+grep -n "pattern" file.cpp  # Check occurrence count
+```
+
+If pattern appears multiple times:
+- Use more specific pattern (include function signature)
+- Or use `--anchor-occurrence` with correct count
+- Or fall back to `--start`/`--end` line numbers
+
+**Bad:** `--anchor-pattern "iSoftTimes"` (appears 5 times)
+
+**Good:** `--anchor-pattern "void RasterizeFilterNullHlr("` (unique)
+
+### 4. Line Numbers Invalidate After Edits
+
+**Rule:** After ANY operation that changes line count, ALL cached line numbers become invalid.
+
+Operations that change line count:
+- `insert` (adds lines)
+- `append` / `prepend` (may add lines)
+- `delete` / `delete-lines` (removes lines)
+- `replace-lines` (may change line count)
+
+**Workflow:**
+```bash
+# Step 1: Do first edit
+replace-lines --start 100 --end 105 --text "..."
+
+# Step 2: Re-query line numbers BEFORE next edit
+grep -n "target_function" file.cpp
+
+# Step 3: Calculate new line numbers
+# Step 4: Do second edit
+```
+
+### 5. Bracket Safety for Block Replacement
+
+When replacing code blocks:
+- Include the opening line (with `{`) in the range
+- Include the closing line (with `}`) in the range
+- Or: ensure replacement text has matching braces
+
+**Before replacing:**
+```
+--start 100 --end 150  # Does this include the closing "}"?
+```
+
+### 6. Validate After Structural Edits
+
+After editing functions, classes, or structured blocks:
+```bash
+# Check bracket matching
+python -c "print(open('file.cpp').read().count('{') == open('file.cpp').read().count('}'))"
+
+# Or compile immediately
+cl file.cpp  # or g++, javac, etc.
+```
+
+---
+
 ## Core Rules
 
 1. **Default to `--old-file` for special characters**: `$`, `%`, `\`, `` ` ``, `'`, `"`, newline, >100 chars.
