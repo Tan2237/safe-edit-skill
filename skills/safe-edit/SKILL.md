@@ -44,49 +44,93 @@ Need to edit a file?
 │
 ├─ Is it a text file? ─── No → STOP, use another tool
 │
-├─ ⚠️ Shell parses args first. Need escaping for special chars or newlines?
+├─ ⚠️ PARAM MODE CHECK
+│   │
+│   ├─ old/new contains ANY of:
+│   │     • newline (multiline)
+│   │     • quote (' or ")
+│   │     • backslash (\)
+│   │     • dollar ($)
+│   │     • percent (%)
+│   │     • backtick (`)
+│   │     • >100 characters
+│   │
+│   │   YES → use --old-file / --new-file (avoid shell parsing)
+│   │   NO  → use --old "..." --new "..."
 │
-├─ Do you know the encoding? ─── No → run `stat --file F --json`
+├─ EDIT TYPE CHECK
+│   │
+│   ├─ SINGLE LINE:
+│   │     edit --old X --new Y --expected-count 1
+│   │
+│   ├─ MULTILINE:
+│   │     edit --old X --new Y --auto-match --expected-count 1
+│   │     (auto-match tries: exact → ignore-eol → ignore-indent → normalize-whitespace)
+│   │
+│   └─ CODE BLOCK (json/yaml/markdown/code):
+│        edit --old X --new Y --auto-match --normalize-whitespace --expected-count 1
 │
-├─ What kind of edit?
+├─ MATCH FAILED?
 │   │
-│   ├─ Replace exact text → `edit --old X --new Y --expected-count 1`
-│   │   └─ Failed? → `edit --old X --new Y --auto-match --expected-count 1`
-│   │       └─ Still failed? → `edit --old X --new Y --auto-match --fuzzy --expected-count 1`
+│   ├─ Step 1: Was --auto-match on? If no, add it
 │   │
-│   ├─ Replace with regex → `regex --pattern P --replacement R --expected-count 1`
+│   ├─ Step 2: --auto-match --fuzzy
 │   │
-│   ├─ Multiple replacements → `edit --diff-input "SEARCH/REPLACE blocks"`
-│   │   or → `batch --ops-file ops.json`
+│   ├─ Step 3: ANCHOR STRATEGY
+│   │     replace-lines --anchor-pattern "function_name" --offset-start +N --offset-end +M --text T
 │   │
-│   ├─ Insert/append text → `insert --line N` / `append` / `prepend`
-│   │
-│   ├─ Delete lines → `delete --line N` / `delete-lines --start S --end E`
-│   │
-│   └─ Replace line range → `replace-lines --start S --end E --text T`
-│       or with anchor → `replace-lines --anchor-pattern A --offset-start +N --offset-end +M --text T`
+│   └─ Step 4: --explain-match-failure (diagnose)
 │
-├─ Ambiguous match (text appears multiple times)?
-│   └─ Add `--context-before "unique text before"` or `--context-after "unique text after"`
-│
-└─ Need format conversion? → `convert --to-encoding X --to-line-ending Y --final-newline Z`
+└─ Ambiguous match?
+    └─ Add --context-before "unique text" or --context-after "unique text"
 ```
 
-## Match Failure Handling Protocol
+## Shell Escaping Quick Reference
 
-When `edit` fails with "old text was not found":
+| Character | Problem | Example | Solution |
+|-----------|---------|---------|----------|
+| `$VAR` | Shell expansion | `$env:PATH` | Use `--old-file` |
+| `%VAR%` | CMD expansion | `%PATH%` | Use `--old-file` |
+| `` ` `` | PowerShell escape | `` `n `` | Use `--old-file` |
+| `\` | Backslash escape | `C:\temp` | Use `--old-file` |
+| `'` or `"` | Quote parsing | `it's` | Use `--old-file` |
+| Newline | Multi-line args | Code blocks | Use `--old-file` |
+| >100 chars | Long args | Large blocks | Use `--old-file` |
 
-1. **Read the error** — if `--json`, check `error.type` and `nearbyContent`
-2. **Diagnose** — common causes:
-   - CRLF vs LF → add `--ignore-eol`
-   - Tab vs space indentation → add `--ignore-indent`
-   - Extra whitespace → add `--normalize-whitespace`
-   - Text slightly different → add `--auto-match`
-   - Completely wrong text → check `nearbyContent.similarity` and fix `--old`
-3. **Retry with relaxation**:
-   - First: `--auto-match` (tries exact → ignore-eol → ignore-indent → normalize-whitespace)
-   - Last resort: `--auto-match --fuzzy` (similarity ≥ 0.6)
-4. **Always verify** — check `matchStrategy` in output to know which level matched
+**Rule: When in doubt, use `--old-file` / `--new-file`.**
+
+## Match Failure Escalation Path
+
+When `edit` fails, follow this escalation path:
+
+```
+edit --old X --new Y --expected-count 1
+│
+├─ SUCCESS → Done
+│
+└─ FAIL → Check error message:
+    │
+    ├─ "old text was not found"
+    │   │
+    │   ├─ Was --auto-match already on?
+    │   │   NO  → retry with --auto-match
+    │   │   YES → retry with --auto-match --fuzzy
+    │   │
+    │   └─ Still failed?
+    │       │
+    │       ├─ Is there a unique anchor (function/class name)?
+    │       │   YES → replace-lines --anchor-pattern "..."
+    │       │
+    │       └─ NO → --explain-match-failure, diagnose, fix --old
+    │
+    ├─ "text appears multiple times"
+    │   └─ Add --context-before "unique" or --context-after "unique"
+    │
+    └─ "expected count mismatch"
+        └─ Adjust --expected-count or use --first
+```
+
+**Key insight:** Most multiline match failures are whitespace differences. `--auto-match` handles this automatically.
 
 ### Structured Error JSON (--json mode)
 
@@ -144,6 +188,9 @@ new text line 2
 8. For GBK/Shift-JIS/Big5 projects, pass `--encoding gbk` etc. before inserting non-ASCII text.
 9. Do not use for binary files, huge generated files, or non-text formats.
 10. Use `--auto-match` instead of guessing `--ignore-eol`/`--ignore-indent` manually.
+11. Default to `--old-file` for multiline content or special characters (`$`, `%`, `\`, `` ` ``).
+12. Use `--auto-match` by default for multiline edits.
+13. Prefer `--anchor-pattern` for function/class body replacement.
 
 ## Commands
 
@@ -162,18 +209,28 @@ new text line 2
 
 ## Match Options
 
-| Option | Effect | When to use |
-|--------|--------|-------------|
-| `--auto-match` | Auto-try: exact → ignore-eol → ignore-indent → normalize-whitespace | Match fails and you're unsure why |
-| `--fuzzy` | Enable fuzzy matching (≥ 0.6 similarity), requires `--auto-match` | Text is close but not exact |
-| `--ignore-indent` | Ignore leading whitespace differences | Tab vs space indentation |
-| `--ignore-eol` | Ignore CRLF vs LF differences | Cross-platform files |
-| `--normalize-whitespace` | Collapse consecutive whitespace | Variable whitespace quantity |
-| `--context-before T` | Text must appear before the match | Disambiguate multiple matches |
-| `--context-after T` | Text must appear after the match | Disambiguate multiple matches |
-| `--explain-match-failure` | Show detailed match diagnostics | Debug failed matches |
+| Option | Effect | When to use (triggers) |
+|--------|--------|------------------------|
+| `--auto-match` | Auto-try: exact → ignore-eol → ignore-indent → normalize-whitespace | **Default for multiline edits** |
+| `--fuzzy` | Fuzzy matching (≥ 0.6 similarity), requires `--auto-match` | AI-generated approximate text |
+| `--ignore-indent` | Ignore leading whitespace | Mixed tab/space indentation |
+| `--ignore-eol` | Ignore CRLF vs LF | Cross-platform files |
+| `--normalize-whitespace` | Collapse consecutive whitespace | **JSON/YAML/Markdown** |
+| `--context-before T` | Text must appear before match | Disambiguate duplicates |
+| `--context-after T` | Text must appear after match | Disambiguate duplicates |
+| `--explain-match-failure` | Show detailed diagnostics | Debug failed matches |
 
 Key principle: match options affect matching only, not replacement text.
+
+**Content type → Default strategy:**
+
+| Content type | Default flags |
+|--------------|---------------|
+| Single line text | (none) |
+| Multiline code | `--auto-match` |
+| JSON / YAML / Markdown | `--auto-match --normalize-whitespace` |
+| Cross-platform file | `--auto-match` |
+| Function/class body | `--anchor-pattern` (use replace-lines, not edit) |
 
 ## Large or Multiline Values
 
@@ -188,6 +245,37 @@ python safe_edit.py insert --file a.cpp --line 5 --text-file block.txt
 Available: `--old`/`--old-file`/`--old-stdin`, `--new`/`--new-file`/`--new-stdin`, `--pattern`/`--pattern-file`/`--pattern-stdin`, `--replacement`/`--replacement-file`/`--replacement-stdin`, `--text`/`--text-file`/`--text-stdin`, `--diff-input`/`--diff-input-file`.
 
 Argument files default to UTF-8; override with `--arg-encoding`.
+
+## Anchor-First Strategy
+
+For function/class/config block replacement, prefer anchors over full-text matching.
+
+**Why:** Code formatters change whitespace, but function names stay stable.
+
+**Example:**
+
+```cpp
+// Before formatting
+void Process()
+{
+    // 50 lines
+}
+
+// After formatting
+void Process() {
+    // 50 lines, different braces/indentation
+}
+```
+
+**Bad:** `edit --old "void Process()\n{\n..."` → FAILS after formatting
+
+**Good:** `replace-lines --anchor-pattern "void Process" --offset-start +0 --offset-end +50 --text "..."`
+
+**Use anchor-first for:**
+- Entire function body replacement
+- Class method replacement
+- JSON/YAML config blocks
+- Any structured block with a distinctive header
 
 ## Anchor-Based Positioning
 
