@@ -16,7 +16,7 @@
 - 支持字面量替换、显式正则替换、插入行、文件头追加、文件尾追加、删除行、替换行范围、删除行范围。
 - 支持 `--old-file`、`--new-file`、`--text-file`、stdin 等方式传入大段/多行内容。
 - 支持 `--dry-run --diff` 预览、`--expected-count` 防误匹配、`--backup` 备份、JSON batch 一次读写多步编辑。
-- **结构化 JSON 错误输出**：`--json` 模式下错误也输出 JSON，包含错误类型分类、建议和附近内容片段。
+- **结构化 JSON 错误输出**：`--json` 模式下错误也输出 JSON，包含错误类型分类、根因分析、最近匹配、Agent 恢复协议（`failureClass`、`recommendedAction`、`retryStrategy`）。
 - **匹配级别报告**：成功时在 operations 中报告 `matchStrategy`（exact、ignore-eol、ignore-indent、fuzzy 等）。
 - **自动容错匹配**：`--auto-match` 精确匹配失败后自动尝试宽松匹配（ignore-eol → ignore-indent → normalize-whitespace），`--fuzzy` 启用模糊匹配。
 - **上下文消歧**：`--context-before` / `--context-after` 辅助多匹配消歧。
@@ -111,11 +111,35 @@ python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-matc
 # 成功时包含 matchStrategy
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --expected-count 1 --json
 
-# 失败时输出错误类型、建议和附近内容
+# 失败时输出错误类型、诊断和恢复建议
 python safe_edit.py edit --file path/to/file --old "missing" --new "bar" --json
 ```
 
 错误类型包括：`match_not_found`、`match_ambiguous`、`match_count_mismatch`、`encoding_error`、`file_error`、`lock_error`、`validation_error`、`format_error`、`unknown`。
+
+### Agent Recovery Protocol
+
+匹配失败时，JSON 错误输出包含完整的恢复协议字段，供 Agent 自动决策：
+
+```json
+{
+  "ok": false,
+  "error_type": "match_not_found",
+  "failureClass": "RETRYABLE",
+  "rootCause": "WHITESPACE_CAUSES",
+  "closestMatch": {"line": 42, "fragment": "similar text", "similarity": 0.85},
+  "recommendedAction": {"type": "retry", "confidence": 0.9},
+  "retryStrategy": {"flags": ["--auto-match", "--normalize-whitespace"]}
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `failureClass` | `RETRYABLE`（可自动重试）、`RE_READ_REQUIRED`（需重新读取文件）、`USER_INPUT`（需用户修正）、`FATAL`（不可恢复） |
+| `rootCause` | 根因分类：`WHITESPACE_CAUSES`、`LINE_ENDING_DIFFERENCE`、`CONTENT_NOT_FOUND`、`MULTIPLE_MATCHES` 等 |
+| `closestMatch` | 最接近匹配的位置、片段和相似度（0.0–1.0） |
+| `recommendedAction` | 推荐的恢复动作（`retry`、`re_read_file`、`ask_user`、`stop`）及其置信度 |
+| `retryStrategy` | 仅 `RETRYABLE` 时返回，包含推荐的重试参数 |
 
 ## 上下文消歧
 
