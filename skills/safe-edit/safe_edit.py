@@ -92,18 +92,225 @@ def classify_error_type(message: str) -> str:
     return "unknown"
 
 
+def _diagnose_root_cause(old: str, fragment: str, similarity: float) -> str:
+    """Determine the root cause of match failure based on closest match.
+
+    Args:
+        old: The expected text that wasn't found
+        fragment: The closest matching fragment from the file
+        similarity: Similarity score (0.0-1.0)
+
+    Returns:
+        Root cause string: indentation_difference, line_ending_difference,
+        whitespace_difference, or content_not_found
+    """
+    if not fragment or similarity < 0.3:
+        return "content_not_found"
+
+    old_lines = old.splitlines()
+    frag_lines = fragment.splitlines()
+
+    # Check indentation differences (most common case)
+    for ol, fl in zip(old_lines[:3], frag_lines[:3]):
+        old_indent = len(ol) - len(ol.lstrip())
+        frag_indent = len(fl) - len(fl.lstrip())
+        old_has_tab = '\t' in ol[:old_indent] if old_indent > 0 else False
+        frag_has_tab = '\t' in fl[:frag_indent] if frag_indent > 0 else False
+
+        # Tab vs spaces difference
+        if old_has_tab != frag_has_tab and old_indent > 0 and frag_indent > 0:
+            return "indentation_difference"
+        # Indent count difference
+        if old_indent != frag_indent:
+            return "indentation_difference"
+
+    # Check line ending differences
+    old_has_crlf = '\r\n' in old
+    frag_has_crlf = '\r\n' in fragment
+    if old_has_crlf != frag_has_crlf:
+        return "line_ending_difference"
+
+    # Check general whitespace differences
+    old_normalized = re.sub(r'\s+', ' ', old)
+    frag_normalized = re.sub(r'\s+', ' ', fragment)
+    if old_normalized == frag_normalized:
+        return "whitespace_difference"
+
+    # Similar but not categorized above
+    if similarity >= 0.6:
+        return "whitespace_difference"
+
+    return "content_not_found"
+
+
+def _determine_failure_class(root_cause: str, error_type: str) -> str:
+    """Determine if failure is retryable, user input issue, or fatal.
+
+    Returns:
+        "RETRYABLE": Agent can retry with different flags
+        "USER_INPUT": Agent should re-read file and update old text
+        "FATAL": Cannot recover automatically
+    """
+    if error_type == "match_ambiguous":
+        # Multiple matches - need more context
+        return "RETRYABLE"
+
+    if root_cause in ("indentation_difference", "line_ending_difference", "whitespace_difference"):
+        return "RETRYABLE"
+
+    if root_cause == "content_not_found":
+        return "USER_INPUT"
+
+    if root_cause == "multiple_matches":
+        return "RETRYABLE"
+
+    return "FATAL"
+
+
+def _recommend_retry_strategy(root_cause: str, similarity: Optional[float]) -> Optional[Dict[str, Any]]:
+    """Recommend retry flags based on root cause.
+
+    Returns dict with:
+        - confidence: 0.0-1.0 confidence in recommendation
+        - flags: recommended flags to add
+        - alternativeFlags: fallback flags to try
+    """
+    strategies = {
+        "indentation_difference": {
+            "confidence": 0.90,
+            "flags": ["--ignore-indent"],
+            "alternativeFlags": ["--auto-match"]
+        },
+        "line_ending_difference": {
+            "confidence": 0.95,
+            "flags": ["--ignore-eol"],
+            "alternativeFlags": ["--auto-match"]
+        },
+        "whitespace_difference": {
+            "confidence": 0.85,
+            "flags": ["--auto-match"],
+            "alternativeFlags": ["--normalize-whitespace"]
+        },
+        "multiple_matches": {
+            "confidence": 0.70,
+            "flags": ["--context-before", "--context-after"],
+            "alternativeFlags": ["--first"]
+        },
+    }
+
+    if root_cause in strategies:
+        return strategies[root_cause]
+
+    # Default strategy for unknown cases
+    if similarity and similarity >= 0.6:
+        return {
+            "confidence": 0.60,
+            "flags": ["--auto-match"],
+            "alternativeFlags": ["--fuzzy"]
+        }
+
+    return None
+
+
+def analyze_match_failure(
+    old: str,
+    text: str,
+    error_type: str = "match_not_found",
+) -> Dict[str, Any]:
+    """Analyze why a match failed and return structured recovery info.
+
+    This is the main entry point for failure analysis. It finds the closest
+    match, diagnoses the root cause, and recommends recovery strategy.
+
+    Args:
+        old: The expected text that wasn't found
+        text: The actual file content
+        error_type: The classified error type
+
+    Returns:
+        {
+            "failureClass": "RETRYABLE" | "USER_INPUT" | "FATAL",
+            "rootCause": str,
+            "closestMatch": {...} | None,
+            "retryStrategy": {...} | None
+        }
+    """
+    result: Dict[str, Any] = {
+        "failureClass": "FATAL",
+        "rootCause": "unknown",
+        "closestMatch": None,
+        "retryStrategy": None,
+    }
+
+    # Handle multiple matches case (match_ambiguous or match_count_mismatch with multiple found)
+    if error_type == "match_ambiguous":
+        result["failureClass"] = "RETRYABLE"
+        result["rootCause"] = "multiple_matches"
+        result["retryStrategy"] = _recommend_retry_strategy("multiple_matches", None)
+        return result
+
+    # Pre-check line ending difference (before find_closest_match loses it)
+    old_has_crlf = '\r\n' in old
+    text_has_crlf = '\r\n' in text
+    line_ending_diff = old_has_crlf != text_has_crlf
+
+    # Find closest match for single match failures
+    closest = find_closest_match(text, old)
+
+    if closest is None:
+        result["failureClass"] = "USER_INPUT"
+        result["rootCause"] = "content_not_found"
+        return result
+
+    line_num, fragment = closest
+
+    # Calculate similarity
+    pattern_lines = old.splitlines()
+    fragment_lines = fragment.splitlines()
+    if len(pattern_lines) == 1:
+        matcher = difflib.SequenceMatcher(None, old, fragment)
+        similarity = matcher.ratio()
+    else:
+        matcher = difflib.SequenceMatcher(None, pattern_lines, fragment_lines)
+        similarity = matcher.ratio()
+
+    # Build closestMatch info
+    result["closestMatch"] = {
+        "line": line_num,
+        "similarity": round(similarity, 2),
+    }
+
+    # Diagnose root cause - check line ending first (pre-detected)
+    if line_ending_diff and similarity >= 0.9:
+        root_cause = "line_ending_difference"
+    else:
+        root_cause = _diagnose_root_cause(old, fragment, similarity)
+    result["rootCause"] = root_cause
+
+    # Determine failure class
+    result["failureClass"] = _determine_failure_class(root_cause, error_type)
+
+    # Recommend retry strategy
+    result["retryStrategy"] = _recommend_retry_strategy(root_cause, similarity)
+
+    return result
+
+
 def emit_json_error(
     exc: SafeEditError,
     file_path: str = "",
     command: str = "",
     *,
-    suggestions: Optional[List[Dict[str, Any]]] = None,
-    nearby_content: Optional[Dict[str, Any]] = None,
+    old: str = "",
+    text: str = "",
 ) -> None:
     """Emit a structured JSON error object to stdout for Agent consumption.
-    
-    This ensures that even on failure, --json mode returns parseable JSON
-    with actionable information for automatic retry.
+
+    When old and text are provided for match errors, provides:
+    - failureClass: RETRYABLE / USER_INPUT / FATAL
+    - rootCause: specific reason for failure
+    - closestMatch: nearest similar content location
+    - retryStrategy: recommended flags for retry
     """
     error_type = classify_error_type(str(exc))
     error_obj: Dict[str, Any] = {
@@ -120,10 +327,18 @@ def emit_json_error(
         "written": False,
         "skipped": False,
     }
-    if suggestions:
-        error_obj["suggestions"] = suggestions
-    if nearby_content:
-        error_obj["nearbyContent"] = nearby_content
+
+    # Structured recovery info for match-related errors
+    if error_type in ("match_not_found", "match_ambiguous", "match_count_mismatch"):
+        if old and text:
+            analysis = analyze_match_failure(old, text, error_type)
+            error_obj["failureClass"] = analysis["failureClass"]
+            error_obj["rootCause"] = analysis["rootCause"]
+            if analysis["closestMatch"]:
+                error_obj["closestMatch"] = analysis["closestMatch"]
+            if analysis["retryStrategy"]:
+                error_obj["retryStrategy"] = analysis["retryStrategy"]
+
     print(json.dumps(error_obj, ensure_ascii=False, sort_keys=True))
 
 
@@ -2170,44 +2385,44 @@ def main(argv: List[str]) -> int:
             # When --json is active, emit structured JSON error for Agent consumption
             file_path = args.file if hasattr(args, 'file') else ""
             command = args.command if hasattr(args, 'command') else ""
-            
-            suggestions = None
-            nearby_content = None
-            
-            # For match_not_found errors, extract nearby content for retry
+
+            # For match-related errors, read file and provide structured recovery info
             error_type = classify_error_type(str(exc))
-            if error_type == "match_not_found":
-                suggestions = [
-                    {"action": "retry_with_ignore_eol", "description": "Retry with --ignore-eol to tolerate CRLF/LF differences"},
-                    {"action": "retry_with_ignore_indent", "description": "Retry with --ignore-indent to tolerate indentation differences"},
-                    {"action": "retry_with_normalize_whitespace", "description": "Retry with --normalize-whitespace to tolerate whitespace differences"},
-                ]
-                # Try to extract nearby content from the file
+            old = ""
+            text = ""
+
+            if error_type in ("match_not_found", "match_ambiguous", "match_count_mismatch"):
+                # Try to read file content for analysis
                 try:
                     path = resolve_target_path(file_path, getattr(args, 'follow_symlink', False))
                     original = read_target(path, getattr(args, 'max_bytes', 50 * 1024 * 1024))
                     encoding = detect_encoding(original, getattr(args, 'encoding', 'auto'))
                     text = strict_decode(original, encoding)
-                    
-                    # Determine the search pattern from the operation
-                    pattern = ""
+
+                    # Get the search pattern (may come from --old, --old-file, or --old-stdin)
                     if command == "edit":
-                        pattern = getattr(args, 'old', '') or ""
+                        # Use resolve_cli_value to handle all input modes
+                        try:
+                            stdin_taken: List[str] = []
+                            old = resolve_cli_value(args, "old", False, stdin_taken=stdin_taken) or ""
+                        except Exception:
+                            old = getattr(args, 'old', '') or ""
                     elif command == "regex":
-                        pattern = getattr(args, 'pattern', '') or ""
-                    
-                    if pattern:
-                        nearby_content = extract_nearby_content(text, pattern)
+                        try:
+                            stdin_taken: List[str] = []
+                            old = resolve_cli_value(args, "pattern", False, stdin_taken=stdin_taken) or ""
+                        except Exception:
+                            old = getattr(args, 'pattern', '') or ""
                 except Exception:
-                    # If we can't read the file for nearby content, just skip it
+                    # If we can't read the file, emit basic error
                     pass
-            
+
             emit_json_error(
                 exc,
                 file_path=file_path,
                 command=command,
-                suggestions=suggestions,
-                nearby_content=nearby_content,
+                old=old,
+                text=text,
             )
         else:
             print(f"safe-edit: {exc}", file=sys.stderr)

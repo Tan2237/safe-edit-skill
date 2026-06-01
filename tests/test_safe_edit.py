@@ -1979,38 +1979,140 @@ class SafeEditTests(unittest.TestCase):
         self.assertEqual(payload["error"]["type"], "match_not_found")
         self.assertIn("not found", payload["error"]["message"])
 
-    def test_json_error_has_suggestions(self):
-        """Test --json error includes suggestions for match_not_found."""
+    def test_json_error_has_retry_strategy(self):
+        """Test --json error includes retryStrategy for match_not_found."""
         path = self.tmpdir / "json_sugg.txt"
         path.write_bytes(b"alpha\nbeta\ngamma\n")
-        
+
         result = self.run_tool(
             "edit", "--file", path,
             "--old", "nonexistent", "--new", "bar",
             "--json", expect=2,
         )
-        
-        payload = json.loads(result.stdout)
-        self.assertIn("suggestions", payload)
-        self.assertIsInstance(payload["suggestions"], list)
-        self.assertTrue(len(payload["suggestions"]) > 0)
 
-    def test_json_error_has_nearby_content(self):
-        """Test --json error includes nearbyContent when pattern is close."""
+        payload = json.loads(result.stdout)
+        self.assertIn("failureClass", payload)
+        self.assertIn("rootCause", payload)
+
+    def test_json_error_has_closest_match(self):
+        """Test --json error includes closestMatch when pattern is close."""
         path = self.tmpdir / "json_nearby.txt"
         path.write_bytes(b"def foo():\n    return 42\n")
-        
+
         result = self.run_tool(
             "edit", "--file", path,
             "--old", "return 43", "--new", "return 44",
             "--json", expect=2,
         )
-        
+
         payload = json.loads(result.stdout)
-        self.assertIn("nearbyContent", payload)
-        nearby = payload["nearbyContent"]
-        self.assertIn("line", nearby)
-        self.assertIn("similarity", nearby)
+        self.assertIn("closestMatch", payload)
+        closest = payload["closestMatch"]
+        self.assertIn("line", closest)
+        self.assertIn("similarity", closest)
+
+    # =========================================================================
+    # Structured error recovery tests
+    # =========================================================================
+
+    def test_error_recovery_indentation_difference(self):
+        """Test indentation_difference is diagnosed and --ignore-indent is recommended."""
+        path = self.tmpdir / "indent_diff.txt"
+        # File uses 4 spaces
+        path.write_bytes(b"def foo():\n    print('hello')\n")
+
+        # Try to match with tabs
+        old_path = self.tmpdir / "old_tabs.txt"
+        old_path.write_bytes(b"def foo():\n\tprint('hello')\n")
+
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old-file", old_path, "--new", "bar",
+            "--json", expect=2,
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["failureClass"], "RETRYABLE")
+        self.assertEqual(payload["rootCause"], "indentation_difference")
+        self.assertIn("--ignore-indent", payload["retryStrategy"]["flags"])
+
+        # Verify retry with suggested flag works
+        result2 = self.run_tool(
+            "edit", "--file", path,
+            "--old-file", old_path, "--new", "def bar():\n    print('world')\n",
+            "--ignore-indent", "--json",
+        )
+        payload2 = json.loads(result2.stdout)
+        self.assertTrue(payload2["ok"])
+        self.assertEqual(payload2["changed"], 1)
+
+    def test_error_recovery_line_ending_difference(self):
+        """Test line_ending_difference is diagnosed and --ignore-eol is recommended."""
+        path = self.tmpdir / "eol_diff.txt"
+        # File uses CRLF
+        path.write_bytes(b"def foo():\r\n    print('hello')\r\n")
+
+        # Try to match with LF
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "def foo():\n    print('hello')", "--new", "bar",
+            "--json", expect=2,
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["failureClass"], "RETRYABLE")
+        self.assertEqual(payload["rootCause"], "line_ending_difference")
+        self.assertIn("--ignore-eol", payload["retryStrategy"]["flags"])
+
+    def test_error_recovery_content_not_found(self):
+        """Test content_not_found results in USER_INPUT failure class."""
+        path = self.tmpdir / "not_found.txt"
+        path.write_bytes(b"alpha\nbeta\ngamma\n")
+
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "nonexistent_pattern_xyz", "--new", "bar",
+            "--json", expect=2,
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["failureClass"], "USER_INPUT")
+        self.assertEqual(payload["rootCause"], "content_not_found")
+
+    def test_error_recovery_multiple_matches(self):
+        """Test multiple matches scenario."""
+        path = self.tmpdir / "multi.txt"
+        path.write_bytes(b"foo\nbar foo baz\nfoo end\n")
+
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "qux",
+            "--expected-count", "1",
+            "--json", expect=2,
+        )
+
+        payload = json.loads(result.stdout)
+        # When there are multiple matches but expected-count is 1, it's a count mismatch
+        # The error type should reflect this
+        self.assertIn(payload["error"]["type"], ["match_count_mismatch", "expected_count_mismatch"])
+
+    def test_error_retry_strategy_confidence(self):
+        """Test retryStrategy includes confidence score."""
+        path = self.tmpdir / "confidence.txt"
+        path.write_bytes(b"def hello():\n    return 42\n")
+
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "def hello():\n\treturn 42", "--new", "bar",
+            "--json", expect=2,
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertIn("retryStrategy", payload)
+        self.assertIn("confidence", payload["retryStrategy"])
+        self.assertGreater(payload["retryStrategy"]["confidence"], 0.5)
+        self.assertIn("flags", payload["retryStrategy"])
+        self.assertIn("alternativeFlags", payload["retryStrategy"])
 
     def test_json_error_classifies_expected_count_mismatch(self):
         """Test --json error classifies expected_count mismatch."""
@@ -2416,40 +2518,40 @@ class SafeEditTests(unittest.TestCase):
         self.assertEqual(payload["operations"][0]["matchStrategy"], "line-based")
 
     # =========================================================================
-    # nearbyContent field tests
+    # closestMatch field tests
     # =========================================================================
 
-    def test_nearby_content_on_close_match(self):
-        """Test nearbyContent contains line and similarity for close match."""
+    def test_closest_match_on_close_match(self):
+        """Test closestMatch contains line and similarity for close match."""
         path = self.tmpdir / "nearby_close.txt"
         path.write_bytes(b"function foo():\n    return 42\n")
-        
+
         result = self.run_tool(
             "edit", "--file", path,
             "--old", "function foo():\n    return 43",
             "--new", "bar",
             "--json", expect=2,
         )
-        
-        payload = json.loads(result.stdout)
-        nearby = payload.get("nearbyContent")
-        self.assertIsNotNone(nearby)
-        self.assertGreaterEqual(nearby["similarity"], 0.5)
 
-    def test_nearby_content_missing_on_non_match_error(self):
-        """Test nearbyContent may be absent for completely unrelated patterns."""
+        payload = json.loads(result.stdout)
+        closest = payload.get("closestMatch")
+        self.assertIsNotNone(closest)
+        self.assertGreaterEqual(closest["similarity"], 0.5)
+
+    def test_closest_match_missing_on_non_match_error(self):
+        """Test closestMatch may be absent for completely unrelated patterns."""
         path = self.tmpdir / "nearby_none.txt"
         path.write_bytes(b"alpha\n")
-        
+
         result = self.run_tool(
             "edit", "--file", path,
             "--old", "zzzzzzzzzzzzzzzzz",
             "--new", "bar",
             "--json", expect=2,
         )
-        
+
         payload = json.loads(result.stdout)
-        # nearbyContent may or may not be present depending on similarity
+        # closestMatch may or may not be present depending on similarity
         # The key test is that it doesn't crash
 
     # =========================================================================
