@@ -19,14 +19,29 @@ python safe_edit.py edit --file F --old "old" --new "new" --expected-count 1
 # Replace with auto-match (tolerate whitespace)
 python safe_edit.py edit --file F --old "old" --new "new" --auto-match --expected-count 1
 
-# Replace function body
-python safe_edit.py replace-lines --file F --anchor-pattern "funcName" --offset-start +0 --offset-end +N --text "..."
-
 # Preview before applying
 python safe_edit.py edit --file F --old "old" --new "new" --dry-run --diff
 ```
 
 On Windows, `py -3` works when `python` is not on PATH.
+
+---
+
+## Core Rules (Priority Order)
+
+1. **Always add `--expected-count 1`** — prevents wrong matches from silently succeeding. First priority.
+
+2. **Prefer `--old-file` when** — multiline, >100 chars, or contains shell-sensitive chars (`$`, `%`, `\`, `` ` ``, `'`, `"`). Prevents shell escaping disasters.
+
+3. **Use `--auto-match` for multiline edits** — automatically tries exact → ignore-eol → ignore-indent → normalize-whitespace.
+
+4. **Line numbers invalidate after edits** — Any `insert`, `delete`, or `replace-lines` that changes line count invalidates all cached line numbers. Re-query with `grep -n` before next line-based operation.
+
+5. **Prefer `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
+
+6. **Verify anchor uniqueness before `replace-lines`** — Run `grep -n "pattern" file` first. If pattern appears multiple times, use more specific pattern or `--start`/`--end` instead.
+
+7. **Re-read before structural edits** — Do not rely on stale context after file modifications. Function position, content, and bracket locations may have changed.
 
 ---
 
@@ -36,13 +51,26 @@ On Windows, `py -3` works when `python` is not on PATH.
 Need modification?
 │
 ├─ Replace exact text (single/multiline)?
-│      → edit --old X --new Y
+│      → edit --old X --new Y --expected-count 1
 │
-├─ Replace entire function/class body?
-│      → replace-lines --anchor-pattern "name" --offset-start +0 --offset-end +N --text T
+├─ Replace function/class body?
+│   │
+│   ├─ Anchor pattern unique?
+│   │      YES → replace-lines --anchor-pattern "unique_sig" --text T
+│   │
+│   └─ Anchor not unique?
+│          → Locate line range with grep -n
+│          → replace-lines --start N --end M --text T
 │
 ├─ Insert content at specific location?
-│      → insert --line N --text T
+│   │
+│   ├─ Structural boundary (}, class/namespace end)?
+│   │      → replace-lines --start N --end N --text "}\nnew_content"
+│   │
+│   └─ Normal text location?
+│          → insert --line N --text T
+│
+├─ Add at file boundaries?
 │      → prepend --text T  (at beginning)
 │      → append --text T   (at end)
 │
@@ -51,42 +79,14 @@ Need modification?
        → delete-lines --start N --end M
 ```
 
----
-
-## Structural Editing Rules
-
-### Command Selection
-
-| Task | Command |
-|------|---------|
-| Replace text within line(s) | `edit --old X --new Y` |
-| Replace function/class body | `replace-lines --anchor-pattern "unique_sig" --text T` |
-| Replace known line range | `replace-lines --start N --end M --text T` |
-| Add at file boundaries | `prepend` / `append` |
-| Delete lines | `delete --line N` / `delete-lines` |
-| Insert near `}` | **AVOID** — use `replace-lines` on the `}` line instead |
-
-### Critical Rules
-
-1. **Avoid `insert` near closing braces** — `insert --line N` goes AFTER line N. For `}` boundaries, use `replace-lines --start N --end N --text "}\nnew_content"` to preserve structure.
-
-2. **Verify anchor uniqueness** — Run `grep -n "pattern" file` first. If pattern appears multiple times (definition + calls), use more specific pattern like `"void FuncName("` or use `--start`/`--end` instead.
-
-3. **Line numbers invalidate after edits** — After `insert`, `delete`, or `replace-lines` that changes line count, re-query with `grep -n` before next line-based operation.
-
-4. **Bracket safety** — When replacing code blocks, verify the range includes/excludes braces as intended.
-
-5. **Validate after structural edits** — Check bracket matching or compile immediately.
-
----
-
-## Core Rules
-
-1. **Default to `--old-file` for special characters**: `$`, `%`, `\`, `` ` ``, `'`, `"`, newline, >100 chars.
-2. **Use `--auto-match` for multiline edits**: automatically tries exact → ignore-eol → ignore-indent → normalize-whitespace.
-3. **Use `--anchor-pattern` for function/class body replacement**: code formatters change whitespace, but names stay stable.
-4. **Always add `--expected-count 1`**: prevents wrong matches from silently succeeding.
-5. **Run `stat --file F` before uncertain edits**: verify encoding and line count.
+**Risk hierarchy (prefer lower risk):**
+```
+edit                 ← SAFEST
+replace-lines (--start/--end)
+replace-lines (--anchor-pattern)
+insert / delete
+regex                ← HIGHEST RISK
+```
 
 ---
 
@@ -126,8 +126,8 @@ Need to edit a file?
 │   │
 │   ├─ Step 1: Was --auto-match on? If no, add it
 │   ├─ Step 2: --auto-match --fuzzy
-│   ├─ Step 3: Use --anchor-pattern instead of full text match
-│   └─ Step 4: --explain-match-failure (diagnose)
+│   ├─ Step 3: --explain-match-failure (diagnose before giving up)
+│   └─ Step 4: Use --anchor-pattern instead of full text match
 │
 └─ Ambiguous match?
     └─ Add --context-before "unique" or --context-after "unique"
@@ -135,19 +135,7 @@ Need to edit a file?
 
 ---
 
-## Shell Escaping Quick Reference
-
-| Character | Problem | Example | Solution |
-|-----------|---------|---------|----------|
-| `$VAR` | Shell expansion | `$env:PATH` | `--old-file` |
-| `%VAR%` | CMD expansion | `%PATH%` | `--old-file` |
-| `` ` `` | PowerShell escape | `` `n `` | `--old-file` |
-| `\` | Backslash escape | `C:\temp` | `--old-file` |
-| `'` or `"` | Quote parsing | `it's` | `--old-file` |
-| Newline | Multi-line args | Code blocks | `--old-file` |
-| >100 chars | Long args | Large blocks | `--old-file` |
-
-**Rule: When in doubt, use `--old-file`.**
+**Shell-sensitive content** (newlines, quotes, `$`, `%`, `\`, `` ` ``, long text) → prefer `--old-file` / `--new-file`.
 
 ---
 
@@ -163,7 +151,8 @@ edit --old X --new Y --expected-count 1
     ├─ "old text was not found"
     │   ├─ No --auto-match? → add it
     │   ├─ Has --auto-match? → add --fuzzy
-    │   └─ Still failed? → try --anchor-pattern
+    │   ├─ Still failed? → --explain-match-failure (diagnose)
+    │   └─ Wrong old text? → fix old text, don't just switch to anchor
     │
     ├─ "text appears multiple times"
     │   └─ Add --context-before/after "unique"
@@ -172,7 +161,23 @@ edit --old X --new Y --expected-count 1
         └─ Adjust --expected-count or use --first
 ```
 
-**Key insight:** Most multiline failures are whitespace differences. `--auto-match` handles this.
+**Key insight:** Most failures are whitespace differences. `--auto-match` handles this. Use `--explain-match-failure` before abandoning text matching.
+
+---
+
+## Structural Editing Rules
+
+### Critical Rules
+
+1. **Avoid `insert` near closing braces** — `insert --line N` goes AFTER line N. For `}` boundaries, use `replace-lines --start N --end N --text "}\nnew_content"` to preserve structure.
+
+2. **Verify anchor uniqueness** — Run `grep -n "pattern" file` first. If pattern appears multiple times (definition + calls), use more specific pattern like `"void FuncName("` or use `--start`/`--end` instead.
+
+3. **Line numbers invalidate after edits** — After any operation that changes line count, re-query locations before next line-based operation.
+
+4. **Bracket safety** — When replacing code blocks, verify the range includes/excludes braces as intended.
+
+5. **Validate after structural edits** — Check bracket matching or compile immediately.
 
 ---
 
@@ -192,32 +197,7 @@ edit --old X --new Y --expected-count 1
 | Single line | (none) |
 | Multiline code | `--auto-match` |
 | JSON/YAML/Markdown | `--auto-match --normalize-whitespace` |
-| Function/class body | `--anchor-pattern` |
-
----
-
-## Anchor-First Strategy
-
-For function/class/config block replacement, prefer anchors over full-text matching.
-
-**Why:** Code formatters change whitespace, but function names stay stable.
-
-**Example:**
-
-```cpp
-void Process() {  // formatter may change braces/indentation
-    // 50 lines
-}
-```
-
-**Bad:** `edit --old "void Process()\n{\n..."` → FAILS after formatting
-
-**Good:** `replace-lines --anchor-pattern "void Process" --offset-start +0 --offset-end +50 --text "..."`
-
-**Use anchor-first for:**
-- Function/class body replacement
-- JSON/YAML config blocks
-- Any block with distinctive header
+| Function/class body | Verify anchor first, then `--anchor-pattern` |
 
 ---
 
