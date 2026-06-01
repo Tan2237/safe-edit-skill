@@ -55,111 +55,28 @@ Need modification?
 
 ## Structural Editing Rules
 
-These rules prevent the most common Agent editing mistakes.
+### Command Selection
 
-### 1. Command Selection Priority
+| Task | Command |
+|------|---------|
+| Replace text within line(s) | `edit --old X --new Y` |
+| Replace function/class body | `replace-lines --anchor-pattern "unique_sig" --text T` |
+| Replace known line range | `replace-lines --start N --end M --text T` |
+| Add at file boundaries | `prepend` / `append` |
+| Delete lines | `delete --line N` / `delete-lines` |
+| Insert near `}` | **AVOID** — use `replace-lines` on the `}` line instead |
 
-```
-Need modification?
-│
-├─ Replace exact text (within a line)?
-│      → edit --old X --new Y
-│
-├─ Replace entire function/class body?
-│      → replace-lines --anchor-pattern "unique_signature" --text T
-│
-├─ Replace known line range?
-│      → replace-lines --start N --end M --text T
-│
-├─ Add content at file boundaries?
-│      → prepend --text T  (beginning)
-│      → append --text T   (end)
-│
-├─ Delete lines?
-│      → delete --line N
-│      → delete-lines --start N --end M
-│
-└─ Insert near structural boundary (closing braces, etc.)?
-       → CAUTION: Use replace-lines on the boundary line instead
-```
+### Critical Rules
 
-### 2. Avoid `insert` Near Structural Boundaries
+1. **Avoid `insert` near closing braces** — `insert --line N` goes AFTER line N. For `}` boundaries, use `replace-lines --start N --end N --text "}\nnew_content"` to preserve structure.
 
-**Problem:** `insert --line N` inserts AFTER line N. Near closing braces `}`, agents often misjudge whether to insert before or after.
+2. **Verify anchor uniqueness** — Run `grep -n "pattern" file` first. If pattern appears multiple times (definition + calls), use more specific pattern like `"void FuncName("` or use `--start`/`--end` instead.
 
-**Bad:**
-```bash
-insert --line 18639  # inserts after "}" but where exactly?
-```
+3. **Line numbers invalidate after edits** — After `insert`, `delete`, or `replace-lines` that changes line count, re-query with `grep -n` before next line-based operation.
 
-**Good:** Replace the boundary line itself, preserving structure:
-```bash
-replace-lines --start 18639 --end 18639 --text "}
-new_function_here"
-```
+4. **Bracket safety** — When replacing code blocks, verify the range includes/excludes braces as intended.
 
-### 3. Verify Anchor Uniqueness Before Using
-
-**Problem:** `--anchor-pattern "iSoftTimes"` may match multiple locations (definition + calls).
-
-**Before using anchor-pattern:**
-```bash
-grep -n "pattern" file.cpp  # Check occurrence count
-```
-
-If pattern appears multiple times:
-- Use more specific pattern (include function signature)
-- Or use `--anchor-occurrence` with correct count
-- Or fall back to `--start`/`--end` line numbers
-
-**Bad:** `--anchor-pattern "iSoftTimes"` (appears 5 times)
-
-**Good:** `--anchor-pattern "void RasterizeFilterNullHlr("` (unique)
-
-### 4. Line Numbers Invalidate After Edits
-
-**Rule:** After ANY operation that changes line count, ALL cached line numbers become invalid.
-
-Operations that change line count:
-- `insert` (adds lines)
-- `append` / `prepend` (may add lines)
-- `delete` / `delete-lines` (removes lines)
-- `replace-lines` (may change line count)
-
-**Workflow:**
-```bash
-# Step 1: Do first edit
-replace-lines --start 100 --end 105 --text "..."
-
-# Step 2: Re-query line numbers BEFORE next edit
-grep -n "target_function" file.cpp
-
-# Step 3: Calculate new line numbers
-# Step 4: Do second edit
-```
-
-### 5. Bracket Safety for Block Replacement
-
-When replacing code blocks:
-- Include the opening line (with `{`) in the range
-- Include the closing line (with `}`) in the range
-- Or: ensure replacement text has matching braces
-
-**Before replacing:**
-```
---start 100 --end 150  # Does this include the closing "}"?
-```
-
-### 6. Validate After Structural Edits
-
-After editing functions, classes, or structured blocks:
-```bash
-# Check bracket matching
-python -c "print(open('file.cpp').read().count('{') == open('file.cpp').read().count('}'))"
-
-# Or compile immediately
-cl file.cpp  # or g++, javac, etc.
-```
+5. **Validate after structural edits** — Check bracket matching or compile immediately.
 
 ---
 
