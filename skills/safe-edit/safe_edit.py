@@ -23,6 +23,11 @@ class SafeEditError(Exception):
     pass
 
 
+# Pre-compiled regex for line ending detection (used by split_records)
+# Matches CRLF, CR, or LF - order matters: CRLF must be first to avoid partial matches
+_LINE_ENDING_RE = re.compile(r'(\r\n|\r|\n)')
+
+
 @dataclass(frozen=True)
 class EncodingInfo:
     name: str
@@ -465,22 +470,18 @@ def detect_encoding(data: bytes, requested: str) -> EncodingInfo:
 
 
 def detect_line_ending(text: str) -> Tuple[str, Dict[str, int], bool]:
-    counts = {"crlf": 0, "lf": 0, "cr": 0}
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if char == "\r":
-            if index + 1 < len(text) and text[index + 1] == "\n":
-                counts["crlf"] += 1
-                index += 2
-            else:
-                counts["cr"] += 1
-                index += 1
-        elif char == "\n":
-            counts["lf"] += 1
-            index += 1
-        else:
-            index += 1
+    # Use C-optimized count() instead of Python character iteration
+    # CRLF contains both \r and \n, so we need to subtract to get standalone counts
+    crlf_count = text.count('\r\n')
+    total_cr = text.count('\r')
+    total_lf = text.count('\n')
+
+    # Standalone CR: total CR minus CRs that are part of CRLF
+    # Standalone LF: total LF minus LFs that are part of CRLF
+    cr_count = total_cr - crlf_count
+    lf_count = total_lf - crlf_count
+
+    counts = {"crlf": crlf_count, "lf": lf_count, "cr": cr_count}
 
     if not any(counts.values()):
         return ("lf", counts, False)
@@ -496,24 +497,35 @@ def line_sep(style: str) -> str:
 
 
 def split_records(text: str) -> List[Tuple[str, str]]:
+    """Split text into (line_content, line_ending) tuples.
+
+    Uses pre-compiled regex for C-optimized performance.
+    Handles CRLF, CR, and LF line endings correctly.
+    """
+    if not text:
+        return []
+
+    # Split by line endings, keeping the separators
+    parts = _LINE_ENDING_RE.split(text)
+
+    # parts alternates: [content, ending, content, ending, ..., content]
+    # If text ends with line ending, last part is empty string
     records: List[Tuple[str, str]] = []
-    start = 0
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if char == "\r":
-            sep = "\r\n" if index + 1 < len(text) and text[index + 1] == "\n" else "\r"
-            records.append((text[start:index], sep))
-            index += len(sep)
-            start = index
-        elif char == "\n":
-            records.append((text[start:index], "\n"))
-            index += 1
-            start = index
+
+    i = 0
+    while i < len(parts):
+        content = parts[i]
+        if i + 1 < len(parts):
+            # Has a line ending
+            ending = parts[i + 1]
+            records.append((content, ending))
+            i += 2
         else:
-            index += 1
-    if start < len(text):
-        records.append((text[start:], ""))
+            # Last content without ending
+            if content:  # Skip empty trailing content
+                records.append((content, ""))
+            i += 1
+
     return records
 
 
