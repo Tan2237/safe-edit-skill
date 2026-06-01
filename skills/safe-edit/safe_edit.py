@@ -102,7 +102,7 @@ def _diagnose_root_cause(old: str, fragment: str, similarity: float) -> str:
 
     Returns:
         Root cause string: indentation_difference, line_ending_difference,
-        whitespace_difference, or content_not_found
+        whitespace_difference, content_not_found, or similar_content_exists
     """
     if not fragment or similarity < 0.3:
         return "content_not_found"
@@ -136,80 +136,115 @@ def _diagnose_root_cause(old: str, fragment: str, similarity: float) -> str:
     if old_normalized == frag_normalized:
         return "whitespace_difference"
 
-    # Similar but not categorized above
-    if similarity >= 0.6:
-        return "whitespace_difference"
+    # Similar but not categorized above - may be stale context
+    if similarity >= SIMILAR_CONTENT_THRESHOLD:
+        return "similar_content_exists"
 
     return "content_not_found"
 
 
-def _determine_failure_class(root_cause: str, error_type: str) -> str:
-    """Determine if failure is retryable, user input issue, or fatal.
+# Whitespace-related causes that can be fixed by retry with flags
+WHITESPACE_CAUSES = frozenset([
+    "indentation_difference",
+    "line_ending_difference",
+    "whitespace_difference",
+])
+
+# Threshold for detecting "similar content exists" (likely stale context)
+# Below this: content_not_found (USER_INPUT)
+# Above this: similar_content_exists (RE_READ_REQUIRED)
+SIMILAR_CONTENT_THRESHOLD = 0.70
+
+
+def _determine_failure_class(root_cause: str, error_type: str, similarity: Optional[float] = None) -> Tuple[str, str]:
+    """Determine failure class and recommended action type.
 
     Returns:
-        "RETRYABLE": Agent can retry with different flags
-        "USER_INPUT": Agent should re-read file and update old text
-        "FATAL": Cannot recover automatically
+        (failureClass, actionType) tuple where:
+        - failureClass: RETRYABLE, RE_READ_REQUIRED, USER_INPUT, or FATAL
+        - actionType: "retry", "re_read_file", "ask_user", or "stop"
+
+    Logic:
+    - WHITESPACE_CAUSES → RETRYABLE + retry
+    - multiple_matches → RE_READ_REQUIRED + re_read_file
+    - similar_content_exists → RE_READ_REQUIRED + re_read_file
+    - content_not_found → USER_INPUT + ask_user
     """
+    # Multiple matches from match_ambiguous error
     if error_type == "match_ambiguous":
-        # Multiple matches - need more context
-        return "RETRYABLE"
+        return ("RE_READ_REQUIRED", "re_read_file")
 
-    if root_cause in ("indentation_difference", "line_ending_difference", "whitespace_difference"):
-        return "RETRYABLE"
+    # Whitespace differences - can retry with flags
+    if root_cause in WHITESPACE_CAUSES:
+        return ("RETRYABLE", "retry")
 
-    if root_cause == "content_not_found":
-        return "USER_INPUT"
-
+    # Multiple matches - need to re-read to find unique context
     if root_cause == "multiple_matches":
-        return "RETRYABLE"
+        return ("RE_READ_REQUIRED", "re_read_file")
 
-    return "FATAL"
+    # Similar content exists but not clear whitespace issue - likely stale context
+    if root_cause == "similar_content_exists":
+        return ("RE_READ_REQUIRED", "re_read_file")
+
+    # Content not found at all
+    if root_cause == "content_not_found":
+        return ("USER_INPUT", "ask_user")
+
+    # Unknown/fatal
+    return ("FATAL", "stop")
 
 
-def _recommend_retry_strategy(root_cause: str, similarity: Optional[float]) -> Optional[Dict[str, Any]]:
-    """Recommend retry flags based on root cause.
+def _build_recommended_action(action_type: str, confidence: float) -> Dict[str, Any]:
+    """Build recommendedAction object.
 
-    Returns dict with:
-        - confidence: 0.0-1.0 confidence in recommendation
-        - flags: recommended flags to add
-        - alternativeFlags: fallback flags to try
+    Args:
+        action_type: "retry", "re_read_file", "ask_user", or "stop"
+        confidence: 0.0-1.0 confidence in the recommended ACTION (not root cause).
+
+    Returns:
+        {"type": action_type, "confidence": confidence}
+
+    Note: confidence represents how confident we are that the recommended action
+    will succeed, NOT how confident we are in the root cause classification.
+    """
+    return {
+        "type": action_type,
+        "confidence": round(confidence, 2),
+    }
+
+
+def _build_retry_strategy(root_cause: str) -> Optional[Dict[str, Any]]:
+    """Build retryStrategy for RETRYABLE cases.
+
+    Returns dict with flags and alternativeFlags, or None for non-retry cases.
     """
     strategies = {
         "indentation_difference": {
-            "confidence": 0.90,
             "flags": ["--ignore-indent"],
             "alternativeFlags": ["--auto-match"]
         },
         "line_ending_difference": {
-            "confidence": 0.95,
             "flags": ["--ignore-eol"],
             "alternativeFlags": ["--auto-match"]
         },
         "whitespace_difference": {
-            "confidence": 0.85,
             "flags": ["--auto-match"],
             "alternativeFlags": ["--normalize-whitespace"]
         },
-        "multiple_matches": {
-            "confidence": 0.70,
-            "flags": ["--context-before", "--context-after"],
-            "alternativeFlags": ["--first"]
-        },
     }
 
-    if root_cause in strategies:
-        return strategies[root_cause]
+    return strategies.get(root_cause)
 
-    # Default strategy for unknown cases
-    if similarity and similarity >= 0.6:
-        return {
-            "confidence": 0.60,
-            "flags": ["--auto-match"],
-            "alternativeFlags": ["--fuzzy"]
-        }
 
-    return None
+# Confidence scores for different root causes
+_CONFIDENCE_SCORES = {
+    "indentation_difference": 0.90,
+    "line_ending_difference": 0.95,
+    "whitespace_difference": 0.85,
+    "multiple_matches": 0.80,
+    "similar_content_exists": 0.75,
+    "content_not_found": 0.70,
+}
 
 
 def analyze_match_failure(
@@ -229,24 +264,27 @@ def analyze_match_failure(
 
     Returns:
         {
-            "failureClass": "RETRYABLE" | "USER_INPUT" | "FATAL",
+            "failureClass": "RETRYABLE" | "RE_READ_REQUIRED" | "USER_INPUT" | "FATAL",
             "rootCause": str,
             "closestMatch": {...} | None,
-            "retryStrategy": {...} | None
+            "recommendedAction": {"type": str, "confidence": float},
+            "retryStrategy": {...} | None  # only for RETRYABLE
         }
     """
     result: Dict[str, Any] = {
         "failureClass": "FATAL",
         "rootCause": "unknown",
         "closestMatch": None,
+        "recommendedAction": None,
         "retryStrategy": None,
     }
 
-    # Handle multiple matches case (match_ambiguous or match_count_mismatch with multiple found)
+    # Handle multiple matches case (match_ambiguous error)
     if error_type == "match_ambiguous":
-        result["failureClass"] = "RETRYABLE"
+        result["failureClass"] = "RE_READ_REQUIRED"
         result["rootCause"] = "multiple_matches"
-        result["retryStrategy"] = _recommend_retry_strategy("multiple_matches", None)
+        confidence = _CONFIDENCE_SCORES.get("multiple_matches", 0.70)
+        result["recommendedAction"] = _build_recommended_action("re_read_file", confidence)
         return result
 
     # Pre-check line ending difference (before find_closest_match loses it)
@@ -256,23 +294,21 @@ def analyze_match_failure(
 
     # Find closest match for single match failures
     closest = find_closest_match(text, old)
+    similarity = 0.0
 
     if closest is None:
         result["failureClass"] = "USER_INPUT"
         result["rootCause"] = "content_not_found"
+        confidence = _CONFIDENCE_SCORES.get("content_not_found", 0.70)
+        result["recommendedAction"] = _build_recommended_action("ask_user", confidence)
         return result
 
     line_num, fragment = closest
 
-    # Calculate similarity
-    pattern_lines = old.splitlines()
-    fragment_lines = fragment.splitlines()
-    if len(pattern_lines) == 1:
-        matcher = difflib.SequenceMatcher(None, old, fragment)
-        similarity = matcher.ratio()
-    else:
-        matcher = difflib.SequenceMatcher(None, pattern_lines, fragment_lines)
-        similarity = matcher.ratio()
+    # Calculate similarity at character level (not line level)
+    # This gives more accurate similarity for content with minor differences
+    matcher = difflib.SequenceMatcher(None, old, fragment)
+    similarity = matcher.ratio()
 
     # Build closestMatch info
     result["closestMatch"] = {
@@ -287,11 +323,17 @@ def analyze_match_failure(
         root_cause = _diagnose_root_cause(old, fragment, similarity)
     result["rootCause"] = root_cause
 
-    # Determine failure class
-    result["failureClass"] = _determine_failure_class(root_cause, error_type)
+    # Determine failure class and action type
+    failure_class, action_type = _determine_failure_class(root_cause, error_type, similarity)
+    result["failureClass"] = failure_class
 
-    # Recommend retry strategy
-    result["retryStrategy"] = _recommend_retry_strategy(root_cause, similarity)
+    # Build recommendedAction
+    confidence = _CONFIDENCE_SCORES.get(root_cause, 0.70)
+    result["recommendedAction"] = _build_recommended_action(action_type, confidence)
+
+    # Build retryStrategy only for RETRYABLE cases
+    if failure_class == "RETRYABLE":
+        result["retryStrategy"] = _build_retry_strategy(root_cause)
 
     return result
 
@@ -307,10 +349,11 @@ def emit_json_error(
     """Emit a structured JSON error object to stdout for Agent consumption.
 
     When old and text are provided for match errors, provides:
-    - failureClass: RETRYABLE / USER_INPUT / FATAL
+    - failureClass: RETRYABLE / RE_READ_REQUIRED / USER_INPUT / FATAL
     - rootCause: specific reason for failure
     - closestMatch: nearest similar content location
-    - retryStrategy: recommended flags for retry
+    - recommendedAction: {"type": str, "confidence": float}
+    - retryStrategy: recommended flags (only for RETRYABLE)
     """
     error_type = classify_error_type(str(exc))
     error_obj: Dict[str, Any] = {
@@ -336,6 +379,8 @@ def emit_json_error(
             error_obj["rootCause"] = analysis["rootCause"]
             if analysis["closestMatch"]:
                 error_obj["closestMatch"] = analysis["closestMatch"]
+            if analysis["recommendedAction"]:
+                error_obj["recommendedAction"] = analysis["recommendedAction"]
             if analysis["retryStrategy"]:
                 error_obj["retryStrategy"] = analysis["retryStrategy"]
 

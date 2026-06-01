@@ -2034,6 +2034,7 @@ class SafeEditTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["failureClass"], "RETRYABLE")
         self.assertEqual(payload["rootCause"], "indentation_difference")
+        self.assertEqual(payload["recommendedAction"]["type"], "retry")
         self.assertIn("--ignore-indent", payload["retryStrategy"]["flags"])
 
         # Verify retry with suggested flag works
@@ -2062,6 +2063,7 @@ class SafeEditTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["failureClass"], "RETRYABLE")
         self.assertEqual(payload["rootCause"], "line_ending_difference")
+        self.assertEqual(payload["recommendedAction"]["type"], "retry")
         self.assertIn("--ignore-eol", payload["retryStrategy"]["flags"])
 
     def test_error_recovery_content_not_found(self):
@@ -2078,6 +2080,7 @@ class SafeEditTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["failureClass"], "USER_INPUT")
         self.assertEqual(payload["rootCause"], "content_not_found")
+        self.assertEqual(payload["recommendedAction"]["type"], "ask_user")
 
     def test_error_recovery_multiple_matches(self):
         """Test multiple matches scenario."""
@@ -2096,8 +2099,8 @@ class SafeEditTests(unittest.TestCase):
         # The error type should reflect this
         self.assertIn(payload["error"]["type"], ["match_count_mismatch", "expected_count_mismatch"])
 
-    def test_error_retry_strategy_confidence(self):
-        """Test retryStrategy includes confidence score."""
+    def test_error_retry_strategy_structure(self):
+        """Test recommendedAction and retryStrategy structure for RETRYABLE cases."""
         path = self.tmpdir / "confidence.txt"
         path.write_bytes(b"def hello():\n    return 42\n")
 
@@ -2108,11 +2111,68 @@ class SafeEditTests(unittest.TestCase):
         )
 
         payload = json.loads(result.stdout)
+        # Check recommendedAction structure
+        self.assertIn("recommendedAction", payload)
+        self.assertIn("type", payload["recommendedAction"])
+        self.assertIn("confidence", payload["recommendedAction"])
+        self.assertGreater(payload["recommendedAction"]["confidence"], 0.5)
+        self.assertEqual(payload["recommendedAction"]["type"], "retry")
+
+        # Check retryStrategy structure (only present for RETRYABLE)
         self.assertIn("retryStrategy", payload)
-        self.assertIn("confidence", payload["retryStrategy"])
-        self.assertGreater(payload["retryStrategy"]["confidence"], 0.5)
         self.assertIn("flags", payload["retryStrategy"])
         self.assertIn("alternativeFlags", payload["retryStrategy"])
+
+    def test_failure_class_action_consistency(self):
+        """Test failureClass and recommendedAction.type are always consistent.
+
+        This ensures Single Source of Truth - failureClass determines action type.
+        """
+        # Test RETRYABLE cases
+        path = self.tmpdir / "consistency.txt"
+
+        # indentation_difference -> RETRYABLE -> retry
+        path.write_bytes(b"def foo():\n    pass\n")
+        old_path = self.tmpdir / "old_tabs.txt"
+        old_path.write_bytes(b"def foo():\n\tpass\n")
+        result = self.run_tool("edit", "--file", path, "--old-file", old_path, "--new", "x", "--json", expect=2)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["failureClass"], "RETRYABLE")
+        self.assertEqual(payload["recommendedAction"]["type"], "retry")
+        self.assertIn("retryStrategy", payload)  # Only RETRYABLE has retryStrategy
+
+        # content_not_found -> USER_INPUT -> ask_user
+        path.write_bytes(b"alpha\n")
+        result = self.run_tool("edit", "--file", path, "--old", "nonexistent_xyz", "--new", "x", "--json", expect=2)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["failureClass"], "USER_INPUT")
+        self.assertEqual(payload["recommendedAction"]["type"], "ask_user")
+        self.assertNotIn("retryStrategy", payload)
+
+    def test_error_similar_content_exists_re_read_required(self):
+        """Test similar_content_exists results in RE_READ_REQUIRED."""
+        path = self.tmpdir / "similar.txt"
+        # Content that is highly similar (only one char different)
+        path.write_bytes(b"def calculate(x, y):\n    return x + y\n")
+
+        result = self.run_tool(
+            "edit", "--file", path,
+            # Try to match with slightly different content (x * y vs x + y)
+            "--old", "def calculate(x, y):\n    return x * y\n", "--new", "bar",
+            "--json", expect=2,
+        )
+
+        payload = json.loads(result.stdout)
+        # Should have closestMatch with high similarity
+        self.assertIn("closestMatch", payload)
+        # Similarity should be high (only one character different)
+        self.assertGreaterEqual(payload["closestMatch"]["similarity"], 0.6)
+        # Similar but not whitespace difference -> similar_content_exists -> RE_READ_REQUIRED
+        self.assertEqual(payload["failureClass"], "RE_READ_REQUIRED")
+        self.assertEqual(payload["rootCause"], "similar_content_exists")
+        self.assertEqual(payload["recommendedAction"]["type"], "re_read_file")
+        # Should NOT have retryStrategy
+        self.assertNotIn("retryStrategy", payload)
 
     def test_json_error_classifies_expected_count_mismatch(self):
         """Test --json error classifies expected_count mismatch."""
