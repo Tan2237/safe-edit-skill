@@ -1,17 +1,60 @@
 ---
 name: safe-edit
-description: Agent-friendly safe text editing primitive. Inspect, edit, and convert existing text files while preserving encoding, BOM, line endings, permissions, and write integrity. Use for any file edit where mojibake, truncated files, silent no-ops, or noisy Git diffs matter.
+description: |
+  Before the first edit of a file:
+
+    python safe_edit.py stat --file FILE --json
+
+  Use the returned editStrategy.
+
+  Cache the result per file.
+
+  Re-run stat only after:
+    - file recreation
+    - edit failure
 ---
 
 # safe-edit — Agent Edit Protocol
 
 Use `safe_edit.py` as the single entry point. Pure Python standard library, portable across Windows/Linux/macOS.
 
+## Required Workflow (run once per file before first edit)
+
+```
+Need to edit a file?
+│
+├─ Step 1: Check file
+│   python safe_edit.py stat --file F --json
+│   │
+│   ├─ editStrategy = "safe-edit"
+│   │      → Use safe-edit for ALL edits on this file
+│   │      → Do not switch back to built-in Edit
+│   │
+│   └─ editStrategy = "edit-tool"
+│   │      → Use built-in Edit tool
+│   │
+│   Cache stat result per file. Re-run stat only after:
+│     - file recreation
+│     - edit failure
+│
+│   Example:
+│     foo.cpp → stat → editStrategy=safe-edit
+│     Subsequent edits → reuse cached result
+│
+├─ Step 2: Edit
+│   Use editStrategy.
+│   For safe-edit usage details, see Core Rules below.
+│
+└─ Step 3: Edit failed?
+    → Read JSON error output
+    → Follow recommendedAction
+```
+
 ## Quick Reference
 
 ```bash
-# Check file before editing
-python safe_edit.py stat --file path/to/file
+# First step before editing
+python safe_edit.py stat --file path/to/file --json
 
 # Replace text
 python safe_edit.py edit --file F --old "old" --new "new" --expected-count 1
@@ -27,21 +70,17 @@ On Windows, `py -3` works when `python` is not on PATH.
 
 ---
 
-## Core Rules (Priority Order)
+## Core Rules
 
-1. **Always add `--expected-count 1`** — prevents wrong matches from silently succeeding. First priority.
+1. **Always add `--expected-count 1`** — prevents wrong matches from silently succeeding. Use this unless the edit is intentionally targeting multiple matches.
 
 2. **Prefer `--old-file` when** — multiline, >100 chars, or contains shell-sensitive chars (`$`, `%`, `\`, `` ` ``, `'`, `"`). Prevents shell escaping disasters.
 
 3. **Use `--auto-match` for multiline edits** — automatically tries exact → ignore-eol → ignore-indent → normalize-whitespace.
 
-4. **Line numbers invalidate after edits** — Any `insert`, `delete`, or `replace-lines` that changes line count invalidates all cached line numbers. Re-query with `grep -n` before next line-based operation.
+4. **Prefer `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
 
-5. **Prefer `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
-
-6. **Verify anchor uniqueness before `replace-lines`** — Run `grep -n "pattern" file` first. If pattern appears multiple times, use more specific pattern or `--start`/`--end` instead.
-
-7. **Re-read before structural edits** — Do not rely on stale context after file modifications. Function position, content, and bracket locations may have changed.
+5. **Re-read before structural edits** — Do not rely on stale context after file modifications. Function position, content, and bracket locations may have changed.
 
 ---
 
@@ -59,7 +98,7 @@ Need modification?
 │   │      YES → replace-lines --anchor-pattern "unique_sig" --text T
 │   │
 │   └─ Anchor not unique?
-│          → Locate line range with grep -n
+│          → Locate line range with search tool
 │          → replace-lines --start N --end M --text T
 │
 ├─ Insert content at specific location?
@@ -80,62 +119,16 @@ Need modification?
 ```
 
 **Risk hierarchy (prefer lower risk):**
+
+Always choose the lowest-risk command that can complete the edit.
+
 ```
-edit                 ← SAFEST
-replace-lines (--start/--end)
+edit                        ← SAFEST
 replace-lines (--anchor-pattern)
+replace-lines (--start/--end)
 insert / delete
-regex                ← HIGHEST RISK
+regex                       ← HIGHEST RISK
 ```
-
----
-
-## Edit Strategy Decision Tree
-
-```
-Need to edit a file?
-│
-├─ Is it a text file? ─── No → STOP
-│
-├─ ⚠️ PARAM MODE CHECK
-│   │
-│   ├─ old/new contains ANY of:
-│   │     • newline (multiline)
-│   │     • quote (' or ")
-│   │     • backslash (\)
-│   │     • dollar ($)
-│   │     • percent (%)
-│   │     • backtick (`)
-│   │     • >100 characters
-│   │
-│   │   YES → use --old-file / --new-file
-│   │   NO  → use --old "..." --new "..."
-│
-├─ EDIT TYPE CHECK
-│   │
-│   ├─ SINGLE LINE:
-│   │     edit --old X --new Y --expected-count 1
-│   │
-│   ├─ MULTILINE:
-│   │     edit --old X --new Y --auto-match --expected-count 1
-│   │
-│   └─ CODE BLOCK (json/yaml/markdown):
-│        edit --old X --new Y --auto-match --normalize-whitespace --expected-count 1
-│
-├─ MATCH FAILED?
-│   │
-│   ├─ Step 1: Was --auto-match on? If no, add it
-│   ├─ Step 2: --auto-match --fuzzy
-│   ├─ Step 3: --explain-match-failure (diagnose before giving up)
-│   └─ Step 4: Use --anchor-pattern instead of full text match
-│
-└─ Ambiguous match?
-    └─ Add --context-before "unique" or --context-after "unique"
-```
-
----
-
-**Shell-sensitive content** (newlines, quotes, `$`, `%`, `\`, `` ` ``, long text) → prefer `--old-file` / `--new-file`.
 
 ---
 
@@ -171,7 +164,7 @@ edit --old X --new Y --expected-count 1
 
 1. **Avoid `insert` near closing braces** — `insert --line N` goes AFTER line N. For `}` boundaries, use `replace-lines --start N --end N --text "}\nnew_content"` to preserve structure.
 
-2. **Verify anchor uniqueness** — Run `grep -n "pattern" file` first. If pattern appears multiple times (definition + calls), use more specific pattern like `"void FuncName("` or use `--start`/`--end` instead.
+2. **Verify anchor uniqueness** — Search for the pattern first. If it appears multiple times (definition + calls), use more specific pattern like `"void FuncName("` or use `--start`/`--end` instead.
 
 3. **Line numbers invalidate after edits** — After any operation that changes line count, re-query locations before next line-based operation.
 
@@ -197,7 +190,6 @@ edit --old X --new Y --expected-count 1
 | Single line | (none) |
 | Multiline code | `--auto-match` |
 | JSON/YAML/Markdown | `--auto-match --normalize-whitespace` |
-| Function/class body | Verify anchor first, then `--anchor-pattern` |
 
 ---
 

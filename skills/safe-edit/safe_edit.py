@@ -1866,6 +1866,10 @@ def read_target(path: Path, max_bytes: int) -> bytes:
 def inspect_target(path: Path, original: bytes, encoding: EncodingInfo, text: str) -> Dict[str, Any]:
     newline_style, line_counts, mixed_line_endings = detect_line_ending(text)
     records = split_records(text)
+    edit_plan = _compute_edit_plan(encoding, text, path,
+                                   newline_style=newline_style,
+                                   mixed=mixed_line_endings,
+                                   line_count=len(records))
     mode = stat.S_IMODE(path.stat().st_mode)
     return {
         "ok": True,
@@ -1883,6 +1887,9 @@ def inspect_target(path: Path, original: bytes, encoding: EncodingInfo, text: st
         "endsWithNewline": bool(text.endswith(("\n", "\r"))),
         "hasNul": "\x00" in text,
         "permissionsOctal": oct(mode),
+        "editMode": edit_plan["editMode"],
+        "editStrategy": edit_plan["editStrategy"],
+        "why": edit_plan["why"],
         "dryRun": True,
         "changed": 0,
         "operations": [],
@@ -1893,18 +1900,108 @@ def inspect_target(path: Path, original: bytes, encoding: EncodingInfo, text: st
     }
 
 
+def _compute_edit_plan(encoding: EncodingInfo, text: str, path: Path,
+                       newline_style: Optional[str] = None, mixed: Optional[bool] = None,
+                       line_count: Optional[int] = None) -> Dict[str, Any]:
+    """Compute edit strategy based on file properties.
+
+    Args:
+        encoding: File encoding info
+        text: Decoded file content
+        path: File path (for extension check)
+        newline_style: Pre-detected dominant line ending (None = auto-detect)
+        mixed: Pre-detected mixed line endings flag (None = auto-detect)
+        line_count: Pre-detected line count (None = auto-detect)
+
+    Returns:
+        {
+            "editMode": "builtin" | "recommended" | "required",
+            "editStrategy": "edit-tool" | "safe-edit",
+            "why": [list of reason strings]
+        }
+
+    editMode levels:
+        builtin     → built-in Edit tool OK (plain UTF-8 LF, no BOM, small file)
+        recommended → safe-edit preferred (large file, structured format, etc.)
+        required    → safe-edit mandatory (non-UTF8, BOM, CRLF, mixed EOL)
+    """
+    why: List[str] = []
+    mode = "builtin"
+
+    # Check encoding — required level
+    is_plain_utf8 = encoding.name == "utf-8" and not encoding.bom
+    if not is_plain_utf8:
+        mode = "required"
+        if encoding.bom:
+            why.append("bom")
+        if encoding.name not in ("utf-8", "utf-8-bom"):
+            why.append(f"encoding_{encoding.name}")
+
+    # Check line endings — required level
+    if newline_style is None:
+        newline_style, _counts, _mixed = detect_line_ending(text)
+        mixed = _mixed
+    if newline_style == "crlf":
+        mode = "required"
+        why.append("crlf")
+    elif newline_style == "cr":
+        mode = "required"
+        why.append("cr")
+    if mixed:
+        mode = "required"
+        why.append("mixed_line_endings")
+
+    # Check file size / line count — recommended level
+    if mode == "builtin":
+        if line_count is None:
+            records = split_records(text)
+            line_count = len(records)
+        file_size = len(text)
+
+        if file_size > 500 * 1024:  # > 500KB
+            mode = "recommended"
+            why.append("large_file")
+        elif line_count > 5000:
+            mode = "recommended"
+            why.append("many_lines")
+
+    # Check file extension for structured formats — recommended level
+    if mode == "builtin":
+        ext = path.suffix.lower()
+        if ext in (".json", ".yaml", ".yml", ".xml", ".toml"):
+            mode = "recommended"
+            why.append(f"structured_format_{ext.lstrip('.')}")
+
+    strategy = "safe-edit" if mode != "builtin" else "edit-tool"
+
+    return {
+        "editMode": mode,
+        "editStrategy": strategy,
+        "why": why,
+    }
+
+
 def stat_target(path: Path, original: bytes, encoding: EncodingInfo, text: str) -> Dict[str, Any]:
-    """Return a concise summary of file metadata for AI agents."""
+    """Return a concise summary of file metadata with edit strategy for AI agents."""
     newline_style, _line_counts, _mixed_line_endings = detect_line_ending(text)
     records = split_records(text)
+    edit_plan = _compute_edit_plan(encoding, text, path,
+                                   newline_style=newline_style,
+                                   mixed=_mixed_line_endings,
+                                   line_count=len(records))
     return {
         "ok": True,
         "file": str(path),
         "command": "stat",
         "encoding": encoding.name,
+        "hasBom": bool(encoding.bom),
         "lineEnding": newline_style,
+        "mixedLineEndings": _mixed_line_endings,
         "sizeBytes": len(original),
         "lineCount": len(records),
+        "editMode": edit_plan["editMode"],
+        "editStrategy": edit_plan["editStrategy"],
+        "why": edit_plan["why"],
         "dryRun": True,
         "changed": 0,
         "operations": [],

@@ -1844,20 +1844,29 @@ class SafeEditTests(unittest.TestCase):
         """Test stat command with --json produces machine-readable output."""
         path = self.tmpdir / "stat_json.txt"
         path.write_bytes(b"alpha\r\nbeta\r\n")
-        
+
         result = self.run_tool("stat", "--file", path, "--json")
         payload = json.loads(result.stdout)
-        
-        # Should have minimal fields
+
+        # Core fields
         self.assertEqual(payload["encoding"], "utf-8")
         self.assertEqual(payload["lineEnding"], "crlf")
         self.assertEqual(payload["sizeBytes"], 13)  # "alpha\r\nbeta\r\n" = 13 bytes
         self.assertEqual(payload["lineCount"], 2)
         self.assertEqual(payload["command"], "stat")
-        
-        # Should NOT have detailed fields like inspect
-        self.assertNotIn("hasBom", payload)
-        self.assertNotIn("mixedLineEndings", payload)
+
+        # Edit Guard fields
+        self.assertIn("editMode", payload)
+        self.assertIn("editStrategy", payload)
+        self.assertIn("why", payload)
+        self.assertIn("hasBom", payload)
+        self.assertIn("mixedLineEndings", payload)
+
+        # CRLF file should require safe-edit
+        self.assertEqual(payload["editMode"], "required")
+        self.assertIn("crlf", payload["why"])
+
+        # Should NOT have detailed inspect-only fields
         self.assertNotIn("lineEndingCounts", payload)
         self.assertNotIn("permissionsOctal", payload)
 
