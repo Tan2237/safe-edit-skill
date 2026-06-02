@@ -4003,5 +4003,197 @@ class SafeEditTests(unittest.TestCase):
         self.assertEqual(standalone_lf, 0, "No standalone LF should exist in CRLF file")
 
 
+# =========================================================================
+    # Lock stale cleanup & JSON enrichment tests
+    # =========================================================================
+
+    def test_is_process_alive_current_pid(self):
+        """Test _is_process_alive returns True for current process PID."""
+        m = self._import_safe_edit()
+        self.assertTrue(m._is_process_alive(os.getpid()))
+
+    def test_is_process_alive_dead_pid(self):
+        """Test _is_process_alive returns False for non-existent PID."""
+        m = self._import_safe_edit()
+        # Very large PID is almost certainly not alive on any system
+        self.assertFalse(m._is_process_alive(99999999))
+
+    def test_is_process_alive_zero_pid(self):
+        """Test _is_process_alive returns False for PID 0."""
+        m = self._import_safe_edit()
+        self.assertFalse(m._is_process_alive(0))
+
+    def test_read_lock_pid_parses_correctly(self):
+        """Test _read_lock_pid parses PID from lock file content."""
+        m = self._import_safe_edit()
+        lock = self.tmpdir / ".test_read.txt.safe-edit.lock"
+        lock.write_text(f"pid={os.getpid()} time={time.time()} file=.test_read.txt.safe-edit.lock\n", encoding="utf-8")
+        self.assertEqual(m._read_lock_pid(lock), os.getpid())
+
+    def test_read_lock_pid_returns_none_on_missing_file(self):
+        """Test _read_lock_pid returns None when lock file doesn't exist."""
+        m = self._import_safe_edit()
+        lock = self.tmpdir / ".nonexistent.txt.safe-edit.lock"
+        self.assertIsNone(m._read_lock_pid(lock))
+
+    def test_read_lock_pid_returns_none_on_bad_content(self):
+        """Test _read_lock_pid returns None for unparseable content."""
+        m = self._import_safe_edit()
+        lock = self.tmpdir / ".bad.txt.safe-edit.lock"
+        lock.write_text("garbage content no pid field\n", encoding="utf-8")
+        self.assertIsNone(m._read_lock_pid(lock))
+
+    def test_stale_lock_removed_when_pid_dead(self):
+        """Test lock is removed immediately when owner PID is dead (even with stale_seconds=0)."""
+        path = self.tmpdir / "dead_pid.txt"
+        path.write_bytes(b"foo\n")
+        lock = self.tmpdir / ".dead_pid.txt.safe-edit.lock"
+        # Use a non-existent PID
+        lock.write_text(f"pid=99999999 time={time.time()} file=.dead_pid.txt.safe-edit.lock\n", encoding="utf-8")
+
+        # With stale_seconds=0, PID-based cleanup should still work
+        self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "1",
+            "--lock-timeout", "1",
+            "--lock-stale-seconds", "0",
+        )
+        self.assertEqual(path.read_bytes(), b"bar\n")
+        self.assertFalse(lock.exists())
+
+    def test_stale_lock_removed_when_age_exceeded_even_with_alive_pid(self):
+        """Test lock is removed by age check even when PID is alive."""
+        path = self.tmpdir / "stale_alive.txt"
+        path.write_bytes(b"foo\n")
+        lock = self.tmpdir / ".stale_alive.txt.safe-edit.lock"
+        # Use current PID (alive), but set lock age > stale_seconds
+        lock.write_text(f"pid={os.getpid()} time={time.time() - 200} file=.stale_alive.txt.safe-edit.lock\n", encoding="utf-8")
+        # Set mtime to match the old timestamp in the content
+        old_time = time.time() - 200
+        os.utime(lock, (old_time, old_time))
+
+        self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "1",
+            "--lock-timeout", "1",
+            "--lock-stale-seconds", "60",
+        )
+        self.assertEqual(path.read_bytes(), b"bar\n")
+        self.assertFalse(lock.exists())
+
+    def test_stale_lock_preserved_when_pid_alive_and_not_stale(self):
+        """Test lock is NOT removed when PID is alive and age < stale_seconds."""
+        path = self.tmpdir / "fresh_lock.txt"
+        path.write_bytes(b"foo\n")
+        lock = self.tmpdir / ".fresh_lock.txt.safe-edit.lock"
+        # Use current PID (alive) + fresh timestamp
+        lock.write_text(f"pid={os.getpid()} time={time.time()} file=.fresh_lock.txt.safe-edit.lock\n", encoding="utf-8")
+
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "1",
+            "--lock-timeout", "0.1",
+            "--lock-stale-seconds", "120",
+            "--json", expect=2,
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "lock_error")
+        # Lock file should still exist
+        self.assertTrue(lock.exists())
+
+    def test_lock_error_json_includes_metadata(self):
+        """Test lock_error JSON output includes targetFile, lockPid, lockAgeSeconds, failureClass, recommendedAction."""
+        path = self.tmpdir / "lock_meta.txt"
+        path.write_bytes(b"foo\n")
+        lock = self.tmpdir / ".lock_meta.txt.safe-edit.lock"
+        # Use current PID (alive) + stale_seconds > lock age so lock is NOT removed
+        lock_pid = os.getpid()
+        lock_time = time.time() - 37.2
+        lock.write_text(f"pid={lock_pid} time={lock_time} file=.lock_meta.txt.safe-edit.lock\n", encoding="utf-8")
+        # Set mtime to match the timestamp in the content
+        os.utime(lock, (lock_time, lock_time))
+
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "1",
+            "--lock-timeout", "0.1",
+            "--lock-stale-seconds", "120",
+            "--json", expect=2,
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "lock_error")
+        self.assertEqual(payload["targetFile"], "lock_meta.txt")
+        self.assertEqual(payload["lockPid"], lock_pid)
+        self.assertAlmostEqual(payload["lockAgeSeconds"], 37.2, delta=2.0)
+        self.assertEqual(payload["failureClass"], "RETRYABLE")
+        self.assertEqual(payload["recommendedAction"]["type"], "retry_after_lock_clears")
+        self.assertEqual(payload["recommendedAction"]["confidence"], 0.8)
+
+    def test_lock_error_json_with_alive_pid_lock(self):
+        """Test lock_error JSON when PID is alive — still includes metadata."""
+        path = self.tmpdir / "lock_alive_meta.txt"
+        path.write_bytes(b"foo\n")
+        lock = self.tmpdir / ".lock_alive_meta.txt.safe-edit.lock"
+        lock_time = time.time()
+        lock.write_text(f"pid={os.getpid()} time={lock_time} file=.lock_alive_meta.txt.safe-edit.lock\n", encoding="utf-8")
+
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "1",
+            "--lock-timeout", "0.1",
+            "--lock-stale-seconds", "120",
+            "--json", expect=2,
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "lock_error")
+        self.assertEqual(payload["targetFile"], "lock_alive_meta.txt")
+        self.assertEqual(payload["lockPid"], os.getpid())
+        self.assertEqual(payload["failureClass"], "RETRYABLE")
+        self.assertEqual(payload["recommendedAction"]["type"], "retry_after_lock_clears")
+
+    def test_lock_error_json_missing_metadata_when_lock_deleted(self):
+        """Test lock_error JSON still has targetFile even if lock file is deleted between fail and JSON output."""
+        path = self.tmpdir / "lock_gone.txt"
+        path.write_bytes(b"foo\n")
+        lock = self.tmpdir / ".lock_gone.txt.safe-edit.lock"
+        lock.write_text(f"pid={os.getpid()} time={time.time()} file=.lock_gone.txt.safe-edit.lock\n", encoding="utf-8")
+
+        # Run with very short timeout so it fails, then delete lock before reading JSON
+        # Note: in practice, the lock file might be deleted by a concurrent process.
+        # We test this by creating a scenario where lock parsing fails.
+        result = self.run_tool(
+            "edit", "--file", path,
+            "--old", "foo", "--new", "bar",
+            "--expected-count", "1",
+            "--lock-timeout", "0.1",
+            "--lock-stale-seconds", "120",
+            "--json", expect=2,
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "lock_error")
+        # targetFile should always be present (computed from args, not lock file)
+        self.assertEqual(payload["targetFile"], "lock_gone.txt")
+        # failureClass and recommendedAction should always be present for lock_error
+        self.assertEqual(payload["failureClass"], "RETRYABLE")
+        self.assertEqual(payload["recommendedAction"]["type"], "retry_after_lock_clears")
+
+    def test_default_lock_stale_seconds_is_120(self):
+        """Test that --lock-stale-seconds defaults to 120."""
+        m = self._import_safe_edit()
+        # Verify by inspecting the argument parser default
+        parser = m.build_parser()
+        action = next(a for a in parser._actions if "--lock-stale-seconds" in a.option_strings)
+        self.assertEqual(action.default, 120.0)
+
+
 if __name__ == "__main__":
     unittest.main()

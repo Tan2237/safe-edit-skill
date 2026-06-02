@@ -23,6 +23,53 @@ class SafeEditError(Exception):
     pass
 
 
+def _is_process_alive(pid: int) -> bool:
+    """Check whether a process with the given PID is still running.
+
+    Pure stdlib, cross-platform:
+    - Unix: os.kill(pid, 0) checks existence without sending a signal.
+    - Windows: OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) via ctypes.
+
+    Returns False on any error (missing PID, permission denied, etc.)
+    so that stale-lock cleanup can proceed safely.
+    """
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        # Unix / macOS
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    else:
+        # Windows — use ctypes to avoid subprocess overhead
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+
+
+def _read_lock_pid(lock_path: Path) -> Optional[int]:
+    """Parse the PID from a safe-edit lock file.
+
+    Lock file format: ``pid=12345 time=1710000000.123 file=foo.lock\\n``
+    Returns None if the file is missing or the PID cannot be parsed.
+    """
+    try:
+        content = lock_path.read_text("utf-8")
+        for field in content.split():
+            if field.startswith("pid="):
+                return int(field.split("=", 1)[1])
+    except Exception:
+        pass
+    return None
+
+
 # Pre-compiled regex for line ending detection (used by split_records)
 # Matches CRLF, CR, or LF - order matters: CRLF must be first to avoid partial matches
 _LINE_ENDING_RE = re.compile(r'(\r\n|\r|\n)')
@@ -345,6 +392,7 @@ def emit_json_error(
     *,
     old: str = "",
     text: str = "",
+    lock_info: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Emit a structured JSON error object to stdout for Agent consumption.
 
@@ -354,6 +402,13 @@ def emit_json_error(
     - closestMatch: nearest similar content location
     - recommendedAction: {"type": str, "confidence": float}
     - retryStrategy: recommended flags (only for RETRYABLE)
+
+    When lock_info is provided for lock errors, provides:
+    - targetFile: filename (relative, not absolute path)
+    - lockPid: PID of the lock owner (may be absent)
+    - lockAgeSeconds: age of the lock in seconds (may be absent)
+    - failureClass: RETRYABLE
+    - recommendedAction: {"type": "retry_after_lock_clears", "confidence": float}
     """
     error_type = classify_error_type(str(exc))
     error_obj: Dict[str, Any] = {
@@ -383,6 +438,20 @@ def emit_json_error(
                 error_obj["recommendedAction"] = analysis["recommendedAction"]
             if analysis["retryStrategy"]:
                 error_obj["retryStrategy"] = analysis["retryStrategy"]
+
+    # Structured recovery info for lock errors
+    if error_type == "lock_error" and lock_info:
+        error_obj["failureClass"] = "RETRYABLE"
+        target_file = lock_info.get("targetFile")
+        if target_file is not None:
+            error_obj["targetFile"] = target_file
+        lock_pid = lock_info.get("lockPid")
+        if lock_pid is not None:
+            error_obj["lockPid"] = lock_pid
+        lock_age = lock_info.get("lockAgeSeconds")
+        if lock_age is not None:
+            error_obj["lockAgeSeconds"] = lock_age
+        error_obj["recommendedAction"] = {"type": "retry_after_lock_clears", "confidence": 0.8}
 
     print(json.dumps(error_obj, ensure_ascii=False, sort_keys=True))
 
@@ -1804,13 +1873,23 @@ class FileLock:
                 time.sleep(0.05)
 
     def remove_stale_lock(self) -> None:
+        # Path 1: PID check — if lock owner is dead, remove immediately
+        pid = _read_lock_pid(self.path)
+        if pid is not None and not _is_process_alive(pid):
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+
+        # Path 2: Stale age check
         if self.stale_seconds <= 0:
             return
         try:
             age = time.time() - self.path.stat().st_mtime
         except FileNotFoundError:
             return
-        if age < self.stale_seconds:
+        if age <= self.stale_seconds:
             return
         try:
             self.path.unlink()
@@ -2277,7 +2356,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--follow-symlink", action="store_true")
     parser.add_argument("--max-bytes", type=int, default=50 * 1024 * 1024)
     parser.add_argument("--lock-timeout", type=float, default=10.0)
-    parser.add_argument("--lock-stale-seconds", type=float, default=0.0)
+    parser.add_argument("--lock-stale-seconds", type=float, default=120.0)
     parser.add_argument("--no-lock", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--interactive", "-i", action="store_true",
@@ -2537,6 +2616,7 @@ def main(argv: List[str]) -> int:
             error_type = classify_error_type(str(exc))
             old = ""
             text = ""
+            lock_info = None
 
             if error_type in ("match_not_found", "match_ambiguous", "match_count_mismatch"):
                 # Try to read file content for analysis
@@ -2564,12 +2644,37 @@ def main(argv: List[str]) -> int:
                     # If we can't read the file, emit basic error
                     pass
 
+            elif error_type == "lock_error":
+                # Try to read lock file for structured recovery info
+                try:
+                    target_name = Path(file_path).name if file_path else ""
+                    lock_path = resolve_target_path(file_path, getattr(args, 'follow_symlink', False)).with_name(f".{target_name}.safe-edit.lock")
+                    content = lock_path.read_text("utf-8")
+                    pid = _read_lock_pid(lock_path)
+                    lock_time = None
+                    for field in content.split():
+                        if field.startswith("time="):
+                            lock_time = float(field.split("=", 1)[1])
+                    lock_age = None
+                    if lock_time is not None:
+                        lock_age = round(time.time() - lock_time, 1)
+                    lock_info = {"targetFile": target_name}
+                    if pid is not None:
+                        lock_info["lockPid"] = pid
+                    if lock_age is not None:
+                        lock_info["lockAgeSeconds"] = lock_age
+                except Exception:
+                    # Lock file may have been deleted by a concurrent process
+                    target_name = Path(file_path).name if file_path else ""
+                    lock_info = {"targetFile": target_name}
+
             emit_json_error(
                 exc,
                 file_path=file_path,
                 command=command,
                 old=old,
                 text=text,
+                lock_info=lock_info,
             )
         else:
             print(f"safe-edit: {exc}", file=sys.stderr)
