@@ -8,7 +8,7 @@
 
 - 单文件 Python 标准库实现，Windows/Linux/macOS 通用。
 - `inspect` 只检查不写入，可输出编码、BOM、行尾统计、文件大小、行数、NUL 字符和权限位。
-- `stat` 简洁摘要，只显示编码、行尾、大小、行数，适合 AI Agent 快速查看。
+- `stat` 简洁摘要，包含编码、BOM、行尾统计、文件大小、行数，以及推荐的编辑策略（`editStrategy`）。
 - `convert` 显式转换编码、行尾、最终换行，或清理尾随空白；普通编辑默认仍保留原格式。
 - 自动检测并保留 `utf-8`、`utf-8-bom`、`gbk`、UTF-16 BOM，以及清晰 NUL 模式下的无 BOM UTF-16。
 - 支持手动指定 `shift-jis`、`big5`、`latin-1`、`utf-16-le`、`utf-16-be`。
@@ -59,13 +59,29 @@ skills/safe-edit/
   safe_edit.py
 ```
 
+## Recommended Workflow
+
+编辑文件前，先检查文件属性：
+
+```bash
+python safe_edit.py stat --file foo.cpp --json
+```
+
+返回的 `editStrategy` 告诉你该用什么工具编辑这个文件：
+
+| editStrategy | 含义 |
+|---|---|
+| `edit-tool` | 用内置 Edit 工具即可 |
+| `safe-edit` | 必须用 safe-edit（文件有 BOM、非 UTF-8 编码、CRLF 行尾等） |
+
+如果 `editStrategy` 是 `safe-edit`，后续对该文件的所有编辑都应使用 safe-edit。
+
 ## 基本用法
 
 直接运行 Python 脚本即可。Windows 上如果 `python` 不在 `PATH`，可以用 `py -3` 替代。
 
 ```bash
-python safe_edit.py inspect --file path/to/file --json
-python safe_edit.py stat --file path/to/file
+python safe_edit.py stat --file path/to/file --json
 python safe_edit.py convert --file path/to/file --to-encoding utf-8-bom --to-line-ending crlf --final-newline ensure
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --expected-count 1
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --expected-count 1
@@ -124,19 +140,22 @@ python safe_edit.py edit --file path/to/file --old "missing" --new "bar" --json
 ```json
 {
   "ok": false,
-  "error_type": "match_not_found",
+  "error": {
+    "type": "match_not_found",
+    "message": "old text was not found"
+  },
   "failureClass": "RETRYABLE",
-  "rootCause": "WHITESPACE_CAUSES",
-  "closestMatch": {"line": 42, "fragment": "similar text", "similarity": 0.85},
+  "rootCause": "indentation_difference",
+  "closestMatch": {"line": 42, "similarity": 0.91},
   "recommendedAction": {"type": "retry", "confidence": 0.9},
-  "retryStrategy": {"flags": ["--auto-match", "--normalize-whitespace"]}
+  "retryStrategy": {"flags": ["--ignore-indent"], "alternativeFlags": ["--auto-match"]}
 }
 ```
 
 | 字段 | 说明 |
 |------|------|
 | `failureClass` | `RETRYABLE`（可自动重试）、`RE_READ_REQUIRED`（需重新读取文件）、`USER_INPUT`（需用户修正）、`FATAL`（不可恢复） |
-| `rootCause` | 根因分类：`WHITESPACE_CAUSES`、`LINE_ENDING_DIFFERENCE`、`CONTENT_NOT_FOUND`、`MULTIPLE_MATCHES` 等 |
+| `rootCause` | 根因分类：`indentation_difference`、`line_ending_difference`、`whitespace_difference`、`content_not_found`、`multiple_matches`、`similar_content_exists` |
 | `closestMatch` | 最接近匹配的位置、片段和相似度（0.0–1.0） |
 | `recommendedAction` | 推荐的恢复动作（`retry`、`re_read_file`、`ask_user`、`stop`）及其置信度 |
 | `retryStrategy` | 仅 `RETRYABLE` 时返回，包含推荐的重试参数 |
