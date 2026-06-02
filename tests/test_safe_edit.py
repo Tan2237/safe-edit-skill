@@ -3962,6 +3962,46 @@ class SafeEditTests(unittest.TestCase):
         self.run_tool("edit", "--file", path, "--diff-input", diff, "--expected-count", "1")
         self.assertEqual(path.read_bytes(), b"alpha\nBETA\ngamma\n")
 
+    def test_auto_match_crlf_boundary_preserves_line_endings(self):
+        """Test that --auto-match on CRLF file does not introduce standalone LF.
+
+        Regression: when ignore-eol matching found a candidate ending with \r
+        (truncated CRLF), the trailing \n was left as a standalone LF in the file.
+        Fix: extend match to include the trailing \n when candidate ends with \r.
+        """
+        # CRLF file content
+        path = self.tmpdir / "crlf_boundary.cpp"
+        path.write_bytes(
+            b"void Func() {\r\n    if (a) {\r\n        doSoft();\r\n    }\r\n"
+            b"    else {\r\n        doHard();\r\n    }\r\n}\r\n"
+        )
+
+        # LF-only old and new (simulating Agent passing LF text to CRLF file)
+        old_file = self.tmpdir / "crlf_old.txt"
+        old_file.write_text("    else {\n        doHard();\n    }\n", encoding="utf-8")
+        new_file = self.tmpdir / "crlf_new.txt"
+        new_file.write_text(
+            "    else {\n        ListFaceSoft();\n        entityList = true;\n    }\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_tool(
+            "edit", "--file", path, "--encoding", "utf-8",
+            "--old-file", str(old_file), "--new-file", str(new_file),
+            "--auto-match", "--expected-count", "1", "--json",
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["changed"], 1)
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "ignore-eol")
+
+        # Verify no standalone LF in the result
+        # On Windows, read_text() auto-converts \r\n to \n, so use read_bytes().decode()
+        new_content = path.read_bytes().decode("utf-8")
+        crlf_count = new_content.count("\r\n")
+        lf_count = new_content.count("\n")
+        standalone_lf = lf_count - crlf_count
+        self.assertEqual(standalone_lf, 0, "No standalone LF should exist in CRLF file")
+
 
 if __name__ == "__main__":
     unittest.main()

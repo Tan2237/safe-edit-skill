@@ -1361,23 +1361,28 @@ def find_original_position(original_text: str, normalized_text: str, norm_pos: i
     # unlikely to be more than 3x longer (handles CRLF→LF, tab→spaces).
     min_len = max(1, len(normalized_old))
     max_len = max(len(original_old) * 3, len(normalized_old) * 3, 200)
-    
+
     search_start = start_search_pos
     while search_start < len(original_text):
         for length in range(min_len, min(max_len + 1, len(original_text) - search_start + 1)):
             candidate = original_text[search_start:search_start + length]
             normalized_candidate = normalize_for_match(candidate, ignore_indent, ignore_eol, normalize_whitespace)
-            
+
             if normalized_candidate == normalized_old:
+                # Extend match to include a trailing \n if the match ends with \r
+                # (CRLF boundary: avoid splitting \r\n into \r matched + \n leftover)
+                if ignore_eol and length < len(original_text) - search_start:
+                    if candidate.endswith('\r') and original_text[search_start + length] == '\n':
+                        length += 1
                 return (search_start, length)
-            
+
             # Early termination: if normalized candidate is already longer than target,
             # no point trying longer substrings from this position
             if len(normalized_candidate) > len(normalized_old):
                 break
-        
+
         search_start += 1
-    
+
     return (-1, 0)
 
 
