@@ -101,6 +101,9 @@ Need modification?
 │          → Locate line range with search tool
 │          → replace-lines --start N --end M --text T
 │
+│   Note: replace-lines preserves original indentation by default.
+│   Use --no-preserve-indent to insert text exactly as provided.
+│
 ├─ Insert content at specific location?
 │   │
 │   ├─ Structural boundary (}, class/namespace end)?
@@ -155,6 +158,34 @@ edit --old X --new Y --expected-count 1
 ```
 
 **Key insight:** Most failures are whitespace differences. `--auto-match` handles this. Use `--explain-match-failure` before abandoning text matching.
+
+---
+
+## Windows (Git Bash / MSYS2)
+
+MSYS2 automatically converts POSIX-style paths in CLI arguments:
+
+| User types | MSYS2 converts to | Effect |
+|------------|-------------------|--------|
+| `--old "//if"` | `--old "/if"` | Double slash collapsed |
+| `--old "/foo"` | `--old "C:/Program Files/Git/foo"` | Single slash expanded |
+
+This silently corrupts `--old`/`--new`/`--pattern`/`--text` values starting with `/` or `//`.
+
+**Fix**: Set environment variable before calling safe_edit.py:
+
+```bash
+export MSYS2_ARG_CONV_EXCL="*"
+python safe_edit.py edit --file F --old "//if (x > 0)" --new "if (x > 0)" --expected-count 1
+```
+
+Or use file variants to bypass shell entirely:
+
+```bash
+python safe_edit.py edit --file F --old-file old.txt --new-file new.txt
+```
+
+safe-edit emits a `"warnings"` field in JSON output when MSYS2 path corruption is detected.
 
 ---
 

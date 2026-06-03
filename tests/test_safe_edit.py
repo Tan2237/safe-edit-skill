@@ -4195,5 +4195,211 @@ class SafeEditTests(unittest.TestCase):
         self.assertEqual(action.default, 120.0)
 
 
+    def test_replace_lines_preserves_indent_by_default(self):
+        """Test that replace-lines preserves original indentation by default."""
+        path = self.tmpdir / "indent_default.txt"
+        path.write_bytes(b"void foo()\n{\n    bar();\n}\n")
+
+        self.run_tool(
+            "replace-lines",
+            "--file", path,
+            "--start", "3",
+            "--end", "3",
+            "--text", "baz();",
+        )
+
+        self.assertEqual(
+            path.read_bytes(),
+            b"void foo()\n{\n    baz();\n}\n",
+        )
+
+    def test_replace_lines_no_preserve_indent(self):
+        """Test that --no-preserve-indent disables indent preservation."""
+        path = self.tmpdir / "no_preserve.txt"
+        path.write_bytes(b"void foo()\n{\n    bar();\n}\n")
+
+        self.run_tool(
+            "replace-lines",
+            "--file", path,
+            "--start", "3",
+            "--end", "3",
+            "--text", "baz();",
+            "--no-preserve-indent",
+        )
+
+        self.assertEqual(
+            path.read_bytes(),
+            b"void foo()\n{\nbaz();\n}\n",
+        )
+
+    def test_replace_lines_preserve_indent_already_indented(self):
+        """Test that already-indented replacement text is not doubled."""
+        path = self.tmpdir / "already_indented.txt"
+        path.write_bytes(b"void foo()\n{\n    bar();\n}\n")
+
+        self.run_tool(
+            "replace-lines",
+            "--file", path,
+            "--start", "3",
+            "--end", "3",
+            "--text", "    baz();",
+        )
+
+        self.assertEqual(
+            path.read_bytes(),
+            b"void foo()\n{\n    baz();\n}\n",
+        )
+
+    def test_replace_lines_preserve_indent_empty_lines(self):
+        """Test that empty lines in replacement don't get indent added."""
+        path = self.tmpdir / "empty_lines.txt"
+        path.write_bytes(b"void foo()\n{\n    bar();\n}\n")
+
+        block = self.tmpdir / "block.txt"
+        block.write_text("alpha();\n\nbeta();", encoding="utf-8")
+
+        self.run_tool(
+            "replace-lines",
+            "--file", path,
+            "--start", "3",
+            "--end", "3",
+            "--text-file", block,
+        )
+
+        self.assertEqual(
+            path.read_bytes(),
+            b"void foo()\n{\n    alpha();\n\n    beta();\n}\n",
+        )
+
+    def test_replace_lines_preserve_indent_multiline(self):
+        """Test indent preservation across multiline replacement."""
+        path = self.tmpdir / "multiline_indent.txt"
+        path.write_bytes(b"void foo()\n{\n    bar();\n    baz();\n}\n")
+
+        block = self.tmpdir / "block.txt"
+        block.write_text("alpha();\nbeta();", encoding="utf-8")
+
+        self.run_tool(
+            "replace-lines",
+            "--file", path,
+            "--start", "3",
+            "--end", "4",
+            "--text-file", block,
+        )
+
+        self.assertEqual(
+            path.read_bytes(),
+            b"void foo()\n{\n    alpha();\n    beta();\n}\n",
+        )
+
+    def test_msys2_detection_with_git_prefix(self):
+        """Test _detect_msys2_path_corruption detects Git prefix corruption."""
+        m = self._import_safe_edit()
+        # Save and restore env
+        old_msystem = os.environ.get("MSYSTEM")
+        old_mingw = os.environ.get("MINGW_PREFIX")
+        old_platform = sys.platform
+        try:
+            os.environ["MSYSTEM"] = "MINGW64"
+            os.environ["MINGW_PREFIX"] = "C:/Program Files/Git"
+            # Simulate what MSYS2 does: /foo → C:/Program Files/Git/foo
+            result = m._detect_msys2_path_corruption(
+                "C:/Program Files/Git/if (iScale > 30)", "old"
+            )
+            self.assertIsNotNone(result)
+            self.assertIn("MSYS2_ARG_CONV_EXCL", result)
+        finally:
+            if old_msystem is not None:
+                os.environ["MSYSTEM"] = old_msystem
+            else:
+                os.environ.pop("MSYSTEM", None)
+            if old_mingw is not None:
+                os.environ["MINGW_PREFIX"] = old_mingw
+            else:
+                os.environ.pop("MINGW_PREFIX", None)
+
+    def test_msys2_detection_single_slash(self):
+        """Test _detect_msys2_path_corruption warns on / prefix under MSYS2."""
+        m = self._import_safe_edit()
+        old_msystem = os.environ.get("MSYSTEM")
+        old_conv = os.environ.get("MSYS2_ARG_CONV_EXCL")
+        try:
+            os.environ["MSYSTEM"] = "MINGW64"
+            os.environ.pop("MSYS2_ARG_CONV_EXCL", None)
+            # /foo could be the result of //foo → /foo conversion
+            result = m._detect_msys2_path_corruption("/if (x > 0)", "old")
+            self.assertIsNotNone(result)
+            self.assertIn("MSYS2_ARG_CONV_EXCL", result)
+        finally:
+            if old_msystem is not None:
+                os.environ["MSYSTEM"] = old_msystem
+            else:
+                os.environ.pop("MSYSTEM", None)
+            if old_conv is not None:
+                os.environ["MSYS2_ARG_CONV_EXCL"] = old_conv
+            else:
+                os.environ.pop("MSYS2_ARG_CONV_EXCL", None)
+
+    def test_msys2_detection_no_env(self):
+        """Test _detect_msys2_path_corruption returns None without MSYS2 env."""
+        m = self._import_safe_edit()
+        old_msystem = os.environ.get("MSYSTEM")
+        old_mingw = os.environ.get("MINGW_PREFIX")
+        try:
+            os.environ.pop("MSYSTEM", None)
+            os.environ.pop("MINGW_PREFIX", None)
+            result = m._detect_msys2_path_corruption("/if (x > 0)", "old")
+            self.assertIsNone(result)
+        finally:
+            if old_msystem is not None:
+                os.environ["MSYSTEM"] = old_msystem
+            else:
+                os.environ.pop("MSYSTEM", None)
+            if old_mingw is not None:
+                os.environ["MINGW_PREFIX"] = old_mingw
+            else:
+                os.environ.pop("MINGW_PREFIX", None)
+
+    def test_msys2_detection_with_conv_excl_set(self):
+        """Test _detect_msys2_path_corruption returns None when MSYS2_ARG_CONV_EXCL is set."""
+        m = self._import_safe_edit()
+        old_msystem = os.environ.get("MSYSTEM")
+        old_conv = os.environ.get("MSYS2_ARG_CONV_EXCL")
+        try:
+            os.environ["MSYSTEM"] = "MINGW64"
+            os.environ["MSYS2_ARG_CONV_EXCL"] = "*"
+            result = m._detect_msys2_path_corruption("/if (x > 0)", "old")
+            self.assertIsNone(result)
+        finally:
+            if old_msystem is not None:
+                os.environ["MSYSTEM"] = old_msystem
+            else:
+                os.environ.pop("MSYSTEM", None)
+            if old_conv is not None:
+                os.environ["MSYS2_ARG_CONV_EXCL"] = old_conv
+            else:
+                os.environ.pop("MSYS2_ARG_CONV_EXCL", None)
+
+    def test_msys2_detection_normal_text(self):
+        """Test _detect_msys2_path_corruption returns None for normal text."""
+        m = self._import_safe_edit()
+        old_msystem = os.environ.get("MSYSTEM")
+        old_conv = os.environ.get("MSYS2_ARG_CONV_EXCL")
+        try:
+            os.environ["MSYSTEM"] = "MINGW64"
+            os.environ.pop("MSYS2_ARG_CONV_EXCL", None)
+            result = m._detect_msys2_path_corruption("if (x > 0)", "old")
+            self.assertIsNone(result)
+        finally:
+            if old_msystem is not None:
+                os.environ["MSYSTEM"] = old_msystem
+            else:
+                os.environ.pop("MSYSTEM", None)
+            if old_conv is not None:
+                os.environ["MSYS2_ARG_CONV_EXCL"] = old_conv
+            else:
+                os.environ.pop("MSYS2_ARG_CONV_EXCL", None)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -970,12 +970,72 @@ def read_argument_file(path: str, arg_encoding: str) -> str:
         fail(f"failed to decode argument file {path} as {arg_encoding}: {exc}")
 
 
+def _detect_msys2_path_corruption(value: str, param_name: str) -> Optional[str]:
+    """Detect if a CLI text argument was corrupted by MSYS2 path conversion.
+
+    MSYS2/Git Bash on Windows automatically converts POSIX-style paths in CLI
+    arguments: /foo → C:/Program Files/Git/foo, //foo → /foo.
+    This corrupts text content parameters like --old, --new, etc.
+
+    Returns None if the value looks clean, or a warning string if corruption detected.
+
+    TODO: Add --msys-guard flag for opt-in automatic path restoration (currently
+    warning-only). When implemented, also add --no-msys-guard to disable.
+    TODO: Post-edit verification — after writing, read back changed lines and
+    compare against expected --new text; emit warning on mismatch.
+    """
+    if sys.platform != "win32" or not value:
+        return None
+
+    msystem = os.environ.get("MSYSTEM", "")
+    msys_prefix = os.environ.get("MINGW_PREFIX", "")
+    if not msystem and not msys_prefix:
+        return None
+
+    # If user has already set MSYS2_ARG_CONV_EXCL, path conversion is disabled
+    if os.environ.get("MSYS2_ARG_CONV_EXCL", ""):
+        return None
+
+    # Pattern 1: /foo → C:/Program Files/Git/foo
+    git_prefix = msys_prefix.replace("\\", "/") if msys_prefix else ""
+    known_prefixes = [git_prefix] if git_prefix else []
+    if not known_prefixes:
+        known_prefixes = [
+            "C:/Program Files/Git/",
+            "C:/Program Files (x86)/Git/",
+        ]
+    for prefix in known_prefixes:
+        if prefix and value.startswith(prefix):
+            return (
+                f"--{param_name} value was likely corrupted by MSYS2 path conversion "
+                f"(starts with {prefix}). Original content starting with '/' was "
+                f"converted to a Windows path. Set MSYS2_ARG_CONV_EXCL=\"*\" before "
+                f"calling safe_edit.py, or use --{param_name}-file to pass content via file."
+            )
+
+    # Pattern 2: //foo → /foo (double-slash collapsed to single-slash)
+    # We can't distinguish this from a legitimate single-slash prefix, so warn
+    # on any value starting with '/' when running under MSYS2.
+    if value.startswith("/"):
+        return (
+            f"--{param_name} value starts with '/'. Under MSYS2/Git Bash, "
+            f"arguments starting with '/' or '//' are automatically converted to Windows paths "
+            f"('/foo' → 'C:/Program Files/Git/foo', '//foo' → '/foo'). "
+            f"If your original text started with '//', it has been corrupted. "
+            f"Set MSYS2_ARG_CONV_EXCL=\"*\" before calling safe_edit.py, "
+            f"or use --{param_name}-file to pass content via file."
+        )
+
+    return None
+
+
 def resolve_cli_value(
     args: argparse.Namespace,
     name: str,
     required: bool,
     *,
     stdin_taken: List[str],
+    warnings: Optional[List[str]] = None,
 ) -> Optional[str]:
     direct = getattr(args, name, None)
     file_value = getattr(args, f"{name}_file", None)
@@ -988,6 +1048,10 @@ def resolve_cli_value(
             fail(f"missing --{name}")
         return None
     if direct is not None:
+        if warnings is not None:
+            warning = _detect_msys2_path_corruption(direct, name)
+            if warning:
+                warnings.append(warning)
         return direct
     if file_value is not None:
         return read_argument_file(file_value, args.arg_encoding)
@@ -1708,13 +1772,39 @@ def apply_delete_lines(text: str, operation: Dict[str, Any]) -> Tuple[str, int, 
     return (join_records(records[:start] + records[end:]), end - start, "line-based")
 
 
+def _extract_indent(line: str) -> str:
+    """Extract leading whitespace from a line."""
+    indent = ""
+    for c in line:
+        if c in ' \t':
+            indent += c
+        else:
+            break
+    return indent
+
+
 def apply_replace_lines(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int, str]:
     records = split_records(text)
     start, end = range_bounds(operation, records, text)
+    preserve_indent = bool(operation.get("preserve_indent", False))
+    replacement_text = str(operation["text"])
+
+    if preserve_indent and start < len(records):
+        original_indent = _extract_indent(records[start][0])
+        if original_indent:
+            lines = replacement_text.split('\n')
+            adjusted = []
+            for line in lines:
+                if line and line[0] not in ' \t':
+                    adjusted.append(original_indent + line)
+                else:
+                    adjusted.append(line)
+            replacement_text = '\n'.join(adjusted)
+
     following_exists = end < len(records)
     original_final_sep = records[end - 1][1] if end > start else newline
     final_sep = newline if following_exists else original_final_sep
-    replacement = block_records(str(operation["text"]), newline, final_sep)
+    replacement = block_records(replacement_text, newline, final_sep)
     return (join_records(records[:start] + replacement + records[end:]), end - start, "line-based")
 
 
@@ -2182,7 +2272,7 @@ def load_batch_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]
     return operations, base_dir
 
 
-def command_to_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Optional[Path]]:
+def command_to_operations(args: argparse.Namespace, warnings: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], Optional[Path]]:
     # Handle --diff-input: parse SEARCH/REPLACE format into edit operations
     diff_input = getattr(args, 'diff_input', None)
     diff_input_file = getattr(args, 'diff_input_file', None)
@@ -2230,8 +2320,8 @@ def command_to_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]
         stdin_taken: List[str] = []
         operation: Dict[str, Any] = {"op": args.command}
         if args.command == "edit":
-            operation["old"] = resolve_cli_value(args, "old", True, stdin_taken=stdin_taken)
-            operation["new"] = resolve_cli_value(args, "new", True, stdin_taken=stdin_taken)
+            operation["old"] = resolve_cli_value(args, "old", True, stdin_taken=stdin_taken, warnings=warnings)
+            operation["new"] = resolve_cli_value(args, "new", True, stdin_taken=stdin_taken, warnings=warnings)
             operation["expected_count"] = args.expected_count
             operation["first"] = args.first
             operation["no_op_ok"] = args.no_op_ok
@@ -2240,8 +2330,8 @@ def command_to_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]
             if getattr(args, 'context_after', None):
                 operation["context_after"] = args.context_after
         elif args.command == "regex":
-            operation["pattern"] = resolve_cli_value(args, "pattern", True, stdin_taken=stdin_taken)
-            operation["replacement"] = resolve_cli_value(args, "replacement", True, stdin_taken=stdin_taken)
+            operation["pattern"] = resolve_cli_value(args, "pattern", True, stdin_taken=stdin_taken, warnings=warnings)
+            operation["replacement"] = resolve_cli_value(args, "replacement", True, stdin_taken=stdin_taken, warnings=warnings)
             operation["flags"] = args.flags
             if args.count and args.first:
                 fail("--count and --first are mutually exclusive")
@@ -2256,7 +2346,7 @@ def command_to_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]
                     fail("missing --line")
             if args.command == "insert":
                 operation["line"] = args.line
-            operation["text"] = resolve_cli_value(args, "text", True, stdin_taken=stdin_taken)
+            operation["text"] = resolve_cli_value(args, "text", True, stdin_taken=stdin_taken, warnings=warnings)
         elif args.command == "delete":
             if args.line is None:
                 fail("missing --line")
@@ -2277,7 +2367,8 @@ def command_to_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]
                     fail("replace-lines requires --start and --end")
                 operation["start"] = args.start
                 operation["end"] = args.end
-            operation["text"] = resolve_cli_value(args, "text", True, stdin_taken=stdin_taken)
+            operation["text"] = resolve_cli_value(args, "text", True, stdin_taken=stdin_taken, warnings=warnings)
+            operation["preserve_indent"] = not getattr(args, 'no_preserve_indent', False)
         elif args.command == "delete-lines":
             if args.start is None and args.end is None:
                 # Check if anchor-based positioning is used
@@ -2425,6 +2516,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="offset from anchor for end line (e.g., +4, -1)")
     parser.add_argument("--anchor-occurrence", type=int,
                         help="which occurrence of anchor pattern to use (1-based)")
+    parser.add_argument("--no-preserve-indent", action="store_true",
+                        help="disable automatic indent preservation in replace-lines (default: preserve)")
 
     parser.add_argument("--ops")
     parser.add_argument("--ops-file")
@@ -2452,7 +2545,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         text = strict_decode(original, encoding)
         return stat_target(path, original, encoding, text)
 
-    operations, _base_dir = command_to_operations(args)
+    warnings: List[str] = []
+    operations, _base_dir = command_to_operations(args, warnings=warnings)
     if args.command == "convert" and (
         args.to_encoding == "preserve"
         and args.to_line_ending == "preserve"
@@ -2530,6 +2624,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "skipped": False,
             "wouldChangeBytes": output != original,
         }
+        if warnings:
+            summary["warnings"] = warnings
         if args.diff:
             summary["diff"] = diff_text
 
