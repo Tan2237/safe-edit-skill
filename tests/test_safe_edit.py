@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -4295,110 +4296,55 @@ class SafeEditTests(unittest.TestCase):
     def test_msys2_detection_with_git_prefix(self):
         """Test _detect_msys2_path_corruption detects Git prefix corruption."""
         m = self._import_safe_edit()
-        # Save and restore env
-        old_msystem = os.environ.get("MSYSTEM")
-        old_mingw = os.environ.get("MINGW_PREFIX")
-        old_platform = sys.platform
-        try:
-            os.environ["MSYSTEM"] = "MINGW64"
-            os.environ["MINGW_PREFIX"] = "C:/Program Files/Git"
-            # Simulate what MSYS2 does: /foo → C:/Program Files/Git/foo
+        with patch.object(m.sys, "platform", "win32"), \
+             patch.dict(os.environ, {
+                 "MSYSTEM": "MINGW64",
+                 "MINGW_PREFIX": "C:/Program Files/Git",
+             }, clear=False):
+            os.environ.pop("MSYS2_ARG_CONV_EXCL", None)
             result = m._detect_msys2_path_corruption(
                 "C:/Program Files/Git/if (iScale > 30)", "old"
             )
             self.assertIsNotNone(result)
             self.assertIn("MSYS2_ARG_CONV_EXCL", result)
-        finally:
-            if old_msystem is not None:
-                os.environ["MSYSTEM"] = old_msystem
-            else:
-                os.environ.pop("MSYSTEM", None)
-            if old_mingw is not None:
-                os.environ["MINGW_PREFIX"] = old_mingw
-            else:
-                os.environ.pop("MINGW_PREFIX", None)
 
     def test_msys2_detection_single_slash(self):
         """Test _detect_msys2_path_corruption warns on / prefix under MSYS2."""
         m = self._import_safe_edit()
-        old_msystem = os.environ.get("MSYSTEM")
-        old_conv = os.environ.get("MSYS2_ARG_CONV_EXCL")
-        try:
-            os.environ["MSYSTEM"] = "MINGW64"
+        with patch.object(m.sys, "platform", "win32"), \
+             patch.dict(os.environ, {"MSYSTEM": "MINGW64"}, clear=False):
             os.environ.pop("MSYS2_ARG_CONV_EXCL", None)
-            # /foo could be the result of //foo → /foo conversion
             result = m._detect_msys2_path_corruption("/if (x > 0)", "old")
             self.assertIsNotNone(result)
             self.assertIn("MSYS2_ARG_CONV_EXCL", result)
-        finally:
-            if old_msystem is not None:
-                os.environ["MSYSTEM"] = old_msystem
-            else:
-                os.environ.pop("MSYSTEM", None)
-            if old_conv is not None:
-                os.environ["MSYS2_ARG_CONV_EXCL"] = old_conv
-            else:
-                os.environ.pop("MSYS2_ARG_CONV_EXCL", None)
 
     def test_msys2_detection_no_env(self):
         """Test _detect_msys2_path_corruption returns None without MSYS2 env."""
         m = self._import_safe_edit()
-        old_msystem = os.environ.get("MSYSTEM")
-        old_mingw = os.environ.get("MINGW_PREFIX")
-        try:
-            os.environ.pop("MSYSTEM", None)
-            os.environ.pop("MINGW_PREFIX", None)
+        with patch.object(m.sys, "platform", "win32"), \
+             patch.dict(os.environ, {}, clear=True):
             result = m._detect_msys2_path_corruption("/if (x > 0)", "old")
             self.assertIsNone(result)
-        finally:
-            if old_msystem is not None:
-                os.environ["MSYSTEM"] = old_msystem
-            else:
-                os.environ.pop("MSYSTEM", None)
-            if old_mingw is not None:
-                os.environ["MINGW_PREFIX"] = old_mingw
-            else:
-                os.environ.pop("MINGW_PREFIX", None)
 
     def test_msys2_detection_with_conv_excl_set(self):
         """Test _detect_msys2_path_corruption returns None when MSYS2_ARG_CONV_EXCL is set."""
         m = self._import_safe_edit()
-        old_msystem = os.environ.get("MSYSTEM")
-        old_conv = os.environ.get("MSYS2_ARG_CONV_EXCL")
-        try:
-            os.environ["MSYSTEM"] = "MINGW64"
-            os.environ["MSYS2_ARG_CONV_EXCL"] = "*"
+        with patch.object(m.sys, "platform", "win32"), \
+             patch.dict(os.environ, {
+                 "MSYSTEM": "MINGW64",
+                 "MSYS2_ARG_CONV_EXCL": "*",
+             }, clear=False):
             result = m._detect_msys2_path_corruption("/if (x > 0)", "old")
             self.assertIsNone(result)
-        finally:
-            if old_msystem is not None:
-                os.environ["MSYSTEM"] = old_msystem
-            else:
-                os.environ.pop("MSYSTEM", None)
-            if old_conv is not None:
-                os.environ["MSYS2_ARG_CONV_EXCL"] = old_conv
-            else:
-                os.environ.pop("MSYS2_ARG_CONV_EXCL", None)
 
     def test_msys2_detection_normal_text(self):
         """Test _detect_msys2_path_corruption returns None for normal text."""
         m = self._import_safe_edit()
-        old_msystem = os.environ.get("MSYSTEM")
-        old_conv = os.environ.get("MSYS2_ARG_CONV_EXCL")
-        try:
-            os.environ["MSYSTEM"] = "MINGW64"
+        with patch.object(m.sys, "platform", "win32"), \
+             patch.dict(os.environ, {"MSYSTEM": "MINGW64"}, clear=False):
             os.environ.pop("MSYS2_ARG_CONV_EXCL", None)
             result = m._detect_msys2_path_corruption("if (x > 0)", "old")
             self.assertIsNone(result)
-        finally:
-            if old_msystem is not None:
-                os.environ["MSYSTEM"] = old_msystem
-            else:
-                os.environ.pop("MSYSTEM", None)
-            if old_conv is not None:
-                os.environ["MSYS2_ARG_CONV_EXCL"] = old_conv
-            else:
-                os.environ.pop("MSYS2_ARG_CONV_EXCL", None)
 
 
 if __name__ == "__main__":
