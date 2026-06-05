@@ -111,6 +111,7 @@ Need modification?
 │   │
 │   └─ Normal text location?
 │          → insert --line N --text T
+│          (inserts BEFORE line N; new content becomes new line N)
 │
 ├─ Add at file boundaries?
 │      → prepend --text T  (at beginning)
@@ -193,7 +194,7 @@ safe-edit emits a `"warnings"` field in JSON output when MSYS2 path corruption i
 
 ### Critical Rules
 
-1. **Avoid `insert` near closing braces** — `insert --line N` goes AFTER line N. For `}` boundaries, use `replace-lines --start N --end N --text "}\nnew_content"` to preserve structure.
+1. **Avoid `insert` near closing braces** — `insert --line N` inserts BEFORE line N (new content becomes the new line N). For `}` boundaries, use `replace-lines --start N --end N --text "}\nnew_content"` to preserve structure.
 
 2. **Verify anchor uniqueness** — Search for the pattern first. If it appears multiple times (definition + calls), use more specific pattern like `"void FuncName("` or use `--start`/`--end` instead.
 
