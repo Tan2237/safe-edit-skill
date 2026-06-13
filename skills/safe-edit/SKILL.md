@@ -1,60 +1,85 @@
 ---
 name: safe-edit
 description: |
-  Before the first edit of a file:
+  MANDATORY: File editing MUST follow this protocol. No exceptions.
 
-    python safe_edit.py stat --file FILE --json
+  The ONLY allowed edit mechanisms:
+  - safe_edit.py (when editStrategy="safe-edit")
+  - built-in Edit tool (when editStrategy="edit-tool")
 
-  Use the returned editStrategy.
+  Any other editing mechanism is forbidden.
 
-  Cache the result per file.
+  Before the first edit of each file:
+    1. Run: python safe_edit.py stat --file FILE --json
+    2. Cache editStrategy for that file.
+    3. Follow the returned strategy for ALL edits on that file.
 
-  Re-run stat only after:
-    - file recreation
-    - edit failure
+  Re-run stat only after: file recreation, edit failure.
 ---
 
-# safe-edit — Agent Edit Protocol
+# safe-edit — Hard Protocol
 
-Use `safe_edit.py` as the single entry point. Pure Python standard library, portable across Windows/Linux/macOS.
-
-## Required Workflow (run once per file before first edit)
+## Priority Order
 
 ```
-Need to edit a file?
-│
-├─ Step 1: Check file
-│   python safe_edit.py stat --file F --json
-│   │
-│   ├─ editStrategy = "safe-edit"
-│   │      → Use safe-edit for ALL edits on this file
-│   │      → Do not switch back to built-in Edit
-│   │
-│   └─ editStrategy = "edit-tool"
-│   │      → Use built-in Edit tool
-│   │
-│   Cache stat result per file. Re-run stat only after:
-│     - file recreation
-│     - edit failure
-│
-│   Example:
-│     foo.cpp → stat → editStrategy=safe-edit
-│     Subsequent edits → reuse cached result
-│
-├─ Step 2: Edit
-│   Use editStrategy.
-│   For safe-edit usage details, see Core Rules below.
-│
-└─ Step 3: Edit failed?
-    → Read JSON error output
-    → Follow recommendedAction
+1. Follow this editing protocol.
+2. Use the lowest-risk allowed command.
+3. Preserve file integrity.
+4. Complete the requested change.
 ```
 
-## Quick Reference
+Never violate a higher priority to satisfy a lower priority.
+
+## Forbidden
+
+- Do NOT construct custom Python code to edit files.
+- Do NOT create temporary scripts or helper programs to modify files (Python, Bash, PowerShell, Perl, Node.js, or any other language).
+- Do NOT invoke `safe_edit.py` indirectly through another program or script.
+- Do NOT replace `safe_edit.py` with inline Python, regex scripts, or ad-hoc file writes.
+- Do NOT write files using shell redirection (`>`, `>>`, `cat <<EOF`, `echo > file`).
+- Do NOT invent alternative edit workflows.
+- Do NOT infer, generate, or invent `safe_edit.py` commands not listed in Allowed Commands.
+
+## Failure Policy
+
+If the required modification cannot be completed using the allowed commands:
+
+**STOP. Report the limitation.**
+
+Do NOT:
+- write a custom script
+- use shell redirection
+- create temporary patch tools
+- modify files through any mechanism outside this protocol
+
+Completing the task is lower priority than following this protocol.
+
+## Required Workflow
+
+Before the first edit of each file:
 
 ```bash
-# First step before editing
-python safe_edit.py stat --file path/to/file --json
+python safe_edit.py stat --file F --json
+```
+
+The stat result is authoritative for the lifetime of the file. Do not re-run stat unless the file is recreated or an edit fails.
+
+The selected editStrategy is locked for the lifetime of the file. Do NOT switch to another edit mechanism after a command failure. Continue using the cached editStrategy.
+
+- `editStrategy: "safe-edit"` → ALL edits on this file MUST use `safe_edit.py`. Do not switch back to built-in Edit.
+- `editStrategy: "edit-tool"` → Use built-in Edit tool for this file.
+
+On Windows, `py -3` works when `python` is not on PATH.
+
+---
+
+## Allowed Commands
+
+These are the ONLY permitted invocations. Any command not listed here is prohibited.
+
+```bash
+# Before editing any file (mandatory first step)
+python safe_edit.py stat --file F --json
 
 # Replace text
 python safe_edit.py edit --file F --old "old" --new "new" --expected-count 1
@@ -64,23 +89,37 @@ python safe_edit.py edit --file F --old "old" --new "new" --auto-match --expecte
 
 # Preview before applying
 python safe_edit.py edit --file F --old "old" --new "new" --dry-run --diff
+
+# Replace function/class body (anchor)
+python safe_edit.py replace-lines --file F --anchor-pattern "sig" --text T
+
+# Replace by line range
+python safe_edit.py replace-lines --file F --start N --end M --text T
+
+# Insert before line N
+python safe_edit.py insert --file F --line N --text T
+
+# Add at file boundaries
+python safe_edit.py prepend --file F --text T
+python safe_edit.py append --file F --text T
+
+# Delete lines
+python safe_edit.py delete --file F --line N
+python safe_edit.py delete-lines --file F --start N --end M
+
+# Fuzzy matching (for approximate text)
+python safe_edit.py edit --file F --old "old" --new "new" --fuzzy --expected-count 1
+
+# Diagnose match failure
+python safe_edit.py edit --file F --old "old" --new "new" --explain-match-failure
+
+# Large content — use file variants
+python safe_edit.py edit --file F --old-file old.txt --new-file new.txt
+python safe_edit.py replace-lines --file F --anchor-pattern "X" --text-file body.txt
+
+# Multi-block edits (2+ edits in one file)
+python safe_edit.py edit --file F --diff-input-file diff.txt
 ```
-
-On Windows, `py -3` works when `python` is not on PATH.
-
----
-
-## Core Rules
-
-1. **Always add `--expected-count 1`** — prevents wrong matches from silently succeeding. Use this unless the edit is intentionally targeting multiple matches.
-
-2. **Prefer `--old-file` when** — multiline, >100 chars, or contains shell-sensitive chars (`$`, `%`, `\`, `` ` ``, `'`, `"`). Prevents shell escaping disasters.
-
-3. **Use `--auto-match` for multiline edits** — automatically tries exact → ignore-eol → ignore-indent → normalize-whitespace.
-
-4. **Prefer `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
-
-5. **Re-read before structural edits** — Do not rely on stale context after file modifications. Function position, content, and bracket locations may have changed.
 
 ---
 
@@ -122,9 +161,7 @@ Need modification?
        → delete-lines --start N --end M
 ```
 
-**Risk hierarchy (prefer lower risk):**
-
-Always choose the lowest-risk command that can complete the edit.
+**Risk hierarchy (always choose lowest-risk command):**
 
 ```
 edit                        ← SAFEST
@@ -136,7 +173,21 @@ regex                       ← HIGHEST RISK
 
 ---
 
-## Match Failure Escalation Path
+## Core Rules
+
+1. **Always add `--expected-count 1` for normal text replacement** — prevents wrong matches from silently succeeding. Do not omit it unless intentionally targeting multiple matches, performing diagnosis, or using commands with their own matching semantics.
+
+2. **Use `--old-file` for complex content** — multiline, >100 chars, or contains shell-sensitive chars (`$`, `%`, `\`, `` ` ``, `'`, `"`).
+
+3. **Use `--auto-match` for multiline edits** — auto-tries: exact → ignore-eol → ignore-indent → normalize-whitespace.
+
+4. **Use `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
+
+5. **Re-read before structural edits** — line positions and content may have shifted after prior edits.
+
+---
+
+## Match Failure Escalation
 
 ```
 edit --old X --new Y --expected-count 1
@@ -148,7 +199,7 @@ edit --old X --new Y --expected-count 1
     ├─ "old text was not found"
     │   ├─ No --auto-match? → add it
     │   ├─ Has --auto-match? → add --fuzzy
-    │   ├─ Still failed? → --explain-match-failure (diagnose)
+    │   ├─ Still failed? → --explain-match-failure
     │   └─ Wrong old text? → fix old text, don't just switch to anchor
     │
     ├─ "text appears multiple times"
@@ -158,51 +209,7 @@ edit --old X --new Y --expected-count 1
         └─ Adjust --expected-count or use --first
 ```
 
-**Key insight:** Most failures are whitespace differences. `--auto-match` handles this. Use `--explain-match-failure` before abandoning text matching.
-
----
-
-## Windows (Git Bash / MSYS2)
-
-MSYS2 automatically converts POSIX-style paths in CLI arguments:
-
-| User types | MSYS2 converts to | Effect |
-|------------|-------------------|--------|
-| `--old "//if"` | `--old "/if"` | Double slash collapsed |
-| `--old "/foo"` | `--old "C:/Program Files/Git/foo"` | Single slash expanded |
-
-This silently corrupts `--old`/`--new`/`--pattern`/`--text` values starting with `/` or `//`.
-
-**Fix**: Set environment variable before calling safe_edit.py:
-
-```bash
-export MSYS2_ARG_CONV_EXCL="*"
-python safe_edit.py edit --file F --old "//if (x > 0)" --new "if (x > 0)" --expected-count 1
-```
-
-Or use file variants to bypass shell entirely:
-
-```bash
-python safe_edit.py edit --file F --old-file old.txt --new-file new.txt
-```
-
-safe-edit emits a `"warnings"` field in JSON output when MSYS2 path corruption is detected.
-
----
-
-## Structural Editing Rules
-
-### Critical Rules
-
-1. **Avoid `insert` near closing braces** — `insert --line N` inserts BEFORE line N (new content becomes the new line N). For `}` boundaries, use `replace-lines --start N --end N --text "}\nnew_content"` to preserve structure.
-
-2. **Verify anchor uniqueness** — Search for the pattern first. If it appears multiple times (definition + calls), use more specific pattern like `"void FuncName("` or use `--start`/`--end` instead.
-
-3. **Line numbers invalidate after edits** — After any operation that changes line count, re-query locations before next line-based operation.
-
-4. **Bracket safety** — When replacing code blocks, verify the range includes/excludes braces as intended.
-
-5. **Validate after structural edits** — Check bracket matching or compile immediately.
+Most failures are whitespace differences. Use `--explain-match-failure` before abandoning text matching.
 
 ---
 
@@ -215,26 +222,11 @@ safe-edit emits a `"warnings"` field in JSON output when MSYS2 path corruption i
 | `--normalize-whitespace` | Collapse whitespace | **JSON/YAML/Markdown** |
 | `--context-before/after` | Disambiguate matches | Multiple occurrences |
 
-**Content type → Default strategy:**
-
 | Content | Default flags |
 |---------|---------------|
 | Single line | (none) |
 | Multiline code | `--auto-match` |
 | JSON/YAML/Markdown | `--auto-match --normalize-whitespace` |
-
----
-
-## Large Content
-
-Use file variants for anything complex:
-
-```bash
-python safe_edit.py edit --file F --old-file old.txt --new-file new.txt
-python safe_edit.py replace-lines --file F --anchor-pattern "X" --text-file body.txt
-```
-
-Available: `--old-file`, `--new-file`, `--text-file`, `--diff-input-file`.
 
 ---
 
@@ -258,6 +250,46 @@ another new
 ```bash
 python safe_edit.py edit --file F --diff-input-file diff.txt
 ```
+
+---
+
+## Windows (Git Bash / MSYS2)
+
+MSYS2 automatically converts POSIX-style paths in CLI arguments:
+
+| User types | MSYS2 converts to | Effect |
+|------------|-------------------|--------|
+| `--old "//if"` | `--old "/if"` | Double slash collapsed |
+| `--old "/foo"` | `--old "C:/Program Files/Git/foo"` | Single slash expanded |
+
+**Fix**: Set environment variable before calling safe_edit.py:
+
+```bash
+export MSYS2_ARG_CONV_EXCL="*"
+python safe_edit.py edit --file F --old "//if (x > 0)" --new "if (x > 0)" --expected-count 1
+```
+
+Or use file variants to bypass shell entirely:
+
+```bash
+python safe_edit.py edit --file F --old-file old.txt --new-file new.txt
+```
+
+safe-edit emits a `"warnings"` field in JSON output when MSYS2 path corruption is detected.
+
+---
+
+## Structural Editing Rules
+
+1. **Avoid `insert` near closing braces** — `insert --line N` inserts BEFORE line N. For `}` boundaries, use `replace-lines --start N --end N --text "}\nnew_content"`.
+
+2. **Verify anchor uniqueness** — Search for the pattern first. If it appears multiple times, use a more specific pattern or `--start`/`--end`.
+
+3. **Line numbers invalidate after edits** — Re-query locations after any operation that changes line count.
+
+4. **Bracket safety** — Verify the range includes/excludes braces as intended.
+
+5. **Validate after structural edits** — Check bracket matching or compile immediately.
 
 ---
 
