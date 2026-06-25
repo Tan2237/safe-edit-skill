@@ -58,6 +58,10 @@ def _get_lock_path(target_file):
 class SafeEditTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = Path(tempfile.mkdtemp(prefix="safe-edit-test-"))
+        lock_dir = _get_lock_dir()
+        if lock_dir.exists():
+            for f in lock_dir.glob("*.lock"):
+                f.unlink(missing_ok=True)
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir)
@@ -4441,11 +4445,16 @@ class SafeEditTests(unittest.TestCase):
         m = self._import_safe_edit()
         path = self.tmpdir / "cap_sandbox.txt"
         path.write_bytes(b"test\n")
-        # Mock target dir as not writable
-        with patch("os.open", side_effect=[OSError("read-only"), *([None] * 10)]):
-            # This will fail the directory probe but succeed on tmp
+
+        original_open = os.open
+        def mock_open_for_probe(*args, **kwargs):
+            probe_path = args[0] if args else ""
+            if ".safe-edit-probe" in probe_path:
+                raise OSError("read-only")
+            return original_open(*args, **kwargs)
+
+        with patch("os.open", side_effect=mock_open_for_probe):
             result = m.check_fs_capability(str(path))
-            # If tmp works, should be sandbox-safe or no-lock-mode
             if result["canWriteTmp"]:
                 self.assertIn(result["executionMode"], ("sandbox-safe", "no-lock-mode"))
 
