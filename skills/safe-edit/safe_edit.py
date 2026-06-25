@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -747,6 +748,118 @@ def encode_text(text: str, info: EncodingInfo) -> bytes:
         return info.bom + text.encode(info.codec, errors="strict")
     except UnicodeEncodeError as exc:
         fail(f"failed to encode as {info.name}: {exc}")
+
+
+def _get_tmp_dir() -> str:
+    """Get the best available temporary directory for sandbox environments.
+
+    Returns /tmp if available, otherwise falls back to system temp.
+    """
+    # Try /tmp first (Unix sandbox environments)
+    if os.name != "nt":
+        try:
+            test_path = "/tmp/.safe-edit-probe"
+            fd = os.open(test_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            os.unlink(test_path)
+            return "/tmp"
+        except OSError:
+            pass
+    # Fallback to system temp
+    return tempfile.gettempdir()
+
+
+def _get_lock_dir() -> Path:
+    """Get or create the lock directory under tmp.
+
+    Returns /tmp/safe-edit/locks/ (or system temp equivalent).
+    """
+    lock_dir = Path(_get_tmp_dir()) / "safe-edit" / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    return lock_dir
+
+
+def _get_lock_key(file_path: str) -> str:
+    """Generate a unique lock key based on file identity (device + inode).
+
+    This ensures:
+    - Same file via different paths (symlinks, junctions) → same lock
+    - Same path after rename → same lock (inode unchanged)
+    - Different files at same path → different lock
+
+    Uses st_dev:st_ino on all platforms:
+    - Unix: true device + inode numbers
+    - Windows: volume serial number + file index (via GetFileInformationByHandle)
+
+    Falls back to resolved path hash only when stat() fails (file not yet created).
+    """
+    p = Path(file_path).resolve()
+    try:
+        stat_info = p.stat()
+        # st_dev:st_ino works on both Unix and Windows for file identity
+        # Windows: st_dev = volume serial number, st_ino = file index
+        identity = f"{stat_info.st_dev}:{stat_info.st_ino}"
+    except OSError:
+        # File may not exist yet, use resolved path as fallback
+        identity = str(p)
+    return hashlib.sha256(identity.encode()).hexdigest()[:32]
+
+
+def check_fs_capability(target_file: str) -> Dict[str, Any]:
+    """Detect filesystem capability WITHOUT writing into target directory.
+
+    Designed for sandbox environments where target dir is write-protected.
+    Tests /tmp (or system temp) for write capability instead of target dir.
+    """
+    result: Dict[str, Any] = {
+        "directoryWritable": False,
+        "canWriteTmp": False,
+        "canCreateLock": False,
+        "executionMode": "unknown",
+        "suggestions": [],
+    }
+
+    tmp_dir = _get_tmp_dir()
+
+    # 1. Check target directory writability (best-effort, non-destructive probe)
+    target_dir = str(Path(target_file).resolve().parent)
+    try:
+        probe = os.path.join(target_dir, ".safe-edit-probe")
+        fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+        os.unlink(probe)
+        result["directoryWritable"] = True
+    except OSError:
+        result["suggestions"].append(f"Target directory not writable: {target_dir}")
+
+    # 2. Check tmp write
+    try:
+        fd, tmp = tempfile.mkstemp(dir=tmp_dir)
+        os.close(fd)
+        os.remove(tmp)
+        result["canWriteTmp"] = True
+    except Exception:
+        result["suggestions"].append(f"Cannot write to {tmp_dir}")
+
+    # 3. Lock test in tmp (NOT target dir)
+    try:
+        fd, lock = tempfile.mkstemp(prefix="safe_edit_lock_", dir=tmp_dir)
+        os.close(fd)
+        os.remove(lock)
+        result["canCreateLock"] = True
+    except Exception:
+        result["suggestions"].append(f"Cannot create lock in {tmp_dir}")
+
+    # 4. Derive mode
+    if result["canWriteTmp"] and result["canCreateLock"]:
+        result["executionMode"] = "sandbox-safe" if not result["directoryWritable"] else "full"
+    elif result["canWriteTmp"]:
+        result["executionMode"] = "no-lock-mode"
+    else:
+        result["executionMode"] = "readonly-fallback"
+        result["suggestions"].append("Filesystem is effectively read-only")
+
+    return result
 
 
 def looks_like_utf16_without_bom(data: bytes) -> Optional[EncodingInfo]:
@@ -1944,17 +2057,21 @@ def generate_diff(path: Path, before: str, after: str, context: int) -> str:
 
 class FileLock:
     def __init__(self, path: Path, timeout: float, stale_seconds: float) -> None:
-        self.path = path.with_name(f".{path.name}.safe-edit.lock")
+        self.file_path = path
         self.timeout = timeout
         self.stale_seconds = stale_seconds
         self.acquired = False
+        # Use /tmp/safe-edit/locks/ (or system temp equivalent) — sandbox-safe
+        # Key is based on file identity (inode on Unix, path on Windows)
+        lock_key = _get_lock_key(str(path))
+        self.lock_path = _get_lock_dir() / f"{lock_key}.lock"
 
     def __enter__(self) -> "FileLock":
         deadline = time.monotonic() + max(0.0, self.timeout)
-        payload = f"pid={os.getpid()} time={time.time()} file={self.path.name}\n".encode("utf-8")
+        payload = f"pid={os.getpid()} time={time.time()} file={self.file_path.resolve()}\n".encode("utf-8")
         while True:
             try:
-                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                fd = os.open(str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 try:
                     os.write(fd, payload)
                 finally:
@@ -1964,15 +2081,15 @@ class FileLock:
             except FileExistsError:
                 self.remove_stale_lock()
                 if time.monotonic() >= deadline:
-                    fail(f"lock already exists: {self.path}")
+                    fail(f"lock already exists: {self.lock_path}")
                 time.sleep(0.05)
 
     def remove_stale_lock(self) -> None:
         # Path 1: PID check — if lock owner is dead, remove immediately
-        pid = _read_lock_pid(self.path)
+        pid = _read_lock_pid(self.lock_path)
         if pid is not None and not _is_process_alive(pid):
             try:
-                self.path.unlink()
+                self.lock_path.unlink()
             except FileNotFoundError:
                 pass
             return
@@ -1981,22 +2098,22 @@ class FileLock:
         if self.stale_seconds <= 0:
             return
         try:
-            age = time.time() - self.path.stat().st_mtime
+            age = time.time() - self.lock_path.stat().st_mtime
         except FileNotFoundError:
             return
         if age <= self.stale_seconds:
             return
         try:
-            self.path.unlink()
+            self.lock_path.unlink()
         except FileNotFoundError:
             return
         except OSError as exc:
-            fail(f"failed to remove stale lock {self.path}: {exc}")
+            fail(f"failed to remove stale lock {self.lock_path}: {exc}")
 
     def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
         if self.acquired:
             try:
-                self.path.unlink()
+                self.lock_path.unlink()
             except FileNotFoundError:
                 pass
 
@@ -2168,6 +2285,7 @@ def stat_target(path: Path, original: bytes, encoding: EncodingInfo, text: str) 
                                    newline_style=newline_style,
                                    mixed=_mixed_line_endings,
                                    line_count=len(records))
+    cap = check_fs_capability(str(path))
     return {
         "ok": True,
         "file": str(path),
@@ -2181,6 +2299,11 @@ def stat_target(path: Path, original: bytes, encoding: EncodingInfo, text: str) 
         "editMode": edit_plan["editMode"],
         "editStrategy": edit_plan["editStrategy"],
         "why": edit_plan["why"],
+        "directoryWritable": cap["directoryWritable"],
+        "canCreateTemp": cap["canWriteTmp"],
+        "canCreateLock": cap["canCreateLock"],
+        "executionMode": cap["executionMode"],
+        "suggestions": cap["suggestions"],
         "dryRun": True,
         "changed": 0,
         "operations": [],
@@ -2209,12 +2332,14 @@ def atomic_replace(
     backup_suffix: str,
 ) -> Optional[str]:
     directory = path.parent
+    # Use /tmp (or system temp) for staging — sandbox-safe
+    tmp_dir = _get_tmp_dir()
     prefix = f".{path.name}.safe-edit."
     fd = -1
     tmp_name = ""
     backup_name = None
     try:
-        fd, tmp_name = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=str(directory))
+        fd, tmp_name = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=tmp_dir)
         with os.fdopen(fd, "wb") as handle:
             fd = -1
             handle.write(data)
@@ -2545,6 +2670,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         text = strict_decode(original, encoding)
         return stat_target(path, original, encoding, text)
 
+    # Sandbox capability detection
+    cap = check_fs_capability(str(path))
+    if cap["executionMode"] == "readonly-fallback":
+        fail(
+            "Sandbox does not allow file writes or temp file creation.\n"
+            "Suggested actions:\n"
+            "1. Use /tmp workspace\n"
+            "2. Enable external workspace mount\n"
+            "3. Use patch/diff output mode instead of in-place edit"
+        )
+    # Auto-disable locking in no-lock-mode
+    disable_locking = cap["executionMode"] == "no-lock-mode"
+
     warnings: List[str] = []
     operations, _base_dir = command_to_operations(args, warnings=warnings)
     if args.command == "convert" and (
@@ -2554,7 +2692,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         and not args.trim_trailing_whitespace
     ):
         fail("convert requires --to-encoding, --to-line-ending, --final-newline, or --trim-trailing-whitespace")
-    lock_context = NullLock() if args.no_lock or args.dry_run else FileLock(path, args.lock_timeout, args.lock_stale_seconds)
+    lock_context = NullLock() if args.no_lock or args.dry_run or disable_locking else FileLock(path, args.lock_timeout, args.lock_stale_seconds)
 
     with lock_context:
         original = read_target(path, args.max_bytes)
@@ -2749,7 +2887,9 @@ def main(argv: List[str]) -> int:
                 # Try to read lock file for structured recovery info
                 try:
                     target_name = Path(file_path).name if file_path else ""
-                    lock_path = resolve_target_path(file_path, getattr(args, 'follow_symlink', False)).with_name(f".{target_name}.safe-edit.lock")
+                    # Lock file is now in /tmp/safe-edit/locks/ (or system temp equivalent)
+                    lock_key = _get_lock_key(file_path)
+                    lock_path = _get_lock_dir() / f"{lock_key}.lock"
                     content = lock_path.read_text("utf-8")
                     pid = _read_lock_pid(lock_path)
                     lock_time = None

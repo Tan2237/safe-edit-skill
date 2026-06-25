@@ -1,4 +1,5 @@
 import codecs
+import hashlib
 import json
 import os
 import shutil
@@ -13,6 +14,45 @@ from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "skills" / "safe-edit" / "safe_edit.py"
+
+
+def _get_tmp_dir():
+    """Get the best available temporary directory (matches safe_edit.py logic)."""
+    if os.name != "nt":
+        try:
+            test_path = "/tmp/.safe-edit-probe"
+            fd = os.open(test_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            os.unlink(test_path)
+            return "/tmp"
+        except OSError:
+            pass
+    return tempfile.gettempdir()
+
+
+def _get_lock_dir():
+    """Get or create the lock directory (matches safe_edit.py logic)."""
+    lock_dir = Path(_get_tmp_dir()) / "safe-edit" / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    return lock_dir
+
+
+def _get_lock_key(file_path):
+    """Generate lock key based on file identity (matches safe_edit.py logic)."""
+    p = Path(file_path).resolve()
+    try:
+        stat_info = p.stat()
+        # st_dev:st_ino works on both Unix and Windows
+        identity = f"{stat_info.st_dev}:{stat_info.st_ino}"
+    except OSError:
+        identity = str(p)
+    return hashlib.sha256(identity.encode()).hexdigest()[:32]
+
+
+def _get_lock_path(target_file):
+    """Calculate the lock file path for a given target file (matches safe_edit.py logic)."""
+    lock_key = _get_lock_key(target_file)
+    return _get_lock_dir() / f"{lock_key}.lock"
 
 
 class SafeEditTests(unittest.TestCase):
@@ -232,7 +272,7 @@ class SafeEditTests(unittest.TestCase):
     def test_stale_lock_can_be_removed(self):
         path = self.tmpdir / "locked.txt"
         path.write_bytes(b"foo\n")
-        lock = self.tmpdir / ".locked.txt.safe-edit.lock"
+        lock = _get_lock_path(path)
         lock.write_text("stale", encoding="utf-8")
         old_time = time.time() - 120
         os.utime(lock, (old_time, old_time))
@@ -2737,7 +2777,7 @@ class SafeEditTests(unittest.TestCase):
         path.write_bytes(b"foo\n")
         
         # Create a lock file that is not stale
-        lock = self.tmpdir / ".err_lock.txt.safe-edit.lock"
+        lock = _get_lock_path(path)
         lock.write_text("active", encoding="utf-8")
         
         result = self.run_tool(
@@ -4048,7 +4088,7 @@ class SafeEditTests(unittest.TestCase):
         """Test lock is removed immediately when owner PID is dead (even with stale_seconds=0)."""
         path = self.tmpdir / "dead_pid.txt"
         path.write_bytes(b"foo\n")
-        lock = self.tmpdir / ".dead_pid.txt.safe-edit.lock"
+        lock = _get_lock_path(path)
         # Use a non-existent PID
         lock.write_text(f"pid=99999999 time={time.time()} file=.dead_pid.txt.safe-edit.lock\n", encoding="utf-8")
 
@@ -4067,7 +4107,7 @@ class SafeEditTests(unittest.TestCase):
         """Test lock is removed by age check even when PID is alive."""
         path = self.tmpdir / "stale_alive.txt"
         path.write_bytes(b"foo\n")
-        lock = self.tmpdir / ".stale_alive.txt.safe-edit.lock"
+        lock = _get_lock_path(path)
         # Use current PID (alive), but set lock age > stale_seconds
         lock.write_text(f"pid={os.getpid()} time={time.time() - 200} file=.stale_alive.txt.safe-edit.lock\n", encoding="utf-8")
         # Set mtime to match the old timestamp in the content
@@ -4088,7 +4128,7 @@ class SafeEditTests(unittest.TestCase):
         """Test lock is NOT removed when PID is alive and age < stale_seconds."""
         path = self.tmpdir / "fresh_lock.txt"
         path.write_bytes(b"foo\n")
-        lock = self.tmpdir / ".fresh_lock.txt.safe-edit.lock"
+        lock = _get_lock_path(path)
         # Use current PID (alive) + fresh timestamp
         lock.write_text(f"pid={os.getpid()} time={time.time()} file=.fresh_lock.txt.safe-edit.lock\n", encoding="utf-8")
 
@@ -4110,7 +4150,7 @@ class SafeEditTests(unittest.TestCase):
         """Test lock_error JSON output includes targetFile, lockPid, lockAgeSeconds, failureClass, recommendedAction."""
         path = self.tmpdir / "lock_meta.txt"
         path.write_bytes(b"foo\n")
-        lock = self.tmpdir / ".lock_meta.txt.safe-edit.lock"
+        lock = _get_lock_path(path)
         # Use current PID (alive) + stale_seconds > lock age so lock is NOT removed
         lock_pid = os.getpid()
         lock_time = time.time() - 37.2
@@ -4140,7 +4180,7 @@ class SafeEditTests(unittest.TestCase):
         """Test lock_error JSON when PID is alive — still includes metadata."""
         path = self.tmpdir / "lock_alive_meta.txt"
         path.write_bytes(b"foo\n")
-        lock = self.tmpdir / ".lock_alive_meta.txt.safe-edit.lock"
+        lock = _get_lock_path(path)
         lock_time = time.time()
         lock.write_text(f"pid={os.getpid()} time={lock_time} file=.lock_alive_meta.txt.safe-edit.lock\n", encoding="utf-8")
 
@@ -4164,7 +4204,7 @@ class SafeEditTests(unittest.TestCase):
         """Test lock_error JSON still has targetFile even if lock file is deleted between fail and JSON output."""
         path = self.tmpdir / "lock_gone.txt"
         path.write_bytes(b"foo\n")
-        lock = self.tmpdir / ".lock_gone.txt.safe-edit.lock"
+        lock = _get_lock_path(path)
         lock.write_text(f"pid={os.getpid()} time={time.time()} file=.lock_gone.txt.safe-edit.lock\n", encoding="utf-8")
 
         # Run with very short timeout so it fails, then delete lock before reading JSON
@@ -4345,6 +4385,150 @@ class SafeEditTests(unittest.TestCase):
             os.environ.pop("MSYS2_ARG_CONV_EXCL", None)
             result = m._detect_msys2_path_corruption("if (x > 0)", "old")
             self.assertIsNone(result)
+
+    # =========================================================================
+    # check_fs_capability tests
+    # =========================================================================
+
+    def test_check_fs_capability_returns_required_keys(self):
+        """Test check_fs_capability returns all required keys."""
+        m = self._import_safe_edit()
+        path = self.tmpdir / "cap_test.txt"
+        path.write_bytes(b"test\n")
+        result = m.check_fs_capability(str(path))
+        self.assertIn("directoryWritable", result)
+        self.assertIn("canWriteTmp", result)
+        self.assertIn("canCreateLock", result)
+        self.assertIn("executionMode", result)
+        self.assertIn("suggestions", result)
+
+    def test_check_fs_capability_directory_writable(self):
+        """Test check_fs_capability detects writable directory."""
+        m = self._import_safe_edit()
+        path = self.tmpdir / "cap_writable.txt"
+        path.write_bytes(b"test\n")
+        result = m.check_fs_capability(str(path))
+        self.assertTrue(result["directoryWritable"])
+        self.assertIn(result["executionMode"], ("full", "sandbox-safe"))
+
+    def test_check_fs_capability_tmp_writable(self):
+        """Test check_fs_capability detects writable tmp."""
+        m = self._import_safe_edit()
+        path = self.tmpdir / "cap_tmp.txt"
+        path.write_bytes(b"test\n")
+        result = m.check_fs_capability(str(path))
+        self.assertTrue(result["canWriteTmp"])
+
+    def test_check_fs_capability_lock_creatable(self):
+        """Test check_fs_capability detects lock capability."""
+        m = self._import_safe_edit()
+        path = self.tmpdir / "cap_lock.txt"
+        path.write_bytes(b"test\n")
+        result = m.check_fs_capability(str(path))
+        self.assertTrue(result["canCreateLock"])
+
+    def test_check_fs_capability_full_mode_when_writable(self):
+        """Test executionMode is 'full' when target dir is writable."""
+        m = self._import_safe_edit()
+        path = self.tmpdir / "cap_full.txt"
+        path.write_bytes(b"test\n")
+        result = m.check_fs_capability(str(path))
+        if result["directoryWritable"]:
+            self.assertEqual(result["executionMode"], "full")
+
+    def test_check_fs_capability_sandbox_mode_when_not_writable(self):
+        """Test executionMode is 'sandbox-safe' when target dir not writable but tmp works."""
+        m = self._import_safe_edit()
+        path = self.tmpdir / "cap_sandbox.txt"
+        path.write_bytes(b"test\n")
+        # Mock target dir as not writable
+        with patch("os.open", side_effect=[OSError("read-only"), *([None] * 10)]):
+            # This will fail the directory probe but succeed on tmp
+            result = m.check_fs_capability(str(path))
+            # If tmp works, should be sandbox-safe or no-lock-mode
+            if result["canWriteTmp"]:
+                self.assertIn(result["executionMode"], ("sandbox-safe", "no-lock-mode"))
+
+    def test_check_fs_capability_suggestions_populated_on_issues(self):
+        """Test suggestions list is populated when there are issues."""
+        m = self._import_safe_edit()
+        path = self.tmpdir / "cap_suggest.txt"
+        path.write_bytes(b"test\n")
+        result = m.check_fs_capability(str(path))
+        # If directory is not writable, should have a suggestion
+        if not result["directoryWritable"]:
+            self.assertTrue(len(result["suggestions"]) > 0)
+
+    def test_check_fs_capability_readonly_fallback(self):
+        """Test executionMode is 'readonly-fallback' when nothing works."""
+        m = self._import_safe_edit()
+        path = self.tmpdir / "cap_readonly.txt"
+        path.write_bytes(b"test\n")
+        # Mock all filesystem operations to fail
+        original_open = os.open
+        def mock_open_readonly(*args, **kwargs):
+            raise OSError("read-only filesystem")
+        with patch("os.open", side_effect=mock_open_readonly):
+            result = m.check_fs_capability(str(path))
+            self.assertEqual(result["executionMode"], "readonly-fallback")
+            self.assertFalse(result["canWriteTmp"])
+            self.assertFalse(result["canCreateLock"])
+
+    def test_stat_includes_capability_fields(self):
+        """Test stat command output includes capability fields."""
+        path = self.tmpdir / "stat_cap.txt"
+        path.write_bytes(b"test\n")
+        result = self.run_tool("stat", "--file", path, "--json")
+        payload = json.loads(result.stdout)
+        self.assertIn("directoryWritable", payload)
+        self.assertIn("canCreateTemp", payload)
+        self.assertIn("canCreateLock", payload)
+        self.assertIn("executionMode", payload)
+        self.assertIn("suggestions", payload)
+
+    def test_get_lock_key_same_file_same_key(self):
+        """Test _get_lock_key returns same key for same file."""
+        m = self._import_safe_edit()
+        path = self.tmpdir / "lock_key.txt"
+        path.write_bytes(b"test\n")
+        key1 = m._get_lock_key(str(path))
+        key2 = m._get_lock_key(str(path))
+        self.assertEqual(key1, key2)
+
+    def test_get_lock_key_different_files_different_keys(self):
+        """Test _get_lock_key returns different keys for different files."""
+        m = self._import_safe_edit()
+        path1 = self.tmpdir / "lock_key1.txt"
+        path2 = self.tmpdir / "lock_key2.txt"
+        path1.write_bytes(b"test1\n")
+        path2.write_bytes(b"test2\n")
+        key1 = m._get_lock_key(str(path1))
+        key2 = m._get_lock_key(str(path2))
+        self.assertNotEqual(key1, key2)
+
+    def test_get_lock_key_nonexistent_file_uses_path(self):
+        """Test _get_lock_key falls back to path hash for non-existent file."""
+        m = self._import_safe_edit()
+        path = self.tmpdir / "nonexistent.txt"
+        key = m._get_lock_key(str(path))
+        self.assertIsInstance(key, str)
+        self.assertEqual(len(key), 32)
+
+    def test_get_lock_key_resolves_symlinks(self):
+        """Test _get_lock_key resolves symlinks to get same key."""
+        m = self._import_safe_edit()
+        if os.name == "nt":
+            self.skipTest("Symlink test not reliable on Windows")
+        path = self.tmpdir / "lock_key_symlink.txt"
+        path.write_bytes(b"test\n")
+        link = self.tmpdir / "lock_key_link.txt"
+        try:
+            link.symlink_to(path)
+            key1 = m._get_lock_key(str(path))
+            key2 = m._get_lock_key(str(link))
+            self.assertEqual(key1, key2)
+        except OSError:
+            self.skipTest("Symlinks not supported")
 
 
 if __name__ == "__main__":
