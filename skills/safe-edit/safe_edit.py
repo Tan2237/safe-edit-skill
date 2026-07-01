@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import difflib
+import errno
 import hashlib
 import json
 import os
@@ -2324,6 +2325,93 @@ def make_backup_path(path: Path, backup_dir: Optional[str], backup_suffix: str) 
     return directory / f"{path.name}{suffix}"
 
 
+def _is_cross_device_error(exc: OSError) -> bool:
+    """Return True if *exc* is a cross-device rename/replace failure.
+
+    ``os.replace`` is atomic but cannot cross filesystem boundaries. On Unix
+    this surfaces as ``errno.EXDEV``; on Windows the native
+    ``ERROR_NOT_SAME_DEVICE`` (winerror 17) is raised when moving between
+    drives (e.g. staging on the system temp drive while the target lives on
+    another volume).
+    """
+    if exc.errno == errno.EXDEV:
+        return True
+    if getattr(exc, "winerror", None) == 17:
+        return True
+    return False
+
+
+def _replace_file(src: str, dst: str) -> None:
+    """Replace *dst* with *src*, tolerating cross-device staging.
+
+    ``os.replace`` is atomic but fails across filesystems. When the staging
+    temp file (kept in the sandbox tmp dir) and the target live on different
+    volumes we first try to re-stage beside the target so the final replace
+    stays atomic; if the target directory cannot hold a new file (e.g. a
+    write-protected sandbox) we fall back to copy + delete, which is correct
+    but not atomic. Anything other than a cross-device error is re-raised.
+    """
+    try:
+        os.replace(src, dst)
+        return
+    except OSError as exc:
+        if not _is_cross_device_error(exc):
+            raise
+
+    dst_dir = os.path.dirname(dst) or os.curdir
+    fd, stage = -1, ""
+    staged = False
+    try:
+        fd, stage = tempfile.mkstemp(
+            prefix=os.path.basename(dst) + ".safe-edit.",
+            suffix=".stage",
+            dir=dst_dir,
+        )
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            with open(src, "rb") as src_handle:
+                shutil.copyfileobj(src_handle, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(stage, stat.S_IMODE(os.stat(src).st_mode))
+        os.replace(stage, dst)
+        stage = ""
+        staged = True
+    except OSError:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            fd = -1
+        if stage:
+            try:
+                os.unlink(stage)
+            except OSError:
+                pass
+            stage = ""
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if stage:
+            try:
+                os.unlink(stage)
+            except OSError:
+                pass
+
+    if staged:
+        try:
+            os.unlink(src)
+        except OSError:
+            pass
+        return
+
+    shutil.move(src, dst)
+
+
 def atomic_replace(
     path: Path,
     data: bytes,
@@ -2353,7 +2441,7 @@ def atomic_replace(
             backup_name = str(make_backup_path(path, backup_dir, backup_suffix))
             shutil.copy2(path, backup_name)
 
-        os.replace(tmp_name, path)
+        _replace_file(tmp_name, str(path))
         tmp_name = ""
         fsync_directory(directory)
         return backup_name

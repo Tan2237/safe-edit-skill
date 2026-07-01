@@ -1,4 +1,5 @@
 import codecs
+import errno
 import hashlib
 import json
 import os
@@ -4538,6 +4539,122 @@ class SafeEditTests(unittest.TestCase):
             self.assertEqual(key1, key2)
         except OSError:
             self.skipTest("Symlinks not supported")
+
+    def test_is_cross_device_error_exdev(self):
+        """EXDEV (Unix cross-device link) is recognised."""
+        m = self._import_safe_edit()
+        self.assertTrue(m._is_cross_device_error(OSError(errno.EXDEV, "cross-device link")))
+
+    def test_is_cross_device_error_winerror(self):
+        """Windows ERROR_NOT_SAME_DEVICE (winerror 17) is recognised."""
+        m = self._import_safe_edit()
+        exc = OSError(17, "The system cannot move the file to a different disk drive")
+        exc.winerror = 17
+        self.assertTrue(m._is_cross_device_error(exc))
+
+    def test_is_cross_device_error_rejects_other(self):
+        """Non cross-device errors are not treated as cross-device."""
+        m = self._import_safe_edit()
+        self.assertFalse(m._is_cross_device_error(OSError(errno.EACCES, "denied")))
+        self.assertFalse(m._is_cross_device_error(OSError(errno.ENOENT, "no such file")))
+        self.assertFalse(m._is_cross_device_error(OSError(errno.ENOSPC, "no space")))
+
+    def test_replace_file_same_device_is_atomic(self):
+        """On the same filesystem os.replace is used directly (one call)."""
+        m = self._import_safe_edit()
+        src = self.tmpdir / "src_same.txt"
+        dst = self.tmpdir / "dst_same.txt"
+        src.write_bytes(b"new contents\n")
+        dst.write_bytes(b"old contents\n")
+
+        calls = []
+        real_replace = os.replace
+
+        def spy(a, b):
+            calls.append((str(a), str(b)))
+            return real_replace(a, b)
+
+        with patch.object(m.os, "replace", side_effect=spy):
+            m._replace_file(str(src), str(dst))
+
+        self.assertEqual(dst.read_bytes(), b"new contents\n")
+        self.assertFalse(src.exists())
+        self.assertEqual(len(calls), 1)
+
+    def test_replace_file_cross_device_stages_beside_target(self):
+        """A cross-device os.replace failure re-stages beside the target.
+
+        The first os.replace raises EXDEV; the second (stage -> dst) must
+        succeed, leaving the destination updated and the staging src removed.
+        """
+        m = self._import_safe_edit()
+        src = self.tmpdir / "src_xdev.txt"
+        dst = self.tmpdir / "dst_xdev.txt"
+        src.write_bytes(b"new contents\n")
+        dst.write_bytes(b"old contents\n")
+
+        calls = {"n": 0}
+        real_replace = os.replace
+
+        def fake_replace(a, b):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return real_replace(a, b)
+
+        with patch.object(m.os, "replace", side_effect=fake_replace):
+            m._replace_file(str(src), str(dst))
+
+        self.assertEqual(dst.read_bytes(), b"new contents\n")
+        self.assertFalse(src.exists(), "staging src must be cleaned up")
+        # No leftover stage files in the target directory.
+        leftovers = [p for p in self.tmpdir.iterdir() if p.name.endswith(".stage")]
+        self.assertEqual(leftovers, [])
+
+    def test_replace_file_cross_device_target_dir_unwritable_falls_back(self):
+        """When the target dir cannot hold a stage file, fall back to copy+delete."""
+        m = self._import_safe_edit()
+        src = self.tmpdir / "src_fallback.txt"
+        dst = self.tmpdir / "dst_fallback.txt"
+        src.write_bytes(b"new contents\n")
+        dst.write_bytes(b"old contents\n")
+
+        real_replace = os.replace
+        real_mkstemp = tempfile.mkstemp
+
+        def fake_replace(a, b):
+            # First (direct) replace always crosses devices.
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+        def fake_mkstemp(*args, **kwargs):
+            # Target-dir staging is impossible in this sandbox scenario.
+            raise OSError(errno.EACCES, "Permission denied")
+
+        with patch.object(m.os, "replace", side_effect=fake_replace), \
+                patch.object(m.tempfile, "mkstemp", side_effect=fake_mkstemp):
+            m._replace_file(str(src), str(dst))
+
+        self.assertEqual(dst.read_bytes(), b"new contents\n")
+        self.assertFalse(src.exists())
+
+    def test_replace_file_non_cross_device_error_reraised(self):
+        """A permission error (not cross-device) must propagate unchanged."""
+        m = self._import_safe_edit()
+        src = self.tmpdir / "src_perm.txt"
+        dst = self.tmpdir / "dst_perm.txt"
+        src.write_bytes(b"new\n")
+        dst.write_bytes(b"old\n")
+
+        def fake_replace(a, b):
+            raise OSError(errno.EACCES, "Permission denied")
+
+        with patch.object(m.os, "replace", side_effect=fake_replace):
+            with self.assertRaises(OSError) as ctx:
+                m._replace_file(str(src), str(dst))
+        self.assertEqual(ctx.exception.errno, errno.EACCES)
+        # Neither file should have been changed.
+        self.assertEqual(src.read_bytes(), b"new\n")
+        self.assertEqual(dst.read_bytes(), b"old\n")
 
 
 if __name__ == "__main__":
