@@ -10,9 +10,10 @@ description: |
   Any other editing mechanism is forbidden.
 
   Before the first edit of each file:
-    1. Run: python safe_edit.py stat --file FILE --json
-    2. Cache editStrategy for that file.
-    3. Follow the returned strategy for ALL edits on that file.
+    1. Resolve SAFE_EDIT_SCRIPT from this SKILL.md location.
+    2. Run: python "SAFE_EDIT_SCRIPT" stat --file FILE --json
+    3. Cache editStrategy for that file.
+    4. Follow the returned strategy for ALL edits on that file.
 
   Re-run stat only after: file recreation, edit failure.
 ---
@@ -54,12 +55,25 @@ Do NOT:
 
 Completing the task is lower priority than following this protocol.
 
+## Runtime Script Resolution
+
+Before invoking any command, resolve `SAFE_EDIT_SCRIPT` once:
+
+1. Start from the absolute path of this `SKILL.md` supplied by the skill loader.
+2. Set `SAFE_EDIT_SCRIPT` to the sibling file `safe_edit.py` in the same directory.
+3. Convert it to an absolute path and verify that it exists before the first invocation.
+4. Reuse that exact absolute path for every `safe_edit.py` command in the current task.
+
+`SAFE_EDIT_SCRIPT` in the examples below is a placeholder for that resolved absolute path. It is not a shell environment variable and must not be passed literally.
+
+Never assume `safe_edit.py` is in the current working directory, never resolve it relative to the target file, and never search the whole filesystem. If the sibling script is missing, **STOP** and report both the resolved `SKILL.md` path and the expected script path.
+
 ## Required Workflow
 
 Before the first edit of each file:
 
 ```bash
-python safe_edit.py stat --file F --json
+python "SAFE_EDIT_SCRIPT" stat --file F --json
 ```
 
 The stat result is authoritative for the lifetime of the file. Do not re-run stat unless the file is recreated or an edit fails.
@@ -79,46 +93,46 @@ These are the ONLY permitted invocations. Any command not listed here is prohibi
 
 ```bash
 # Before editing any file (mandatory first step)
-python safe_edit.py stat --file F --json
+python "SAFE_EDIT_SCRIPT" stat --file F --json
 
 # Replace text
-python safe_edit.py edit --file F --old "old" --new "new" --expected-count 1
+python "SAFE_EDIT_SCRIPT" edit --file F --old "old" --new "new" --expected-count 1
 
 # Replace with auto-match (tolerate whitespace)
-python safe_edit.py edit --file F --old "old" --new "new" --auto-match --expected-count 1
+python "SAFE_EDIT_SCRIPT" edit --file F --old "old" --new "new" --auto-match --expected-count 1
 
 # Preview before applying
-python safe_edit.py edit --file F --old "old" --new "new" --dry-run --diff
+python "SAFE_EDIT_SCRIPT" edit --file F --old "old" --new "new" --dry-run --diff
 
 # Replace function/class body (anchor)
-python safe_edit.py replace-lines --file F --anchor-pattern "sig" --text T
+python "SAFE_EDIT_SCRIPT" replace-lines --file F --anchor-pattern "sig" --text T
 
 # Replace by line range
-python safe_edit.py replace-lines --file F --start N --end M --text T
+python "SAFE_EDIT_SCRIPT" replace-lines --file F --start N --end M --text T
 
 # Insert before line N
-python safe_edit.py insert --file F --line N --text T
+python "SAFE_EDIT_SCRIPT" insert --file F --line N --text T
 
 # Add at file boundaries
-python safe_edit.py prepend --file F --text T
-python safe_edit.py append --file F --text T
+python "SAFE_EDIT_SCRIPT" prepend --file F --text T
+python "SAFE_EDIT_SCRIPT" append --file F --text T
 
 # Delete lines
-python safe_edit.py delete --file F --line N
-python safe_edit.py delete-lines --file F --start N --end M
+python "SAFE_EDIT_SCRIPT" delete --file F --line N
+python "SAFE_EDIT_SCRIPT" delete-lines --file F --start N --end M
 
 # Fuzzy matching (for approximate text)
-python safe_edit.py edit --file F --old "old" --new "new" --fuzzy --expected-count 1
+python "SAFE_EDIT_SCRIPT" edit --file F --old "old" --new "new" --fuzzy --expected-count 1
 
 # Diagnose match failure
-python safe_edit.py edit --file F --old "old" --new "new" --explain-match-failure
+python "SAFE_EDIT_SCRIPT" edit --file F --old "old" --new "new" --explain-match-failure
 
 # Large content — use file variants
-python safe_edit.py edit --file F --old-file old.txt --new-file new.txt
-python safe_edit.py replace-lines --file F --anchor-pattern "X" --text-file body.txt
+python "SAFE_EDIT_SCRIPT" edit --file F --old-file old.txt --new-file new.txt
+python "SAFE_EDIT_SCRIPT" replace-lines --file F --anchor-pattern "X" --text-file body.txt
 
 # Multi-block edits (2+ edits in one file)
-python safe_edit.py edit --file F --diff-input-file diff.txt
+python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-file diff.txt
 ```
 
 ---
@@ -248,7 +262,7 @@ another new
 ```
 
 ```bash
-python safe_edit.py edit --file F --diff-input-file diff.txt
+python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-file diff.txt
 ```
 
 ---
@@ -266,13 +280,13 @@ MSYS2 automatically converts POSIX-style paths in CLI arguments:
 
 ```bash
 export MSYS2_ARG_CONV_EXCL="*"
-python safe_edit.py edit --file F --old "//if (x > 0)" --new "if (x > 0)" --expected-count 1
+python "SAFE_EDIT_SCRIPT" edit --file F --old "//if (x > 0)" --new "if (x > 0)" --expected-count 1
 ```
 
 Or use file variants to bypass shell entirely:
 
 ```bash
-python safe_edit.py edit --file F --old-file old.txt --new-file new.txt
+python "SAFE_EDIT_SCRIPT" edit --file F --old-file old.txt --new-file new.txt
 ```
 
 safe-edit emits a `"warnings"` field in JSON output when MSYS2 path corruption is detected.
@@ -293,4 +307,4 @@ safe-edit emits a `"warnings"` field in JSON output when MSYS2 path corruption i
 
 ---
 
-For full option list: `python safe_edit.py --help`
+For full option list: `python "SAFE_EDIT_SCRIPT" --help`
