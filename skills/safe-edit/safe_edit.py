@@ -133,7 +133,8 @@ def classify_error_type(message: str) -> str:
         return "match_count_mismatch"
     if "decode" in msg or "failed to encode" in msg or "unable to auto-detect encoding" in msg or "bom" in msg or "unsupported encoding" in msg:
         return "encoding_error"
-    if ("file not found" in msg or "not a regular" in msg or "symlink" in msg
+    if ("file not found" in msg or "file already exists" in msg
+            or "not a regular" in msg or "symlink" in msg
             or "failed to read" in msg or ("failed to" in msg and "file" in msg)
             or ("exceeding" in msg and "max-bytes" in msg)):
         return "file_error"
@@ -2434,6 +2435,49 @@ def _replace_file(src: str, dst: str) -> None:
     shutil.move(src, dst)
 
 
+def resolve_create_path(path_value: str) -> Path:
+    """Validate a new-file target without creating parent directories."""
+    path = Path(path_value)
+    if os.path.lexists(path):
+        fail(f"file already exists: {path}")
+    parent = path.parent
+    if not parent.exists():
+        fail(f"parent directory not found: {parent}")
+    if not parent.is_dir():
+        fail(f"parent path is not a directory: {parent}")
+    return path
+
+
+def exclusive_create(path: Path, data: bytes) -> None:
+    """Create *path* exclusively and remove partial output if writing fails."""
+    fd = -1
+    created = False
+    try:
+        try:
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+            created = True
+        except FileExistsError:
+            fail(f"file already exists: {path}")
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        fsync_directory(path.parent)
+    except BaseException:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if created:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise
+
+
 def atomic_replace(
     path: Path,
     data: bytes,
@@ -2668,6 +2712,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             "inspect",
             "stat",
+            "create",
             "convert",
             "edit",
             "regex",
@@ -2789,6 +2834,107 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def run_create(args: argparse.Namespace) -> Dict[str, Any]:
+    """Create one new text file without permitting implicit overwrite."""
+    path = resolve_create_path(args.file)
+    if args.to_encoding == "preserve":
+        fail("create requires explicit --to-encoding")
+    if args.to_line_ending == "preserve":
+        fail("create requires explicit --to-line-ending")
+    if args.backup or args.backup_dir:
+        fail("create does not support backups because no original file exists")
+    if args.force_write:
+        fail("--force-write is not applicable to create")
+
+    cap = check_fs_capability(str(path))
+    if not cap["directoryWritable"]:
+        fail(f"target directory is not writable: {path.parent}")
+
+    warnings: List[str] = []
+    text = resolve_cli_value(
+        args,
+        "text",
+        True,
+        stdin_taken=[],
+        warnings=warnings,
+    )
+    newline = line_sep(args.to_line_ending)
+    new_text = apply_post_transforms(text or "", args, newline)
+    if "\x00" in new_text and not args.allow_nul:
+        fail("text contains NUL bytes; refusing likely binary content")
+    output_encoding = make_encoding_info(args.to_encoding)
+    output = encode_text(new_text, output_encoding)
+    if len(output) > args.max_bytes:
+        fail(f"output is {len(output)} bytes, exceeding --max-bytes {args.max_bytes}")
+    output_line_ending, output_line_counts, output_mixed = detect_line_ending(new_text)
+    diff_text = generate_diff(path, "", new_text, args.context) if args.diff else ""
+
+    summary: Dict[str, Any] = {
+        "ok": True,
+        "file": str(path),
+        "command": "create",
+        "encoding": output_encoding.name,
+        "outputEncoding": output_encoding.name,
+        "lineEnding": output_line_ending,
+        "outputLineEnding": output_line_ending,
+        "mixedLineEndings": output_mixed,
+        "outputMixedLineEndings": output_mixed,
+        "lineEndingCounts": output_line_counts,
+        "outputLineEndingCounts": output_line_counts,
+        "changed": 1,
+        "operations": [
+            {"index": 1, "op": "create", "changed": 1, "matchStrategy": "exact"}
+        ],
+        "postTransforms": {
+            "toEncoding": args.to_encoding,
+            "toLineEnding": args.to_line_ending,
+            "finalNewline": args.final_newline,
+            "trimTrailingWhitespace": bool(args.trim_trailing_whitespace),
+        },
+        "matchOptions": {
+            "autoMatch": False,
+            "fuzzy": False,
+            "ignoreIndent": False,
+            "ignoreEol": False,
+            "normalizeWhitespace": False,
+        },
+        "dryRun": args.dry_run,
+        "backup": None,
+        "written": False,
+        "created": False,
+        "skipped": False,
+        "wouldChangeBytes": True,
+        "wouldCreate": True,
+    }
+    if warnings:
+        summary["warnings"] = warnings
+    if args.diff:
+        summary["diff"] = diff_text
+
+    if args.dry_run:
+        return summary
+
+    lock_context = NullLock() if args.no_lock else FileLock(
+        path, args.lock_timeout, args.lock_stale_seconds
+    )
+    with lock_context:
+        resolve_create_path(str(path))
+        if args.interactive:
+            apply_this, _apply_all = prompt_interactive(
+                path, "", new_text, args.context, "create"
+            )
+            if not apply_this:
+                summary["skipped"] = True
+                summary["interactiveSkipped"] = True
+                return summary
+        exclusive_create(path, output)
+        if path.read_bytes() != output:
+            fail("post-write verification failed: bytes on disk do not match intended output")
+        summary["written"] = True
+        summary["created"] = True
+    return summary
+
+
 def run(args: argparse.Namespace) -> Dict[str, Any]:
     # Validate --interactive constraints
     if getattr(args, 'interactive', False):
@@ -2797,6 +2943,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         if args.command == "inspect":
             fail("--interactive is not applicable to inspect command (read-only)")
     
+    if args.command == "create":
+        return run_create(args)
+
     path = resolve_target_path(args.file, args.follow_symlink)
     if args.command == "inspect":
         original = read_target(path, args.max_bytes)

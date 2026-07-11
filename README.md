@@ -9,6 +9,7 @@
 - 单文件 Python 标准库实现，Windows/Linux/macOS 通用。
 - `inspect` 只检查不写入，可输出编码、BOM、行尾统计、文件大小、行数、NUL 字符和权限位。
 - `stat` 简洁摘要，包含编码、BOM、行尾统计、文件大小、行数，以及推荐的编辑策略（`editStrategy`）。
+- `create` 受控新建任务成果文件：拒绝覆盖、要求父目录已存在，并强制显式选择编码和行尾。
 - `convert` 显式转换编码、行尾、最终换行，或清理尾随空白；普通编辑默认仍保留原格式。
 - 自动检测并保留 `utf-8`、`utf-8-bom`、`gbk`、UTF-16 BOM，以及清晰 NUL 模式下的无 BOM UTF-16。
 - 支持手动指定 `shift-jis`、`big5`、`latin-1`、`utf-16-le`、`utf-16-be`。
@@ -82,6 +83,7 @@ python safe_edit.py stat --file foo.cpp --json
 
 ```bash
 python safe_edit.py stat --file path/to/file --json
+python safe_edit.py create --file path/to/new.txt --to-encoding utf-8 --to-line-ending lf --text-base64 B64
 python safe_edit.py convert --file path/to/file --to-encoding utf-8-bom --to-line-ending crlf --final-newline ensure
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --expected-count 1
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --expected-count 1
@@ -101,6 +103,29 @@ python safe_edit.py delete-lines --file path/to/file --start 10 --end 20
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" -i
 python safe_edit.py batch --file path/to/file --ops-file ops.json
 ```
+
+## 受控新建文件
+
+新文件不能先执行 `stat`。当任务确实需要新增源码、测试、配置或文档时，使用 `create`：
+
+```bash
+python safe_edit.py create \
+  --file path/to/new-file.txt \
+  --to-encoding utf-8 \
+  --to-line-ending lf \
+  --text-base64 B64
+```
+
+`create` 的约束：
+
+- 目标必须不存在，绝不隐式覆盖。
+- 父目录必须已经存在，不会递归创建目录。
+- 必须显式指定 `--to-encoding` 和 `--to-line-ending`。
+- 支持 `--text`、`--text-file`、`--text-stdin`、`--text-base64`。
+- 支持 `--dry-run --diff`，预览时不会落盘。
+- 创建完成后，如需继续修改该文件，先执行一次 `stat` 并遵循返回的 `editStrategy`。
+
+`create` 只用于任务成果文件，不用于临时脚本、补丁工具或为了绕过载荷传输规则而生成的中转文件。
 
 ## 自动容错匹配
 
@@ -453,6 +478,7 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 
 | 选项 | 说明 |
 | --- | --- |
+| `create` | 受控创建不存在的任务成果文件；要求显式编码和行尾 |
 | `--encoding` | 指定目标文件编码，默认 `auto` |
 | `--to-encoding` | 指定输出编码，默认 `preserve` |
 | `--to-line-ending` | 指定输出行尾，支持 `preserve`、`lf`、`crlf`、`cr` |

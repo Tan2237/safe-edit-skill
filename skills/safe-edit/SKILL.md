@@ -9,11 +9,14 @@ description: |
 
   Any other editing mechanism is forbidden.
 
-  Before the first edit of each file:
+  Before modifying an existing file:
     1. Resolve SAFE_EDIT_SCRIPT from this SKILL.md location.
     2. Run: python "SAFE_EDIT_SCRIPT" stat --file FILE --json
     3. Cache editStrategy for that file.
     4. Follow the returned strategy for ALL edits on that file.
+
+  For a required new file, use the controlled create command. It refuses
+  existing targets and requires explicit encoding and line-ending choices.
 
   Re-run stat only after: file recreation, a failed safe_edit.py invocation that may have reached the write phase, or an uncertain execution outcome.
 ---
@@ -70,11 +73,19 @@ Never assume `safe_edit.py` is in the current working directory, never resolve i
 
 ## Required Workflow
 
-Before the first edit of each file:
+Before the first edit of each existing file:
 
 ```bash
 python "SAFE_EDIT_SCRIPT" stat --file F --json
 ```
+
+A new file cannot be inspected first. Create it only when it is a requested task artifact:
+
+```bash
+python "SAFE_EDIT_SCRIPT" create --file F --to-encoding utf-8 --to-line-ending lf --text-base64 B64
+```
+
+The target must not exist and its parent directory must already exist. `create` never overwrites and never creates parent directories. After creation, run `stat` before any later edit.
 
 The stat result is authoritative for the lifetime of the file. Re-run it only when the file is recreated, a failed `safe_edit.py` invocation may have reached the write phase, or the execution outcome is uncertain. Do not re-run it when the shell/tool rejects the command before process start, or when argument parsing fails before target access.
 
@@ -92,8 +103,15 @@ On Windows, `py -3` works when `python` is not on PATH.
 These are the ONLY permitted invocations. Any command not listed here is prohibited.
 
 ```bash
-# Before editing any file (mandatory first step)
+# Before editing any existing file (mandatory first step)
 python "SAFE_EDIT_SCRIPT" stat --file F --json
+
+# Create a requested task artifact; target must not exist
+python "SAFE_EDIT_SCRIPT" create --file F --to-encoding ENC --to-line-ending EOL --text-stdin
+python "SAFE_EDIT_SCRIPT" create --file F --to-encoding ENC --to-line-ending EOL --text-base64 B64
+python "SAFE_EDIT_SCRIPT" create --file F --to-encoding ENC --to-line-ending EOL --text-file EXISTING_FILE
+python "SAFE_EDIT_SCRIPT" create --file F --to-encoding ENC --to-line-ending EOL --text T
+python "SAFE_EDIT_SCRIPT" create --file F --to-encoding ENC --to-line-ending EOL --text-base64 B64 --dry-run --diff
 
 # Shell-safe payload transports (preferred for complex or sensitive content)
 python "SAFE_EDIT_SCRIPT" batch --file F --ops-stdin
@@ -166,6 +184,10 @@ python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-base64 B64
 ```
 Need modification?
 │
+├─ Target does not exist and is a required task artifact?
+│      → create --to-encoding ENC --to-line-ending EOL --text-{stdin|base64}
+│      → Never use create for temporary scripts, patch tools, or payload bootstrapping
+│
 ├─ Replace exact text (single/multiline)?
 │      → edit --old X --new Y --expected-count 1
 │
@@ -213,19 +235,21 @@ regex                       ← HIGHEST RISK
 
 ## Core Rules
 
-1. **Always add `--expected-count 1` for normal text replacement** — prevents wrong matches from silently succeeding. Do not omit it unless intentionally targeting multiple matches, performing diagnosis, or using commands with their own matching semantics.
+1. **Create only requested task artifacts** — `create` is for source, test, configuration, documentation, and other deliverables required by the task. It does not authorize temporary scripts, patch tools, or payload files. The target must not exist, the parent directory must already exist, and both `--to-encoding` and `--to-line-ending` are mandatory.
 
-2. **Do not send complex content through literal argv** — for multiline content, >100 characters, or shell-sensitive characters (`$`, `%`, `!`, `\`, `` ` ``, `'`, `"`), prefer `--ops-stdin` when the execution tool provides native stdin. Otherwise use URL-safe UTF-8 Base64 via `--ops-base64`, `--diff-input-base64`, or `--text-base64`.
+2. **Always add `--expected-count 1` for normal text replacement** — prevents wrong matches from silently succeeding. Do not omit it unless intentionally targeting multiple matches, performing diagnosis, or using commands with their own matching semantics.
 
-3. **Do not bootstrap payload files outside this protocol** — use a `--*-file` option only when that payload file already exists or was created through its own authorized edit workflow. The need for a payload file never authorizes shell redirection or an ad-hoc writer.
+3. **Do not send complex content through literal argv** — for multiline content, >100 characters, or shell-sensitive characters (`$`, `%`, `!`, `\`, `` ` ``, `'`, `"`), prefer `--ops-stdin` when the execution tool provides native stdin. Otherwise use URL-safe UTF-8 Base64 via `--ops-base64`, `--diff-input-base64`, or `--text-base64`.
 
-4. **Use URL-safe Base64 for Windows argv** — unpadded URL-safe Base64 avoids quotes, whitespace, `+`, and `/`. The CLI also accepts padded and standard Base64, and always decodes the result as strict UTF-8.
+4. **Do not bootstrap payload files outside this protocol** — use a `--*-file` option only when that payload file already exists or was created through its own authorized edit workflow. The need for a payload file never authorizes shell redirection or an ad-hoc writer.
 
-5. **Use `--auto-match` for multiline edits** — auto-tries: exact → ignore-eol → ignore-indent → normalize-whitespace.
+5. **Use URL-safe Base64 for Windows argv** — unpadded URL-safe Base64 avoids quotes, whitespace, `+`, and `/`. The CLI also accepts padded and standard Base64, and always decodes the result as strict UTF-8.
 
-6. **Use `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
+6. **Use `--auto-match` for multiline edits** — auto-tries: exact → ignore-eol → ignore-indent → normalize-whitespace.
 
-7. **Re-read and validate after edits** — successful execution confirms only the payload received by `safe_edit.py`. For literal argv, re-read or compile/test to verify intent. Base64/stdin transports substantially reduce this risk.
+7. **Use `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
+
+8. **Re-read and validate after edits** — successful execution confirms only the payload received by `safe_edit.py`. For literal argv, re-read or compile/test to verify intent. Base64/stdin transports substantially reduce this risk.
 
 ---
 

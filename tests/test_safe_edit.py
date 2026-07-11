@@ -4030,6 +4030,119 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         )
         self.assertEqual(path.read_bytes(), b"line1\nline5\n")
 
+    def test_create_new_file_with_explicit_format(self):
+        path = self.tmpdir / "created.txt"
+        result = self.run_tool(
+            "create", "--file", path,
+            "--to-encoding", "utf-8",
+            "--to-line-ending", "crlf",
+            "--final-newline", "ensure",
+            "--text", "alpha\nbeta",
+            "--json",
+        )
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["created"])
+        self.assertTrue(payload["written"])
+        self.assertEqual(path.read_bytes(), b"alpha\r\nbeta\r\n")
+
+        stat_result = self.run_tool("stat", "--file", path, "--json")
+        stat_payload = json.loads(stat_result.stdout)
+        self.assertEqual(stat_payload["encoding"], "utf-8")
+        self.assertEqual(stat_payload["lineEnding"], "crlf")
+
+    def test_create_refuses_to_overwrite_existing_file(self):
+        path = self.tmpdir / "existing.txt"
+        path.write_text("original", encoding="utf-8")
+        result = self.run_tool(
+            "create", "--file", path,
+            "--to-encoding", "utf-8",
+            "--to-line-ending", "lf",
+            "--text", "replacement",
+            "--json",
+            expect=2,
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["type"], "file_error")
+        self.assertIn("file already exists", payload["error"]["message"])
+        self.assertEqual(path.read_text(encoding="utf-8"), "original")
+
+    def test_create_requires_existing_parent_and_explicit_format(self):
+        missing_parent = self.tmpdir / "missing" / "new.txt"
+        result = self.run_tool(
+            "create", "--file", missing_parent,
+            "--to-encoding", "utf-8",
+            "--to-line-ending", "lf",
+            "--text", "content",
+            "--json",
+            expect=2,
+        )
+        self.assertIn("parent directory not found", json.loads(result.stdout)["error"]["message"])
+
+        path = self.tmpdir / "format-required.txt"
+        result = self.run_tool(
+            "create", "--file", path,
+            "--to-line-ending", "lf",
+            "--text", "content",
+            "--json",
+            expect=2,
+        )
+        self.assertIn("explicit --to-encoding", json.loads(result.stdout)["error"]["message"])
+        self.assertFalse(path.exists())
+
+        result = self.run_tool(
+            "create", "--file", path,
+            "--to-encoding", "utf-8",
+            "--text", "content",
+            "--json",
+            expect=2,
+        )
+        self.assertIn("explicit --to-line-ending", json.loads(result.stdout)["error"]["message"])
+        self.assertFalse(path.exists())
+
+    def test_create_dry_run_and_base64_payload(self):
+        path = self.tmpdir / "preview.txt"
+        encoded = base64.urlsafe_b64encode(b"encoded\ntext").decode("ascii").rstrip("=")
+        result = self.run_tool(
+            "create", "--file", path,
+            "--to-encoding", "utf-8-bom",
+            "--to-line-ending", "lf",
+            "--text-base64", encoded,
+            "--dry-run", "--diff", "--json",
+        )
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["wouldCreate"])
+        self.assertFalse(payload["created"])
+        self.assertFalse(payload["written"])
+        self.assertIn("encoded", payload["diff"])
+        self.assertFalse(path.exists())
+
+    def test_create_enforces_text_safety_limits(self):
+        nul_path = self.tmpdir / "contains-nul.txt"
+        nul_payload = base64.urlsafe_b64encode(b"a\x00b").decode("ascii").rstrip("=")
+        result = self.run_tool(
+            "create", "--file", nul_path,
+            "--to-encoding", "utf-8",
+            "--to-line-ending", "lf",
+            "--text-base64", nul_payload,
+            "--dry-run", "--json",
+            expect=2,
+        )
+        self.assertIn("NUL bytes", json.loads(result.stdout)["error"]["message"])
+        self.assertFalse(nul_path.exists())
+
+        large_path = self.tmpdir / "large.txt"
+        result = self.run_tool(
+            "create", "--file", large_path,
+            "--to-encoding", "utf-8",
+            "--to-line-ending", "lf",
+            "--text", "12345",
+            "--max-bytes", "4",
+            "--dry-run", "--json",
+            expect=2,
+        )
+        self.assertIn("exceeding --max-bytes", json.loads(result.stdout)["error"]["message"])
+        self.assertFalse(large_path.exists())
+
     def test_file_not_found_fails(self):
         """Test editing a non-existent file fails with file_error."""
         path = self.tmpdir / "nonexistent.txt"
