@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import codecs
 import difflib
 import errno
@@ -1143,6 +1145,23 @@ def _detect_msys2_path_corruption(value: str, param_name: str) -> Optional[str]:
     return None
 
 
+def decode_base64_text(value: str, option_name: str) -> str:
+    # Accept padded or unpadded URL-safe/standard Base64 and require UTF-8.
+    compact = ''.join(value.split())
+    if not compact:
+        return ''
+    padding = '=' * (-len(compact) % 4)
+    normalized = (compact + padding).replace('-', '+').replace('_', '/')
+    try:
+        decoded = base64.b64decode(normalized, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        fail(f'invalid --{option_name} data: expected Base64 text ({exc})')
+    try:
+        return decoded.decode('utf-8', errors='strict')
+    except UnicodeDecodeError as exc:
+        fail(f'invalid --{option_name} data: decoded bytes are not UTF-8 ({exc})')
+
+
 def resolve_cli_value(
     args: argparse.Namespace,
     name: str,
@@ -1152,14 +1171,15 @@ def resolve_cli_value(
     warnings: Optional[List[str]] = None,
 ) -> Optional[str]:
     direct = getattr(args, name, None)
-    file_value = getattr(args, f"{name}_file", None)
-    stdin_value = bool(getattr(args, f"{name}_stdin", False))
-    provided = [direct is not None, file_value is not None, stdin_value].count(True)
+    file_value = getattr(args, f'{name}_file', None)
+    base64_value = getattr(args, f'{name}_base64', None)
+    stdin_value = bool(getattr(args, f'{name}_stdin', False))
+    provided = [direct is not None, file_value is not None, base64_value is not None, stdin_value].count(True)
     if provided > 1:
-        fail(f"use only one of --{name}, --{name}-file, or --{name}-stdin")
+        fail(f'use only one of --{name}, --{name}-file, --{name}-base64, or --{name}-stdin')
     if provided == 0:
         if required:
-            fail(f"missing --{name}")
+            fail(f'missing --{name}')
         return None
     if direct is not None:
         if warnings is not None:
@@ -1169,8 +1189,10 @@ def resolve_cli_value(
         return direct
     if file_value is not None:
         return read_argument_file(file_value, args.arg_encoding)
+    if base64_value is not None:
+        return decode_base64_text(base64_value, f'{name}-base64')
     if stdin_taken:
-        fail(f"stdin is already used by --{stdin_taken[0]}-stdin")
+        fail(f'stdin is already used by --{stdin_taken[0]}-stdin')
     stdin_taken.append(name)
     return sys.stdin.read()
 
@@ -2456,9 +2478,14 @@ def atomic_replace(
 
 
 def load_batch_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Optional[Path]]:
-    sources = [args.ops is not None, args.ops_file is not None, args.ops_stdin].count(True)
+    sources = [
+        args.ops is not None,
+        args.ops_file is not None,
+        args.ops_base64 is not None,
+        args.ops_stdin,
+    ].count(True)
     if sources != 1:
-        fail("batch requires exactly one of --ops, --ops-file, or --ops-stdin")
+        fail('batch requires exactly one of --ops, --ops-file, --ops-base64, or --ops-stdin')
     base_dir = None
     if args.ops is not None:
         raw = args.ops
@@ -2466,64 +2493,78 @@ def load_batch_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]
         ops_path = Path(args.ops_file)
         raw = read_argument_file(str(ops_path), args.arg_encoding)
         base_dir = ops_path.parent
+    elif args.ops_base64 is not None:
+        raw = decode_base64_text(args.ops_base64, 'ops-base64')
     else:
         raw = sys.stdin.read()
 
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        fail(f"invalid batch JSON: {exc}")
+        fail(f'invalid batch JSON: {exc}')
     if isinstance(payload, dict):
-        payload = payload.get("operations", payload.get("ops"))
+        payload = payload.get('operations', payload.get('ops'))
     if not isinstance(payload, list):
-        fail("batch JSON must be a list or an object with operations/ops")
+        fail('batch JSON must be a list or an object with operations/ops')
     operations: List[Dict[str, Any]] = []
     for index, item in enumerate(payload, start=1):
         if not isinstance(item, dict):
-            fail(f"batch operation {index} must be an object")
+            fail(f'batch operation {index} must be an object')
         operations.append(dict(item))
     return operations, base_dir
 
 
 def command_to_operations(args: argparse.Namespace, warnings: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], Optional[Path]]:
-    # Handle --diff-input: parse SEARCH/REPLACE format into edit operations
+    # Parse an optional SEARCH/REPLACE transport into edit operations.
     diff_input = getattr(args, 'diff_input', None)
     diff_input_file = getattr(args, 'diff_input_file', None)
-    if diff_input or diff_input_file:
-        if diff_input and diff_input_file:
-            fail("use only one of --diff-input or --diff-input-file")
-        if diff_input:
+    diff_input_base64 = getattr(args, 'diff_input_base64', None)
+    diff_input_stdin = bool(getattr(args, 'diff_input_stdin', False))
+    diff_sources = [
+        diff_input is not None,
+        diff_input_file is not None,
+        diff_input_base64 is not None,
+        diff_input_stdin,
+    ].count(True)
+    if diff_sources > 1:
+        fail('use only one of --diff-input, --diff-input-file, --diff-input-base64, or --diff-input-stdin')
+    if diff_sources == 1:
+        if diff_input is not None:
             raw_diff = diff_input
             base_dir = None
-        else:
+        elif diff_input_file is not None:
             diff_path = Path(diff_input_file)
             raw_diff = read_argument_file(str(diff_path), args.arg_encoding)
             base_dir = diff_path.parent
+        elif diff_input_base64 is not None:
+            raw_diff = decode_base64_text(diff_input_base64, 'diff-input-base64')
+            base_dir = None
+        else:
+            raw_diff = sys.stdin.read()
+            base_dir = None
         operations = parse_diff_input(raw_diff)
-        # Add context_before/context_after and expected_count/first/no_op_ok to each operation
         for op in operations:
             if getattr(args, 'context_before', None):
-                op["context_before"] = args.context_before
+                op['context_before'] = args.context_before
             if getattr(args, 'context_after', None):
-                op["context_after"] = args.context_after
+                op['context_after'] = args.context_after
             if args.expected_count is not None:
-                op["expected_count"] = args.expected_count
+                op['expected_count'] = args.expected_count
             if args.first:
-                op["first"] = True
+                op['first'] = True
             if args.no_op_ok:
-                op["no_op_ok"] = True
-        # Resolve file-based values in each operation
+                op['no_op_ok'] = True
         resolved: List[Dict[str, Any]] = []
         for operation in operations:
             current = dict(operation)
-            op = str(current.get("op") or "").replace("_", "-")
-            current["op"] = op
-            if op == "edit":
-                current["old"] = resolve_operation_value(current, "old", True, args.arg_encoding, base_dir)
-                current["new"] = resolve_operation_value(current, "new", True, args.arg_encoding, base_dir)
+            op = str(current.get('op') or '').replace('_', '-')
+            current['op'] = op
+            if op == 'edit':
+                current['old'] = resolve_operation_value(current, 'old', True, args.arg_encoding, base_dir)
+                current['new'] = resolve_operation_value(current, 'new', True, args.arg_encoding, base_dir)
             resolved.append(current)
         return resolved, base_dir
-    
+
     if args.command == "batch":
         operations, base_dir = load_batch_operations(args)
     elif args.command == "convert":
@@ -2671,19 +2712,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--interactive", "-i", action="store_true",
                         help="prompt for confirmation before each write operation")
 
-    parser.add_argument("--old")
-    parser.add_argument("--old-file")
-    parser.add_argument("--old-stdin", action="store_true")
-    parser.add_argument("--new")
-    parser.add_argument("--new-file")
-    parser.add_argument("--new-stdin", action="store_true")
+    parser.add_argument('--old')
+    parser.add_argument('--old-file')
+    parser.add_argument('--old-base64', help='URL-safe or standard Base64 containing UTF-8 text')
+    parser.add_argument('--old-stdin', action='store_true')
+    parser.add_argument('--new')
+    parser.add_argument('--new-file')
+    parser.add_argument('--new-base64', help='URL-safe or standard Base64 containing UTF-8 text')
+    parser.add_argument('--new-stdin', action='store_true')
 
-    parser.add_argument("--pattern")
-    parser.add_argument("--pattern-file")
-    parser.add_argument("--pattern-stdin", action="store_true")
-    parser.add_argument("--replacement")
-    parser.add_argument("--replacement-file")
-    parser.add_argument("--replacement-stdin", action="store_true")
+    parser.add_argument('--pattern')
+    parser.add_argument('--pattern-file')
+    parser.add_argument('--pattern-base64', help='URL-safe or standard Base64 containing UTF-8 text')
+    parser.add_argument('--pattern-stdin', action='store_true')
+    parser.add_argument('--replacement')
+    parser.add_argument('--replacement-file')
+    parser.add_argument('--replacement-base64', help='URL-safe or standard Base64 containing UTF-8 text')
+    parser.add_argument('--replacement-stdin', action='store_true')
     parser.add_argument("--flags", default="")
     parser.add_argument("--count", type=int, default=0)
     parser.add_argument("--literal-replacement", action="store_true")
@@ -2693,7 +2738,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-op-ok", action="store_true")
     parser.add_argument("--explain-match-failure", action="store_true",
                         help="show detailed diagnostics when match fails")
-    
+
     # Controlled whitespace matching flags (only affect --old matching, not --new replacement)
     parser.add_argument("--ignore-indent", action="store_true",
                         help="ignore indentation differences when matching (tabs vs spaces)")
@@ -2709,17 +2754,22 @@ def build_parser() -> argparse.ArgumentParser:
                         help="text that must appear before the match for disambiguation")
     parser.add_argument("--context-after",
                         help="text that must appear after the match for disambiguation")
-    parser.add_argument("--diff-input",
-                        help="SEARCH/REPLACE diff format input for edit operations")
-    parser.add_argument("--diff-input-file",
-                        help="read SEARCH/REPLACE diff from file")
+    parser.add_argument('--diff-input',
+                        help='SEARCH/REPLACE diff format input for edit operations')
+    parser.add_argument('--diff-input-file',
+                        help='read SEARCH/REPLACE diff from file')
+    parser.add_argument('--diff-input-base64',
+                        help='read SEARCH/REPLACE diff from URL-safe or standard Base64 UTF-8 text')
+    parser.add_argument('--diff-input-stdin', action='store_true',
+                        help='read SEARCH/REPLACE diff from stdin')
 
     parser.add_argument("--line", type=int)
     parser.add_argument("--start", type=int)
     parser.add_argument("--end", type=int)
-    parser.add_argument("--text")
-    parser.add_argument("--text-file")
-    parser.add_argument("--text-stdin", action="store_true")
+    parser.add_argument('--text')
+    parser.add_argument('--text-file')
+    parser.add_argument('--text-base64', help='URL-safe or standard Base64 containing UTF-8 text')
+    parser.add_argument('--text-stdin', action='store_true')
     
     parser.add_argument("--anchor-pattern", 
                         help="context anchor pattern for relative line positioning")
@@ -2732,9 +2782,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-preserve-indent", action="store_true",
                         help="disable automatic indent preservation in replace-lines (default: preserve)")
 
-    parser.add_argument("--ops")
-    parser.add_argument("--ops-file")
-    parser.add_argument("--ops-stdin", action="store_true")
+    parser.add_argument('--ops')
+    parser.add_argument('--ops-file')
+    parser.add_argument('--ops-base64', help='URL-safe or standard Base64 containing UTF-8 batch JSON')
+    parser.add_argument('--ops-stdin', action='store_true')
     return parser
 
 

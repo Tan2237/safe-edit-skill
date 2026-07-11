@@ -1,3 +1,4 @@
+import base64
 import codecs
 import errno
 import hashlib
@@ -3422,6 +3423,75 @@ class SafeEditTests(unittest.TestCase):
         result = self.run_tool("inspect", "--file", path, "--json", expect=2)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["error"]["type"], "encoding_error")
+
+    def test_old_and_new_base64_replace_exact_text(self):
+        path = self.tmpdir / "old_new_base64.txt"
+        original = 'quoted "%!"'
+        replacement = """frozenset({'"', '%', '!', '\\r', '\\n'})"""
+        path.write_text(original + "\n", encoding="utf-8")
+        old_encoded = base64.urlsafe_b64encode(original.encode("utf-8")).decode("ascii").rstrip("=")
+        new_encoded = base64.urlsafe_b64encode(replacement.encode("utf-8")).decode("ascii").rstrip("=")
+        self.run_tool(
+            "edit", "--file", path, "--old-base64", old_encoded,
+            "--new-base64", new_encoded, "--expected-count", "1",
+        )
+        self.assertEqual(path.read_text(encoding="utf-8"), replacement + "\n")
+
+    def test_base64_source_conflict_fails_before_write(self):
+        path = self.tmpdir / "base64_conflict.txt"
+        original = b"unchanged\n"
+        path.write_bytes(original)
+        self.run_tool(
+            "append", "--file", path, "--text", "x", "--text-base64", "eA",
+            expect=2,
+        )
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_text_base64_preserves_shell_sensitive_multiline_content(self):
+        path = self.tmpdir / "text_base64.txt"
+        path.write_bytes(b"placeholder\r\n")
+        content = """'''doc'''
+value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
+        encoded = base64.urlsafe_b64encode(content.encode("utf-8")).decode("ascii").rstrip("=")
+        self.run_tool(
+            "replace-lines", "--file", path, "--start", "1", "--end", "1",
+            "--text-base64", encoded, "--no-preserve-indent",
+        )
+        self.assertEqual(path.read_bytes(), (content.replace("\n", "\r\n") + "\r\n").encode("utf-8"))
+
+    def test_ops_base64_carries_old_and_new_without_shell_parsing(self):
+        path = self.tmpdir / "ops_base64.txt"
+        path.write_bytes(b"before\r\nafter\r\n")
+        replacement = """frozenset({'"', '%', '!', '\\r', '\\n'})"""
+        operations = json.dumps([
+            {"op": "edit", "old": "before", "new": replacement, "expected_count": 1}
+        ], ensure_ascii=False)
+        encoded = base64.urlsafe_b64encode(operations.encode("utf-8")).decode("ascii")
+        self.run_tool("batch", "--file", path, "--ops-base64", encoded)
+        self.assertEqual(path.read_text(encoding="utf-8"), replacement + "\nafter\n")
+
+    def test_diff_input_stdin_and_base64(self):
+        for option in ("--diff-input-stdin", "--diff-input-base64"):
+            path = self.tmpdir / (option.removeprefix("--") + ".txt")
+            path.write_bytes(b"alpha\nbeta\ngamma\n")
+            diff = "------- SEARCH\nbeta\n=======\nBETA % ! \" \\ \u0060\n+++++++ REPLACE"
+            if option.endswith("stdin"):
+                self.run_tool("edit", "--file", path, option, input_text=diff)
+            else:
+                encoded = base64.urlsafe_b64encode(diff.encode("utf-8")).decode("ascii").rstrip("=")
+                self.run_tool("edit", "--file", path, option, encoded)
+            self.assertEqual(path.read_text(encoding="utf-8"), "alpha\nBETA % ! \" \\ \u0060\ngamma\n")
+
+    def test_invalid_base64_does_not_modify_file(self):
+        path = self.tmpdir / "invalid_base64.txt"
+        original = b"unchanged\n"
+        path.write_bytes(original)
+        result = self.run_tool(
+            "append", "--file", path, "--text-base64", "not*base64", "--json", expect=2,
+        )
+        payload = json.loads(result.stdout)
+        self.assertIn("expected Base64 text", payload["error"]["message"])
+        self.assertEqual(path.read_bytes(), original)
 
     def test_ops_stdin_batch_mode(self):
         """Test --ops-stdin reads batch JSON from stdin."""

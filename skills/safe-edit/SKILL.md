@@ -15,7 +15,7 @@ description: |
     3. Cache editStrategy for that file.
     4. Follow the returned strategy for ALL edits on that file.
 
-  Re-run stat only after: file recreation, edit failure.
+  Re-run stat only after: file recreation, a failed safe_edit.py invocation that may have reached the write phase, or an uncertain execution outcome.
 ---
 
 # safe-edit — Hard Protocol
@@ -76,7 +76,7 @@ Before the first edit of each file:
 python "SAFE_EDIT_SCRIPT" stat --file F --json
 ```
 
-The stat result is authoritative for the lifetime of the file. Do not re-run stat unless the file is recreated or an edit fails.
+The stat result is authoritative for the lifetime of the file. Re-run it only when the file is recreated, a failed `safe_edit.py` invocation may have reached the write phase, or the execution outcome is uncertain. Do not re-run it when the shell/tool rejects the command before process start, or when argument parsing fails before target access.
 
 The selected editStrategy is locked for the lifetime of the file. Do NOT switch to another edit mechanism after a command failure. Continue using the cached editStrategy.
 
@@ -95,6 +95,28 @@ These are the ONLY permitted invocations. Any command not listed here is prohibi
 # Before editing any file (mandatory first step)
 python "SAFE_EDIT_SCRIPT" stat --file F --json
 
+# Shell-safe payload transports (preferred for complex or sensitive content)
+python "SAFE_EDIT_SCRIPT" batch --file F --ops-stdin
+python "SAFE_EDIT_SCRIPT" batch --file F --ops-base64 B64
+python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-stdin
+python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-base64 B64
+python "SAFE_EDIT_SCRIPT" edit --file F --old-stdin --new-base64 B64 --expected-count 1
+python "SAFE_EDIT_SCRIPT" edit --file F --old-base64 B64 --new-stdin --expected-count 1
+python "SAFE_EDIT_SCRIPT" edit --file F --old-base64 OLD_B64 --new-base64 NEW_B64 --expected-count 1
+python "SAFE_EDIT_SCRIPT" regex --file F --pattern-stdin --replacement-base64 B64
+python "SAFE_EDIT_SCRIPT" regex --file F --pattern-base64 B64 --replacement-stdin
+python "SAFE_EDIT_SCRIPT" regex --file F --pattern-base64 PATTERN_B64 --replacement-base64 REPLACEMENT_B64
+python "SAFE_EDIT_SCRIPT" insert --file F --line N --text-stdin
+python "SAFE_EDIT_SCRIPT" insert --file F --line N --text-base64 B64
+python "SAFE_EDIT_SCRIPT" prepend --file F --text-stdin
+python "SAFE_EDIT_SCRIPT" prepend --file F --text-base64 B64
+python "SAFE_EDIT_SCRIPT" append --file F --text-stdin
+python "SAFE_EDIT_SCRIPT" append --file F --text-base64 B64
+python "SAFE_EDIT_SCRIPT" replace-lines --file F --start N --end M --text-stdin
+python "SAFE_EDIT_SCRIPT" replace-lines --file F --start N --end M --text-base64 B64
+python "SAFE_EDIT_SCRIPT" replace-lines --file F --anchor-pattern X --offset-start A --offset-end B --text-stdin
+python "SAFE_EDIT_SCRIPT" replace-lines --file F --anchor-pattern X --offset-start A --offset-end B --text-base64 B64
+
 # Replace text
 python "SAFE_EDIT_SCRIPT" edit --file F --old "old" --new "new" --expected-count 1
 
@@ -105,7 +127,7 @@ python "SAFE_EDIT_SCRIPT" edit --file F --old "old" --new "new" --auto-match --e
 python "SAFE_EDIT_SCRIPT" edit --file F --old "old" --new "new" --dry-run --diff
 
 # Replace function/class body (anchor)
-python "SAFE_EDIT_SCRIPT" replace-lines --file F --anchor-pattern "sig" --text T
+python "SAFE_EDIT_SCRIPT" replace-lines --file F --anchor-pattern "sig" --offset-start A --offset-end B --text T
 
 # Replace by line range
 python "SAFE_EDIT_SCRIPT" replace-lines --file F --start N --end M --text T
@@ -127,12 +149,14 @@ python "SAFE_EDIT_SCRIPT" edit --file F --old "old" --new "new" --fuzzy --expect
 # Diagnose match failure
 python "SAFE_EDIT_SCRIPT" edit --file F --old "old" --new "new" --explain-match-failure
 
-# Large content — use file variants
+# Existing payload files (when they already exist)
 python "SAFE_EDIT_SCRIPT" edit --file F --old-file old.txt --new-file new.txt
-python "SAFE_EDIT_SCRIPT" replace-lines --file F --anchor-pattern "X" --text-file body.txt
+python "SAFE_EDIT_SCRIPT" replace-lines --file F --anchor-pattern "X" --offset-start A --offset-end B --text-file body.txt
 
 # Multi-block edits (2+ edits in one file)
 python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-file diff.txt
+python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-stdin
+python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-base64 B64
 ```
 
 ---
@@ -148,7 +172,7 @@ Need modification?
 ├─ Replace function/class body?
 │   │
 │   ├─ Anchor pattern unique?
-│   │      YES → replace-lines --anchor-pattern "unique_sig" --text T
+│   │      YES → replace-lines --anchor-pattern "unique_sig" --offset-start A --offset-end B --text T
 │   │
 │   └─ Anchor not unique?
 │          → Locate line range with search tool
@@ -191,13 +215,17 @@ regex                       ← HIGHEST RISK
 
 1. **Always add `--expected-count 1` for normal text replacement** — prevents wrong matches from silently succeeding. Do not omit it unless intentionally targeting multiple matches, performing diagnosis, or using commands with their own matching semantics.
 
-2. **Use `--old-file` for complex content** — multiline, >100 chars, or contains shell-sensitive chars (`$`, `%`, `\`, `` ` ``, `'`, `"`).
+2. **Do not send complex content through literal argv** — for multiline content, >100 characters, or shell-sensitive characters (`$`, `%`, `!`, `\`, `` ` ``, `'`, `"`), prefer `--ops-stdin` when the execution tool provides native stdin. Otherwise use URL-safe UTF-8 Base64 via `--ops-base64`, `--diff-input-base64`, or `--text-base64`.
 
-3. **Use `--auto-match` for multiline edits** — auto-tries: exact → ignore-eol → ignore-indent → normalize-whitespace.
+3. **Do not bootstrap payload files outside this protocol** — use a `--*-file` option only when that payload file already exists or was created through its own authorized edit workflow. The need for a payload file never authorizes shell redirection or an ad-hoc writer.
 
-4. **Use `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
+4. **Use URL-safe Base64 for Windows argv** — unpadded URL-safe Base64 avoids quotes, whitespace, `+`, and `/`. The CLI also accepts padded and standard Base64, and always decodes the result as strict UTF-8.
 
-5. **Re-read before structural edits** — line positions and content may have shifted after prior edits.
+5. **Use `--auto-match` for multiline edits** — auto-tries: exact → ignore-eol → ignore-indent → normalize-whitespace.
+
+6. **Use `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
+
+7. **Re-read and validate after edits** — successful execution confirms only the payload received by `safe_edit.py`. For literal argv, re-read or compile/test to verify intent. Base64/stdin transports substantially reduce this risk.
 
 ---
 
@@ -262,34 +290,47 @@ another new
 ```
 
 ```bash
+# Preferred when native stdin is available
+python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-stdin
+
+# Preferred argv fallback
+python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-base64 B64
+
+# Use only when diff.txt already exists
 python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-file diff.txt
 ```
 
 ---
 
-## Windows (Git Bash / MSYS2)
+## Windows Payload Transport
 
-MSYS2 automatically converts POSIX-style paths in CLI arguments:
+PowerShell and the Windows native argv layer can rewrite quotes before Python receives them. MSYS2/Git Bash can additionally convert leading `/` and `//` as paths. `safe_edit.py` cannot reconstruct the caller's original intent after that transformation.
 
-| User types | MSYS2 converts to | Effect |
-|------------|-------------------|--------|
-| `--old "//if"` | `--old "/if"` | Double slash collapsed |
-| `--old "/foo"` | `--old "C:/Program Files/Git/foo"` | Single slash expanded |
+Use this order:
 
-**Fix**: Set environment variable before calling safe_edit.py:
+1. Native execution-tool stdin with `--ops-stdin`, `--diff-input-stdin`, or `--text-stdin`.
+2. Unpadded URL-safe UTF-8 Base64 with `--ops-base64`, `--diff-input-base64`, or a field-specific `--*-base64`.
+3. An existing payload file through `--*-file`.
+4. Literal `--old`/`--new`/`--text` only for short, shell-insensitive text.
 
-```bash
-export MSYS2_ARG_CONV_EXCL="*"
-python "SAFE_EDIT_SCRIPT" edit --file F --old "//if (x > 0)" --new "if (x > 0)" --expected-count 1
+For exact replacement, one stdin stream cannot carry both `old` and `new` independently. Use a batch JSON envelope:
+
+```json
+[
+  {
+    "op": "edit",
+    "old": "original text",
+    "new": "replacement text",
+    "expected_count": 1
+  }
+]
 ```
 
-Or use file variants to bypass shell entirely:
+Pass that JSON through `batch --ops-stdin`, or encode the entire JSON document as URL-safe UTF-8 Base64 and pass it through `batch --ops-base64 B64`.
 
-```bash
-python "SAFE_EDIT_SCRIPT" edit --file F --old-file old.txt --new-file new.txt
-```
+Do not put a PowerShell here-string or quoted source literal into the command merely to feed stdin; that still relies on shell parsing. When the execution tool has no native stdin field, use Base64.
 
-safe-edit emits a `"warnings"` field in JSON output when MSYS2 path corruption is detected.
+For short literal arguments under MSYS2, `MSYS2_ARG_CONV_EXCL="*"` remains a fallback. `safe-edit` emits a `"warnings"` field in JSON output when it detects likely MSYS2 path corruption.
 
 ---
 

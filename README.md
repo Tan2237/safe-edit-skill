@@ -14,13 +14,13 @@
 - 支持手动指定 `shift-jis`、`big5`、`latin-1`、`utf-16-le`、`utf-16-be`。
 - 自动检测并保留 CRLF、LF、CR 行尾风格。
 - 支持字面量替换、显式正则替换、插入行、文件头追加、文件尾追加、删除行、替换行范围、删除行范围。
-- 支持 `--old-file`、`--new-file`、`--text-file`、stdin 等方式传入大段/多行内容。
+- 支持 stdin、URL-safe/标准 Base64 和文件三类载荷通道，避免 Windows shell 改写多行代码与特殊字符。
 - 支持 `--dry-run --diff` 预览、`--expected-count` 防误匹配、`--backup` 备份、JSON batch 一次读写多步编辑。
 - **结构化 JSON 错误输出**：`--json` 模式下错误也输出 JSON，包含错误类型分类、根因分析、最近匹配、Agent 恢复协议（`failureClass`、`recommendedAction`、`retryStrategy`）。
 - **匹配级别报告**：成功时在 operations 中报告 `matchStrategy`（exact、ignore-eol、ignore-indent、fuzzy 等）。
 - **自动容错匹配**：`--auto-match` 精确匹配失败后自动尝试宽松匹配（ignore-eol → ignore-indent → normalize-whitespace），`--fuzzy` 启用模糊匹配。
 - **上下文消歧**：`--context-before` / `--context-after` 辅助多匹配消歧。
-- **SEARCH/REPLACE 输入格式**：`--diff-input` / `--diff-input-file` 支持 Agent 友好的 diff 格式输入。
+- **SEARCH/REPLACE 输入格式**：`--diff-input`、`--diff-input-file`、`--diff-input-stdin`、`--diff-input-base64` 支持 Agent 友好的 diff 格式输入。
 - 支持备份目录/后缀自定义，以及 stale lock 自动清理。
 - 同目录临时文件写入、原子替换、写后字节校验，并带有协作锁以降低并发写入风险。
 - 如果变换后的字节和原文件完全一致，默认跳过写入，避免无意义的 mtime 和 Git 状态变化。
@@ -303,72 +303,88 @@ Differences:
 - indentation uses tabs instead of spaces
 ```
 
-## Stdin 和跨平台传参
+## 安全载荷传输与跨平台传参
 
-不同 shell 对特殊字符的处理不同，safe-edit 提供多种传参方式避免转义问题。
+PowerShell、Windows 原生命令行和 MSYS2 都可能在 Python 收到参数前改写引号、反斜杠或路径形态。此时即使 safe-edit 报告成功，也只能证明“实际收到的载荷”被安全写入，不能证明它仍与调用者的原始文本一致。
+
+推荐顺序：
+
+1. 调用工具提供原生 stdin 时，使用 `--ops-stdin`、`--diff-input-stdin` 或 `--text-stdin`。
+2. 没有原生 stdin 时，使用 URL-safe UTF-8 Base64：`--ops-base64`、`--diff-input-base64` 或字段级 `--*-base64`。
+3. 载荷文件已经存在时，使用 `--ops-file`、`--old-file`、`--new-file` 或 `--text-file`。
+4. 仅对短且不含 shell 敏感字符的内容使用字面 `--old`、`--new`、`--text`。
 
 ### Stdin 方式
 
-通过管道传入内容，避免 shell 解析特殊字符：
+一个 stdin 流只能供一个 `--*-stdin` 参数读取。只有一个文本字段时可以直接使用：
 
-**PowerShell (Windows):**
-```powershell
-# 避免 % 符号问题
-"foo bar" | py -3 safe_edit.py edit --file a.cpp --old-stdin --new "new text"
-
-# 从文件读取
-Get-Content old.txt | py -3 safe_edit.py edit --file a.cpp --old-stdin --new-file new.txt
-```
-
-**CMD (Windows):**
-```cmd
-type old.txt | py -3 safe_edit.py edit --file a.cpp --old-stdin --new-file new.txt
-```
-
-**Bash (Linux/macOS):**
 ```bash
-cat old.txt | python3 safe_edit.py edit --file a.cpp --old-stdin --new-file new.txt
+python safe_edit.py replace-lines --file a.cpp --start 10 --end 20 --text-stdin
+python safe_edit.py edit --file a.cpp --diff-input-stdin
 ```
+
+精确替换同时需要 `old` 和 `new`，应把整个操作封装为 JSON，交给：
+
+```bash
+python safe_edit.py batch --file a.cpp --ops-stdin
+```
+
+JSON 示例：
+
+```json
+[
+  {
+    "op": "edit",
+    "old": "frozenset({\"old\", \"%\"})",
+    "new": "frozenset({\"new\", \"!\"})",
+    "expected_count": 1
+  }
+]
+```
+
+应优先通过执行工具的 stdin 字段传入 JSON，而不是把源码先放进 PowerShell here-string。若载荷已经存在于文件中，也可通过管道读取；这不用于绕过载荷文件本身的创建规则：
+
+```powershell
+Get-Content -Raw ops.json | py -3 safe_edit.py batch --file a.cpp --ops-stdin
+```
+
+```bash
+cat ops.json | python3 safe_edit.py batch --file a.cpp --ops-stdin
+```
+
+### Base64 方式
+
+所有 Base64 参数都将解码为严格 UTF-8。支持标准 Base64 和 URL-safe Base64，也支持省略末尾 `=`；Windows/MSYS2 下推荐无填充的 URL-safe 形式。
+
+```bash
+python safe_edit.py batch --file a.cpp --ops-base64 B64
+python safe_edit.py edit --file a.cpp --diff-input-base64 B64
+python safe_edit.py replace-lines --file a.cpp --start 10 --end 20 --text-base64 B64
+python safe_edit.py edit --file a.cpp --old-base64 OLD_B64 --new-base64 NEW_B64 --expected-count 1
+```
+
+字段级入口包括：
+
+- `--old-base64` / `--new-base64`
+- `--pattern-base64` / `--replacement-base64`
+- `--text-base64`
+- `--diff-input-base64`
+- `--ops-base64`
 
 ### 文件方式
 
-多行或大段内容推荐用文件传参：
+`--*-file` 适合已经存在的 UTF-8 载荷文件：
 
 ```bash
 python safe_edit.py edit --file a.cpp --old-file old.txt --new-file new.txt
 python safe_edit.py insert --file a.cpp --line 5 --text-file block.txt
 ```
 
-### 特殊字符问题
+不要为了使用文件参数而通过 shell 重定向或临时脚本创建载荷文件。参数文件默认按 UTF-8 读取；需要时使用 `--arg-encoding` 覆盖。
 
-| Shell | 问题字符 | 示例 | 解决方案 |
-|-------|---------|------|---------|
-| PowerShell | `` ` `` `$` `%` | `"foo %VAR%"` | 用 stdin 或文件 |
-| CMD | `%` `^` | `%PATH%` | 用 stdin 或文件 |
-| Bash | `$` `` ` `` `\` | `$HOME` | 用单引号或文件 |
-
-### PowerShell 编码问题
-
-如果中文乱码，设置输出编码：
-
-```powershell
-$OutputEncoding = [System.Text.Encoding]::UTF8
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-Get-Content old.txt | py -3 safe_edit.py edit --file a.cpp --old-stdin --new-file new.txt
-```
 ## 多行内容
 
-命令行参数不适合塞大段代码。推荐用文件或 stdin：
-
-```bash
-python safe_edit.py edit --file a.cpp --old-file old.txt --new-file new.txt
-python safe_edit.py insert --file a.cpp --line 5 --text-file block.txt
-python safe_edit.py prepend --file a.cpp --text-file header.txt
-python safe_edit.py append --file a.cpp --text-file footer.txt
-python safe_edit.py regex --file a.cpp --pattern-file pattern.txt --replacement-file replacement.txt
-```
-
-参数文件默认按 UTF-8 读取；需要时使用 `--arg-encoding` 覆盖。
+多行、超过 100 个字符，或包含 `"`、`'`、`%`、`!`、反引号、反斜杠等字符时，不要使用字面 argv。优先使用完整的 `batch --ops-stdin` JSON；无原生 stdin 时使用 `batch --ops-base64`。完成后仍应重新读取，并按文件类型执行编译或测试。
 
 ## 正则替换
 
@@ -402,6 +418,13 @@ python safe_edit.py regex \
 执行：
 
 ```bash
+# 原生 stdin
+python safe_edit.py batch --file path/to/file --ops-stdin
+
+# URL-safe UTF-8 Base64
+python safe_edit.py batch --file path/to/file --ops-base64 B64
+
+# 已存在的 JSON 文件
 python safe_edit.py batch --file path/to/file --ops-file ops.json
 ```
 
@@ -447,6 +470,12 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 | `--context-after T` | 匹配位置后面必须包含的文本 |
 | `--diff-input TEXT` | SEARCH/REPLACE 格式输入 |
 | `--diff-input-file PATH` | 从文件读取 SEARCH/REPLACE 格式 |
+| `--diff-input-stdin` | 从 stdin 读取 SEARCH/REPLACE 格式 |
+| `--diff-input-base64 B64` | 从 Base64 UTF-8 读取 SEARCH/REPLACE 格式 |
+| `--old-base64 B64` / `--new-base64 B64` | Base64 UTF-8 字面替换载荷 |
+| `--pattern-base64 B64` / `--replacement-base64 B64` | Base64 UTF-8 正则载荷 |
+| `--text-base64 B64` | Base64 UTF-8 插入或行替换载荷 |
+| `--ops-stdin` / `--ops-base64 B64` | 从 stdin 或 Base64 UTF-8 读取 batch JSON |
 | `--anchor-pattern` | 锚点定位模式 |
 | `--offset-start` | 起始偏移（如 +2、-1） |
 | `--offset-end` | 结束偏移 |
