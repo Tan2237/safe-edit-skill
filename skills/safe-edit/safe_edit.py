@@ -7,6 +7,7 @@ import argparse
 import base64
 import binascii
 import codecs
+import contextlib
 import difflib
 import errno
 import hashlib
@@ -2731,13 +2732,228 @@ def command_to_operations(args: argparse.Namespace, warnings: Optional[List[str]
     return resolved, base_dir
 
 
+def load_request_payload(args: argparse.Namespace) -> Dict[str, Any]:
+    sources = [
+        args.request_file is not None,
+        args.request_base64 is not None,
+        args.request_stdin,
+    ].count(True)
+    if sources != 1:
+        fail(
+            "transaction requires exactly one of --request-file, "
+            "--request-base64, or --request-stdin"
+        )
+    if args.request_file is not None:
+        raw = read_argument_file(args.request_file, args.arg_encoding)
+    elif args.request_base64 is not None:
+        raw = decode_base64_text(args.request_base64, "request-base64")
+    else:
+        raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        fail(f"invalid transaction JSON: {exc}")
+    if isinstance(payload, list):
+        payload = {"files": payload}
+    if not isinstance(payload, dict):
+        fail("transaction JSON must be an object or a list of file requests")
+    if "files" not in payload and "file" in payload:
+        payload = {"files": [payload]}
+    return payload
+
+
+def request_item_args(
+    parent: argparse.Namespace,
+    item: Dict[str, Any],
+    dry_run: bool,
+) -> argparse.Namespace:
+    if not isinstance(item, dict):
+        fail("each transaction file request must be an object")
+    file_value = item.get("file")
+    if not isinstance(file_value, str) or not file_value:
+        fail("each transaction file request requires a non-empty file")
+    action = str(item.get("action", item.get("command", ""))).replace("_", "-")
+    has_text = "text" in item
+    has_operations = "operations" in item or "ops" in item
+    if has_text and has_operations:
+        fail(f"transaction request for {file_value} mixes text and operations")
+    if not action:
+        if has_text:
+            action = "create"
+        elif has_operations:
+            action = "edit"
+    child = argparse.Namespace(**vars(parent))
+    child.file = file_value
+    child.dry_run = dry_run
+    child.no_lock = True
+    child.interactive = False
+    child.backup = False
+    child.backup_dir = None
+    child.follow_symlink = bool(item.get("followSymlink", False))
+    child.expected_sha256 = item.get("expectedSha256")
+    child.encoding = item.get("inputEncoding", "auto")
+    child.to_encoding = item.get("encoding", item.get("toEncoding", "preserve"))
+    child.to_line_ending = item.get("lineEnding", "preserve")
+    child.final_newline = item.get("finalNewline", "preserve")
+    child.trim_trailing_whitespace = bool(item.get("trimTrailingWhitespace", False))
+    child.force_write = bool(item.get("forceWrite", False))
+    child.allow_nul = bool(item.get("allowNul", False))
+    child.diff = bool(item.get("diff", False))
+
+    if action == "create":
+        text_value = item.get("text")
+        if not isinstance(text_value, str):
+            fail(f"create request for {file_value} requires string text")
+        child.command = "create"
+        child.text = text_value
+        child.text_file = None
+        child.text_base64 = None
+        child.text_stdin = False
+    elif action in ("edit", "batch"):
+        operations = item.get("operations", item.get("ops"))
+        if not isinstance(operations, list) or not operations:
+            fail(f"edit request for {file_value} requires non-empty operations")
+        expected = child.expected_sha256
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+            fail(f"edit request for {file_value} requires expectedSha256 from stat")
+        child.command = "batch"
+        child.ops = json.dumps(operations, ensure_ascii=False)
+        child.ops_file = None
+        child.ops_base64 = None
+        child.ops_stdin = False
+    else:
+        fail(f"unsupported transaction action for {file_value}: {action or '<missing>'}")
+    return child
+
+
+def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
+    target = args.file or str(Path.cwd() / ".safe-edit-preflight-target")
+    capability = check_fs_capability(target)
+    return {
+        "ok": True,
+        "command": "preflight",
+        "file": args.file,
+        "pythonExecutable": sys.executable,
+        "pythonVersion": ".".join(str(part) for part in sys.version_info[:3]),
+        "stdinReadable": sys.stdin is not None and not sys.stdin.closed,
+        "stdinIsTty": bool(sys.stdin.isatty()) if sys.stdin is not None else False,
+        "base64Available": True,
+        "requestTransports": ["stdin", "base64", "file"],
+        "directoryWritable": capability["directoryWritable"],
+        "canCreateTemp": capability["canWriteTmp"],
+        "canCreateLock": capability["canCreateLock"],
+        "executionMode": capability["executionMode"],
+        "suggestions": capability["suggestions"],
+        "dryRun": True,
+        "written": False,
+        "skipped": True,
+    }
+
+
+def run_transaction(args: argparse.Namespace) -> Dict[str, Any]:
+    payload = load_request_payload(args)
+    items = payload.get("files")
+    if not isinstance(items, list) or not items:
+        fail("transaction request requires a non-empty files list")
+
+    children = [request_item_args(args, item, True) for item in items]
+    identities: List[str] = []
+    for child in children:
+        identity = os.path.normcase(os.path.abspath(child.file))
+        if identity in identities:
+            fail(f"transaction contains duplicate file: {child.file}")
+        identities.append(identity)
+
+    lock_paths = [Path(child.file) for child in children]
+    lock_paths.sort(key=lambda path: os.path.normcase(os.path.abspath(str(path))))
+    originals: Dict[str, Tuple[bool, bytes]] = {}
+    previews: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []
+
+    lock_stack = contextlib.ExitStack()
+    try:
+        if not args.no_lock and not args.dry_run:
+            for path in lock_paths:
+                lock_stack.enter_context(
+                    FileLock(path, args.lock_timeout, args.lock_stale_seconds)
+                )
+        for child in children:
+            path = Path(child.file)
+            exists = path.exists()
+            originals[os.path.normcase(os.path.abspath(child.file))] = (
+                exists,
+                read_target(path, args.max_bytes) if exists else b"",
+            )
+            previews.append(run(child))
+
+        if args.dry_run:
+            return {
+                "ok": True,
+                "command": "transaction",
+                "file": None,
+                "files": previews,
+                "fileCount": len(previews),
+                "dryRun": True,
+                "written": False,
+                "rolledBack": False,
+                "atomicity": "prevalidated",
+            }
+
+        for child in children:
+            actual = argparse.Namespace(**vars(child))
+            actual.dry_run = False
+            results.append(run(actual))
+    except Exception as exc:
+        rollback_errors: List[str] = []
+        for child in reversed(children):
+            key = os.path.normcase(os.path.abspath(child.file))
+            existed, original = originals[key]
+            path = Path(child.file)
+            try:
+                if existed:
+                    if not path.exists():
+                        fail("target disappeared during transaction")
+                    if path.read_bytes() != original:
+                        atomic_replace(path, original, False, None, ".bak")
+                elif path.exists():
+                    path.unlink()
+                    fsync_directory(path.parent)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"{child.file}: {rollback_exc}")
+        if rollback_errors:
+            fail(
+                f"transaction failed ({exc}); rollback also failed: "
+                + "; ".join(rollback_errors)
+            )
+        if isinstance(exc, SafeEditError):
+            fail(f"transaction rolled back: {exc}")
+        fail(f"transaction rolled back after unexpected error: {exc}")
+    finally:
+        lock_stack.close()
+
+    return {
+        "ok": True,
+        "command": "transaction",
+        "file": None,
+        "files": results,
+        "fileCount": len(results),
+        "dryRun": False,
+        "written": any(item.get("written") for item in results),
+        "rolledBack": False,
+        "atomicity": "prevalidated-with-rollback",
+        "crashAtomic": False,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Safely edit one text file.")
+    parser = argparse.ArgumentParser(description="Safely edit text files.")
     parser.add_argument(
         "command",
         choices=(
             "inspect",
             "stat",
+            "preflight",
+            "transaction",
             "create",
             "convert",
             "edit",
@@ -2752,11 +2968,11 @@ def build_parser() -> argparse.ArgumentParser:
             "remove-file",
         ),
     )
-    parser.add_argument("--file", required=True)
+    parser.add_argument("--file")
     parser.add_argument("--workspace-root",
                         help="required workspace boundary for remove-file")
     parser.add_argument("--expected-sha256",
-                        help="required lowercase SHA-256 reported by stat before remove-file")
+                        help="optional SHA-256 guard; required by remove-file and transaction edits")
     parser.add_argument(
         "--encoding",
         default="auto",
@@ -2862,6 +3078,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--ops-file')
     parser.add_argument('--ops-base64', help='URL-safe or standard Base64 containing UTF-8 batch JSON')
     parser.add_argument('--ops-stdin', action='store_true')
+    parser.add_argument('--request-file')
+    parser.add_argument('--request-base64',
+                        help='URL-safe or standard Base64 containing UTF-8 transaction JSON')
+    parser.add_argument('--request-stdin', action='store_true')
     return parser
 
 
@@ -3059,6 +3279,13 @@ def run_create(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def run(args: argparse.Namespace) -> Dict[str, Any]:
+    if args.command == "preflight":
+        return run_preflight(args)
+    if args.command == "transaction":
+        return run_transaction(args)
+    if not args.file:
+        fail(f"{args.command} requires --file")
+
     # Validate --interactive constraints
     if getattr(args, 'interactive', False):
         if args.dry_run:
@@ -3074,11 +3301,31 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     path = resolve_target_path(args.file, args.follow_symlink)
     if args.command == "inspect":
         original = read_target(path, args.max_bytes)
+        if args.expected_sha256:
+            expected = args.expected_sha256.lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", expected):
+                fail("--expected-sha256 must contain exactly 64 hexadecimal characters")
+            actual = hashlib.sha256(original).hexdigest()
+            if actual != expected:
+                fail(
+                    "SHA-256 mismatch: "
+                    f"expected {expected}, actual {actual}; run stat again"
+                )
         encoding = detect_encoding(original, args.encoding)
         text = strict_decode(original, encoding)
         return inspect_target(path, original, encoding, text)
     if args.command == "stat":
         original = read_target(path, args.max_bytes)
+        if args.expected_sha256:
+            expected = args.expected_sha256.lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", expected):
+                fail("--expected-sha256 must contain exactly 64 hexadecimal characters")
+            actual = hashlib.sha256(original).hexdigest()
+            if actual != expected:
+                fail(
+                    "SHA-256 mismatch: "
+                    f"expected {expected}, actual {actual}; run stat again"
+                )
         encoding = detect_encoding(original, args.encoding)
         text = strict_decode(original, encoding)
         return stat_target(path, original, encoding, text)
@@ -3109,6 +3356,16 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     with lock_context:
         original = read_target(path, args.max_bytes)
+        if args.expected_sha256:
+            expected = args.expected_sha256.lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", expected):
+                fail("--expected-sha256 must contain exactly 64 hexadecimal characters")
+            actual = hashlib.sha256(original).hexdigest()
+            if actual != expected:
+                fail(
+                    "SHA-256 mismatch: "
+                    f"expected {expected}, actual {actual}; run stat again"
+                )
         encoding = detect_encoding(original, args.encoding)
         text = strict_decode(original, encoding)
         if "\x00" in text and not args.allow_nul:
@@ -3210,6 +3467,20 @@ def emit_summary(summary: Dict[str, Any], as_json: bool) -> None:
     if "diff" in summary and summary["diff"]:
         print(summary["diff"])
     note = "DRY-RUN " if summary["dryRun"] else ""
+    if summary.get("command") == "preflight":
+        print(
+            f"Preflight: python={summary['pythonVersion']} "
+            f"mode={summary['executionMode']} stdin={summary['stdinReadable']} "
+            f"base64={summary['base64Available']}"
+        )
+        return
+    if summary.get("command") == "transaction":
+        note = "DRY-RUN " if summary["dryRun"] else ""
+        print(
+            f"{note}Transaction: files={summary['fileCount']} "
+            f"written={summary['written']} atomicity={summary['atomicity']}"
+        )
+        return
     if summary.get("command") == "stat":
         # Concise output for AI agents
         size_kb = summary['sizeBytes'] / 1024

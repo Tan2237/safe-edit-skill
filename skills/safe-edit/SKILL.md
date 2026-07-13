@@ -16,8 +16,9 @@ description: |
     4. Follow the returned strategy for edits; use remove-file only for an
        explicitly requested deletion.
 
-  For a required new file, use the controlled create command. It refuses
-  existing targets and requires explicit encoding and line-ending choices.
+  For a required new file, use controlled create. For related edits spanning
+  multiple files, use the structured transaction command so every request is
+  prevalidated and failures roll back writes already made.
 
   Re-run stat only after: file recreation, a failed safe_edit.py invocation that may have reached the write phase, or an uncertain execution outcome.
 ---
@@ -92,6 +93,38 @@ python "SAFE_EDIT_SCRIPT" create --file F --to-encoding utf-8 --to-line-ending l
 
 The target must not exist and its parent directory must already exist. `create` never overwrites and never creates parent directories. After creation, run `stat` before any later edit.
 
+For one new file, the structured request may be exactly
+`{"file":"new.txt","text":"...","encoding":"utf-8","lineEnding":"lf"}`;
+`action: "create"` is inferred. For related edits, use a `files` list:
+
+```json
+{
+  "files": [
+    {
+      "file": "existing.py",
+      "action": "edit",
+      "expectedSha256": "SHA256_FROM_STAT",
+      "operations": [
+        {"op": "edit", "old": "before", "new": "after", "expected_count": 1}
+      ]
+    },
+    {
+      "file": "new.py",
+      "action": "create",
+      "text": "print('ready')\n",
+      "encoding": "utf-8",
+      "lineEnding": "lf"
+    }
+  ]
+}
+```
+
+Pass the object through native structured tool arguments when the host exposes
+them. Otherwise use `transaction --request-stdin`; fall back to an existing
+request file, then URL-safe UTF-8 Base64. The command locks targets in stable
+order, prevalidates every file, and rolls back completed writes on failure.
+It does not claim crash-atomicity across multiple files.
+
 The stat result is authoritative for the lifetime of the file. Re-run it only when the file is recreated, a failed `safe_edit.py` invocation may have reached the write phase, or the execution outcome is uncertain. Do not re-run it when the shell/tool rejects the command before process start, or when argument parsing fails before target access.
 
 The selected editStrategy is locked for the lifetime of the file. Do NOT switch to another edit mechanism after a command failure. Continue using the cached editStrategy.
@@ -99,7 +132,10 @@ The selected editStrategy is locked for the lifetime of the file. Do NOT switch 
 - `editStrategy: "safe-edit"` → ALL edits on this file MUST use `safe_edit.py`. Do not switch back to built-in Edit.
 - `editStrategy: "edit-tool"` → Use built-in Edit tool for this file.
 
-On Windows, `py -3` works when `python` is not on PATH.
+Resolve the Python executable before editing: prefer a runtime path supplied by
+the host, then `python`, then `py -3` on Windows. Run `preflight --json`
+before a related edit set or when runtime/transport support is uncertain. If no
+Python runtime can execute the script, stop before modifying any file.
 
 ---
 
@@ -108,8 +144,18 @@ On Windows, `py -3` works when `python` is not on PATH.
 These are the ONLY permitted invocations. Any command not listed here is prohibited.
 
 ```bash
+# Check runtime, stdin/Base64 support, temp storage, locks, and target writability
+python "SAFE_EDIT_SCRIPT" preflight --json
+python "SAFE_EDIT_SCRIPT" preflight --file F --json
+
 # Before editing or removing any existing file (mandatory first step)
 python "SAFE_EDIT_SCRIPT" stat --file F --json
+
+# Prevalidate and apply a related multi-file request with rollback on failure
+python "SAFE_EDIT_SCRIPT" transaction --request-stdin --json
+python "SAFE_EDIT_SCRIPT" transaction --request-file EXISTING_JSON --json
+python "SAFE_EDIT_SCRIPT" transaction --request-base64 B64 --json
+python "SAFE_EDIT_SCRIPT" transaction --request-stdin --dry-run --json
 
 # Remove one explicitly requested regular file inside a workspace root
 python "SAFE_EDIT_SCRIPT" remove-file --file F --workspace-root ROOT --expected-sha256 SHA256
@@ -265,7 +311,9 @@ regex                       ← HIGHEST EDIT RISK
 
 8. **Use `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
 
-9. **Re-read and validate after edits** — successful execution confirms only the payload received by `safe_edit.py`. For literal argv, re-read or compile/test to verify intent. Base64/stdin transports substantially reduce this risk.
+9. **Use transactions for related files** — obtain `stat` hashes for existing files, require `expectedSha256` on every edit request, and include controlled creates in the same request. Treat `atomicity: prevalidated-with-rollback` as process-level rollback, not crash-atomicity.
+
+10. **Re-read and validate after edits** — successful execution confirms only the payload received by `safe_edit.py`. For literal argv, re-read or compile/test to verify intent. Base64/stdin transports substantially reduce this risk.
 
 ---
 
@@ -348,10 +396,11 @@ PowerShell and the Windows native argv layer can rewrite quotes before Python re
 
 Use this order:
 
-1. Native execution-tool stdin with `--ops-stdin`, `--diff-input-stdin`, or `--text-stdin`.
-2. Unpadded URL-safe UTF-8 Base64 with `--ops-base64`, `--diff-input-base64`, or a field-specific `--*-base64`.
-3. An existing payload file through `--*-file`.
-4. Literal `--old`/`--new`/`--text` only for short, shell-insensitive text.
+1. Native structured safe-edit tool arguments when the host exposes them.
+2. Native execution-tool stdin with `--request-stdin`, `--ops-stdin`, `--diff-input-stdin`, or `--text-stdin`.
+3. An existing payload file through `--request-file` or another `--*-file`.
+4. Unpadded URL-safe UTF-8 Base64 with `--request-base64`, `--ops-base64`, `--diff-input-base64`, or a field-specific `--*-base64`.
+5. Literal `--old`/`--new`/`--text` only for short, shell-insensitive text.
 
 For exact replacement, one stdin stream cannot carry both `old` and `new` independently. Use a batch JSON envelope:
 

@@ -4978,5 +4978,125 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertEqual(dst.read_bytes(), b"old\n")
 
 
+    def test_preflight_reports_runtime_and_transports(self):
+        result = self.run_tool("preflight", "--json")
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["base64Available"])
+        self.assertIn("stdin", payload["requestTransports"])
+        self.assertTrue(payload["pythonExecutable"])
+
+    def test_transaction_edits_and_creates_as_one_request(self):
+        existing = self.tmpdir / "existing-transaction.txt"
+        created = self.tmpdir / "created-transaction.txt"
+        request = self.tmpdir / "transaction.json"
+        existing.write_bytes(b"alpha\n")
+        request.write_text(
+            json.dumps(
+                {
+                    "files": [
+                        {
+                            "file": str(existing),
+                            "action": "edit",
+                            "expectedSha256": hashlib.sha256(b"alpha\n").hexdigest(),
+                            "operations": [
+                                {
+                                    "op": "edit",
+                                    "old": "alpha",
+                                    "new": "beta",
+                                    "expected_count": 1,
+                                }
+                            ],
+                        },
+                        {
+                            "file": str(created),
+                            "action": "create",
+                            "text": "new\nfile\n",
+                            "encoding": "utf-8",
+                            "lineEnding": "lf",
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = self.run_tool(
+            "transaction", "--request-file", request, "--json"
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["fileCount"], 2)
+        self.assertEqual(payload["atomicity"], "prevalidated-with-rollback")
+        self.assertFalse(payload["crashAtomic"])
+        self.assertEqual(existing.read_bytes(), b"beta\n")
+        self.assertEqual(created.read_bytes(), b"new\nfile\n")
+
+    def test_transaction_request_base64_dry_run_does_not_write(self):
+        created = self.tmpdir / "base64-transaction.txt"
+        request = json.dumps(
+            {
+                "file": str(created),
+                "text": "content",
+                "encoding": "utf-8",
+                "lineEnding": "lf",
+            }
+        )
+        encoded = base64.urlsafe_b64encode(request.encode("utf-8")).decode("ascii")
+        result = self.run_tool(
+            "transaction", "--request-base64", encoded,
+            "--dry-run", "--json",
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["atomicity"], "prevalidated")
+        self.assertFalse(payload["written"])
+        self.assertFalse(created.exists())
+
+    def test_transaction_rolls_back_files_written_before_runtime_failure(self):
+        m = self._import_safe_edit()
+        first = self.tmpdir / "first-rollback.txt"
+        second = self.tmpdir / "second-rollback.txt"
+        request = self.tmpdir / "rollback-transaction.json"
+        request.write_text(
+            json.dumps(
+                {
+                    "files": [
+                        {
+                            "file": str(first),
+                            "action": "create",
+                            "text": "first",
+                            "encoding": "utf-8",
+                            "lineEnding": "lf",
+                        },
+                        {
+                            "file": str(second),
+                            "action": "create",
+                            "text": "second",
+                            "encoding": "utf-8",
+                            "lineEnding": "lf",
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = m.build_parser().parse_args(
+            ["transaction", "--request-file", str(request)]
+        )
+        real_create = m.exclusive_create
+        calls = {"count": 0}
+
+        def fail_second(path, data):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise m.SafeEditError("injected write failure")
+            return real_create(path, data)
+
+        with patch.object(m, "exclusive_create", side_effect=fail_second):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run(args)
+        self.assertIn("transaction rolled back", str(ctx.exception))
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

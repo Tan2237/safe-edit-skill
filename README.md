@@ -9,6 +9,8 @@
 - 单文件 Python 标准库实现，Windows/Linux/macOS 通用。
 - `inspect` 只检查不写入，可输出编码、BOM、行尾统计、文件大小、行数、NUL 字符和权限位。
 - `stat` 简洁摘要，包含编码、BOM、行尾统计、文件大小、行数，以及推荐的编辑策略（`editStrategy`）。
+- `preflight` 在写入前报告 Python、stdin、Base64、临时目录、锁和目标目录能力。
+- `transaction` 接收结构化多文件请求，先全量预演，再按稳定顺序加锁写入；失败时回滚已完成的写入。
 - `create` 受控新建任务成果文件：拒绝覆盖、要求父目录已存在，并强制显式选择编码和行尾。
 - `convert` 显式转换编码、行尾、最终换行，或清理尾随空白；普通编辑默认仍保留原格式。
 - 自动检测并保留 `utf-8`、`utf-8-bom`、`gbk`、UTF-16 BOM，以及清晰 NUL 模式下的无 BOM UTF-16。
@@ -62,11 +64,15 @@ skills/safe-edit/
 
 ## Recommended Workflow
 
-编辑文件前，先检查文件属性：
+先确认运行时和传输能力，再检查文件属性：
 
 ```bash
+python safe_edit.py preflight --file foo.cpp --json
 python safe_edit.py stat --file foo.cpp --json
 ```
+
+如果 `python` 和 `py -3` 都不可用，应优先使用宿主提供的 Python
+运行时绝对路径；仍无法执行时，在修改任何文件前停止。
 
 返回的 `editStrategy` 告诉你该用什么工具编辑这个文件：
 
@@ -82,7 +88,9 @@ python safe_edit.py stat --file foo.cpp --json
 直接运行 Python 脚本即可。Windows 上如果 `python` 不在 `PATH`，可以用 `py -3` 替代。
 
 ```bash
+python safe_edit.py preflight --json
 python safe_edit.py stat --file path/to/file --json
+python safe_edit.py transaction --request-stdin --json
 python safe_edit.py create --file path/to/new.txt --to-encoding utf-8 --to-line-ending lf --text-base64 B64
 python safe_edit.py remove-file --file path/to/obsolete.txt --workspace-root path/to/workspace --expected-sha256 SHA256
 python safe_edit.py convert --file path/to/file --to-encoding utf-8-bom --to-line-ending crlf --final-newline ensure
@@ -485,6 +493,56 @@ python safe_edit.py batch --file path/to/file --ops-file ops.json
 
 `*_file` 相对路径会按 `ops.json` 所在目录解析。
 
+## 结构化多文件事务
+
+`transaction` 用一个 JSON 对象承载文件路径、正文、编码、行尾和编辑操作，
+避免每个文本字段分别做 shell 转义或 Base64。单个新文件可直接传入：
+
+```json
+{"file": "src/new.py", "text": "print('ok')\n", "encoding": "utf-8", "lineEnding": "lf"}
+```
+
+多文件请求使用 `files` 清单：
+
+```json
+{
+  "files": [
+    {
+      "file": "src/index.py",
+      "action": "edit",
+      "expectedSha256": "stat 返回的 SHA-256",
+      "operations": [
+        {"op": "edit", "old": "from .old import x", "new": "from .new import x", "expected_count": 1}
+      ]
+    },
+    {
+      "file": "src/new.py",
+      "action": "create",
+      "text": "def x():\n    return 1\n",
+      "encoding": "utf-8",
+      "lineEnding": "lf"
+    }
+  ]
+}
+```
+
+优先通过宿主的结构化工具参数或原生 stdin 传入：
+
+```bash
+python safe_edit.py transaction --request-stdin --dry-run --json
+python safe_edit.py transaction --request-stdin --json
+```
+
+没有原生 stdin 时，官方 fallback 顺序为：已存在的 JSON 文件
+（`--request-file`），然后 URL-safe UTF-8 Base64
+（`--request-base64`）。已有文件必须提供本轮 `stat` 返回的
+`expectedSha256`；新文件仍拒绝覆盖并要求显式 `encoding` 和
+`lineEnding`。
+
+事务会在持锁后预演全部文件，并在进程内写入失败时恢复原字节、删除本事务已创建
+的文件。返回的 `atomicity` 为 `prevalidated-with-rollback`；
+这不是跨文件系统或断电级原子提交。
+
 ## 编码注意事项
 
 自动检测优先级大致是 BOM、UTF-16 NUL 模式、UTF-8、GBK。纯 ASCII 文件会被视为 UTF-8；如果它属于 GBK、Shift-JIS 或 Big5 项目，并且本次要插入非 ASCII 字符，请显式指定：
@@ -508,10 +566,13 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 
 | 选项 | 说明 |
 | --- | --- |
+| `preflight` | 检查运行时、载荷传输、临时目录、锁和目标目录能力 |
+| `transaction` | 结构化多文件预演、写入和失败回滚 |
 | `create` | 受控创建不存在的任务成果文件；要求显式编码和行尾 |
 | `remove-file` | 受控删除一个明确指定的普通文件；要求工作区根目录和 SHA-256 |
 | `--workspace-root DIR` | `remove-file` 的强制路径边界 |
-| `--expected-sha256 HASH` | 要求待删除文件的当前 SHA-256 与 `stat` 输出一致 |
+| `--expected-sha256 HASH` | 要求当前文件 SHA-256 与 `stat` 输出一致 |
+| `--request-stdin` / `--request-file PATH` / `--request-base64 B64` | 读取 transaction JSON |
 | `--encoding` | 指定目标文件编码，默认 `auto` |
 | `--to-encoding` | 指定输出编码，默认 `preserve` |
 | `--to-line-ending` | 指定输出行尾，支持 `preserve`、`lf`、`crlf`、`cr` |
@@ -562,6 +623,7 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 - 不适合二进制文件和复杂结构化文件格式。
 - 原子替换通常会生成新的文件对象；不保证保留硬链接关系。
 - 仅尽力保留普通权限位，不完整保留 ACL、扩展属性或创建时间。
+- 多文件事务提供全量预演和进程内失败回滚，但不保证进程崩溃、断电或跨文件系统时的全局原子性。
 - Windows 上无法像 Unix 一样 fsync 目录，因此断电级别保证受平台限制。
 
 ## 许可证
