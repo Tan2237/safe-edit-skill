@@ -2320,6 +2320,7 @@ def stat_target(path: Path, original: bytes, encoding: EncodingInfo, text: str) 
         "mixedLineEndings": _mixed_line_endings,
         "sizeBytes": len(original),
         "lineCount": len(records),
+        "sha256": hashlib.sha256(original).hexdigest(),
         "editMode": edit_plan["editMode"],
         "editStrategy": edit_plan["editStrategy"],
         "why": edit_plan["why"],
@@ -2433,6 +2434,31 @@ def _replace_file(src: str, dst: str) -> None:
         return
 
     shutil.move(src, dst)
+
+
+def resolve_remove_path(path_value: str, workspace_root_value: Optional[str]) -> Tuple[Path, Path]:
+    """Resolve a regular file that is contained by an explicit workspace root."""
+    if not workspace_root_value:
+        fail("remove-file requires --workspace-root")
+    root = Path(workspace_root_value).resolve()
+    if not root.exists():
+        fail(f"workspace root not found: {root}")
+    if not root.is_dir():
+        fail(f"workspace root is not a directory: {root}")
+
+    candidate = Path(path_value)
+    if not os.path.lexists(candidate):
+        fail(f"file not found: {candidate}")
+    if candidate.is_symlink():
+        fail("remove-file refuses symbolic links")
+    path = candidate.resolve()
+    if not path.is_file():
+        fail(f"not a regular file: {path}")
+    try:
+        path.relative_to(root)
+    except ValueError:
+        fail(f"refusing to remove file outside workspace root: {path}")
+    return path, root
 
 
 def resolve_create_path(path_value: str) -> Path:
@@ -2723,9 +2749,14 @@ def build_parser() -> argparse.ArgumentParser:
             "replace-lines",
             "delete-lines",
             "batch",
+            "remove-file",
         ),
     )
     parser.add_argument("--file", required=True)
+    parser.add_argument("--workspace-root",
+                        help="required workspace boundary for remove-file")
+    parser.add_argument("--expected-sha256",
+                        help="required lowercase SHA-256 reported by stat before remove-file")
     parser.add_argument(
         "--encoding",
         default="auto",
@@ -2832,6 +2863,98 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--ops-base64', help='URL-safe or standard Base64 containing UTF-8 batch JSON')
     parser.add_argument('--ops-stdin', action='store_true')
     return parser
+
+
+def run_remove_file(args: argparse.Namespace) -> Dict[str, Any]:
+    """Remove one verified regular file inside an explicit workspace root."""
+    if args.follow_symlink:
+        fail("remove-file does not support --follow-symlink")
+    if args.backup or args.backup_dir:
+        fail("remove-file does not support backup options")
+    if args.force_write:
+        fail("--force-write is not applicable to remove-file")
+    if args.diff:
+        fail("--diff is not applicable to remove-file")
+    if args.interactive:
+        fail("remove-file requires explicit task authorization, not --interactive")
+
+    expected = (args.expected_sha256 or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        fail("remove-file requires --expected-sha256 with exactly 64 hexadecimal characters")
+
+    path, root = resolve_remove_path(args.file, args.workspace_root)
+    cap = check_fs_capability(str(path))
+    if not cap["directoryWritable"]:
+        fail(f"target directory is not writable: {path.parent}")
+
+    lock_context = NullLock() if args.no_lock or args.dry_run else FileLock(
+        path, args.lock_timeout, args.lock_stale_seconds
+    )
+    with lock_context:
+        path, root = resolve_remove_path(str(path), str(root))
+        before_stat = path.stat()
+        original = read_target(path, args.max_bytes)
+        after_stat = path.stat()
+        before_identity = (
+            before_stat.st_dev,
+            before_stat.st_ino,
+            before_stat.st_size,
+            before_stat.st_mtime_ns,
+        )
+        after_identity = (
+            after_stat.st_dev,
+            after_stat.st_ino,
+            after_stat.st_size,
+            after_stat.st_mtime_ns,
+        )
+        if before_identity != after_identity:
+            fail("file changed while remove-file was verifying it")
+        actual = hashlib.sha256(original).hexdigest()
+        if actual != expected:
+            fail(
+                "SHA-256 mismatch: "
+                f"expected {expected}, actual {actual}; run stat again before removing"
+            )
+
+        summary: Dict[str, Any] = {
+            "ok": True,
+            "file": str(path),
+            "workspaceRoot": str(root),
+            "command": "remove-file",
+            "sizeBytes": len(original),
+            "expectedSha256": expected,
+            "sha256": actual,
+            "dryRun": args.dry_run,
+            "changed": 1,
+            "operations": [
+                {"index": 1, "op": "remove-file", "changed": 1, "matchStrategy": "sha256"}
+            ],
+            "backup": None,
+            "written": False,
+            "removed": False,
+            "skipped": False,
+            "wouldRemove": True,
+            "wouldChangeBytes": True,
+        }
+        if args.dry_run:
+            return summary
+
+        final_stat = path.stat()
+        final_identity = (
+            final_stat.st_dev,
+            final_stat.st_ino,
+            final_stat.st_size,
+            final_stat.st_mtime_ns,
+        )
+        if final_identity != after_identity:
+            fail("file changed after remove-file verification")
+        path.unlink()
+        fsync_directory(path.parent)
+        if os.path.lexists(path):
+            fail("post-remove verification failed: target still exists")
+        summary["written"] = True
+        summary["removed"] = True
+        return summary
 
 
 def run_create(args: argparse.Namespace) -> Dict[str, Any]:
@@ -2945,6 +3068,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     
     if args.command == "create":
         return run_create(args)
+    if args.command == "remove-file":
+        return run_remove_file(args)
 
     path = resolve_target_path(args.file, args.follow_symlink)
     if args.command == "inspect":
@@ -3096,6 +3221,13 @@ def emit_summary(summary: Dict[str, Any], as_json: bool) -> None:
         print(f"Line endings: {summary['lineEnding'].upper()}")
         print(f"Size: {size_str}")
         print(f"Lines: {summary['lineCount']}")
+        return
+    if summary.get("command") == "remove-file":
+        action = "Would remove" if summary["dryRun"] else "Removed"
+        print(
+            f"{action}: {summary['file']} "
+            f"(bytes={summary['sizeBytes']}, sha256={summary['sha256']})"
+        )
         return
     if summary.get("command") == "inspect":
         print(

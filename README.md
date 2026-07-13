@@ -84,6 +84,7 @@ python safe_edit.py stat --file foo.cpp --json
 ```bash
 python safe_edit.py stat --file path/to/file --json
 python safe_edit.py create --file path/to/new.txt --to-encoding utf-8 --to-line-ending lf --text-base64 B64
+python safe_edit.py remove-file --file path/to/obsolete.txt --workspace-root path/to/workspace --expected-sha256 SHA256
 python safe_edit.py convert --file path/to/file --to-encoding utf-8-bom --to-line-ending crlf --final-newline ensure
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --expected-count 1
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --expected-count 1
@@ -126,6 +127,35 @@ python safe_edit.py create \
 - 创建完成后，如需继续修改该文件，先执行一次 `stat` 并遵循返回的 `editStrategy`。
 
 `create` 只用于任务成果文件，不用于临时脚本、补丁工具或为了绕过载荷传输规则而生成的中转文件。
+
+## 受控删除文件
+
+仅当任务明确要求删除某个文件时使用 `remove-file`。先运行 `stat --json`
+取得当前内容的 SHA-256，再把工作区根目录和哈希一并传入：
+
+```bash
+python safe_edit.py stat --file path/to/obsolete.txt --json
+python safe_edit.py remove-file \
+  --file path/to/obsolete.txt \
+  --workspace-root path/to/workspace \
+  --expected-sha256 SHA256 \
+  --dry-run \
+  --json
+python safe_edit.py remove-file \
+  --file path/to/obsolete.txt \
+  --workspace-root path/to/workspace \
+  --expected-sha256 SHA256
+```
+
+安全约束：
+
+- 一次只能删除一个工作区根目录内的普通文件。
+- 拒绝目录、符号链接、通配符和递归删除。
+- 文件内容或身份在检查后发生变化时拒绝删除。
+- `--expected-sha256` 必须与当前文件内容一致。
+- `--dry-run` 只报告 `wouldRemove`，不会删除文件。
+- 不支持 `--follow-symlink`、`--backup`、`--diff` 或 `--interactive`。
+- 删除仍受 `--max-bytes` 限制；大文件需要显式提高限制。
 
 ## 自动容错匹配
 
@@ -479,6 +509,9 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 | 选项 | 说明 |
 | --- | --- |
 | `create` | 受控创建不存在的任务成果文件；要求显式编码和行尾 |
+| `remove-file` | 受控删除一个明确指定的普通文件；要求工作区根目录和 SHA-256 |
+| `--workspace-root DIR` | `remove-file` 的强制路径边界 |
+| `--expected-sha256 HASH` | 要求待删除文件的当前 SHA-256 与 `stat` 输出一致 |
 | `--encoding` | 指定目标文件编码，默认 `auto` |
 | `--to-encoding` | 指定输出编码，默认 `preserve` |
 | `--to-line-ending` | 指定输出行尾，支持 `preserve`、`lf`、`crlf`、`cr` |

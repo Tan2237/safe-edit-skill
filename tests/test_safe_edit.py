@@ -1202,6 +1202,144 @@ class SafeEditTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
 
     # =========================================================================
+    # Controlled file removal tests
+    # =========================================================================
+
+    def test_stat_reports_sha256_for_remove_file_precondition(self):
+        path = self.tmpdir / "remove-stat.txt"
+        content = b"remove me\n"
+        path.write_bytes(content)
+
+        result = self.run_tool("stat", "--file", path, "--json")
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(payload["sha256"], hashlib.sha256(content).hexdigest())
+
+    def test_remove_file_removes_verified_regular_file(self):
+        path = self.tmpdir / "remove.txt"
+        content = b"obsolete\r\n"
+        path.write_bytes(content)
+        digest = hashlib.sha256(content).hexdigest()
+
+        result = self.run_tool(
+            "remove-file",
+            "--file", path,
+            "--workspace-root", self.tmpdir,
+            "--expected-sha256", digest,
+            "--json",
+        )
+        payload = json.loads(result.stdout)
+
+        self.assertFalse(path.exists())
+        self.assertTrue(payload["removed"])
+        self.assertTrue(payload["written"])
+        self.assertEqual(payload["sha256"], digest)
+        self.assertEqual(payload["workspaceRoot"], str(self.tmpdir.resolve()))
+
+    def test_remove_file_dry_run_preserves_target(self):
+        path = self.tmpdir / "remove-dry-run.txt"
+        content = b"keep during preview\n"
+        path.write_bytes(content)
+        digest = hashlib.sha256(content).hexdigest()
+
+        result = self.run_tool(
+            "remove-file",
+            "--file", path,
+            "--workspace-root", self.tmpdir,
+            "--expected-sha256", digest,
+            "--dry-run",
+            "--json",
+        )
+        payload = json.loads(result.stdout)
+
+        self.assertTrue(path.exists())
+        self.assertTrue(payload["wouldRemove"])
+        self.assertFalse(payload["removed"])
+        self.assertFalse(payload["written"])
+
+    def test_remove_file_rejects_sha256_mismatch(self):
+        path = self.tmpdir / "remove-hash-mismatch.txt"
+        path.write_bytes(b"current content\n")
+
+        result = self.run_tool(
+            "remove-file",
+            "--file", path,
+            "--workspace-root", self.tmpdir,
+            "--expected-sha256", "0" * 64,
+            "--json",
+            expect=2,
+        )
+        payload = json.loads(result.stdout)
+
+        self.assertTrue(path.exists())
+        self.assertIn("SHA-256 mismatch", payload["error"]["message"])
+
+    def test_remove_file_requires_workspace_root(self):
+        path = self.tmpdir / "remove-no-root.txt"
+        content = b"content\n"
+        path.write_bytes(content)
+
+        result = self.run_tool(
+            "remove-file",
+            "--file", path,
+            "--expected-sha256", hashlib.sha256(content).hexdigest(),
+            expect=2,
+        )
+
+        self.assertTrue(path.exists())
+        self.assertIn("requires --workspace-root", result.stderr)
+
+    def test_remove_file_rejects_file_outside_workspace_root(self):
+        with tempfile.TemporaryDirectory(prefix="safe-edit-outside-") as outside_dir:
+            path = Path(outside_dir) / "outside.txt"
+            content = b"outside\n"
+            path.write_bytes(content)
+
+            result = self.run_tool(
+                "remove-file",
+                "--file", path,
+                "--workspace-root", self.tmpdir,
+                "--expected-sha256", hashlib.sha256(content).hexdigest(),
+                expect=2,
+            )
+
+            self.assertTrue(path.exists())
+            self.assertIn("outside workspace root", result.stderr)
+
+    def test_remove_file_rejects_directory(self):
+        result = self.run_tool(
+            "remove-file",
+            "--file", self.tmpdir,
+            "--workspace-root", self.tmpdir,
+            "--expected-sha256", "0" * 64,
+            expect=2,
+        )
+
+        self.assertTrue(self.tmpdir.exists())
+        self.assertIn("not a regular file", result.stderr)
+
+    def test_remove_file_rejects_symbolic_link(self):
+        if not self._can_create_symlink():
+            self.skipTest("symlink creation not available (requires admin on Windows)")
+
+        target = self.tmpdir / "remove-link-target.txt"
+        target.write_bytes(b"target\n")
+        link = self.tmpdir / "remove-link.txt"
+        link.symlink_to(target)
+
+        result = self.run_tool(
+            "remove-file",
+            "--file", link,
+            "--workspace-root", self.tmpdir,
+            "--expected-sha256", hashlib.sha256(target.read_bytes()).hexdigest(),
+            expect=2,
+        )
+
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(target.exists())
+        self.assertIn("refuses symbolic links", result.stderr)
+
+    # =========================================================================
     # Symlink tests
     # =========================================================================
 

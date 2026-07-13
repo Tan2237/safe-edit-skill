@@ -9,11 +9,12 @@ description: |
 
   Any other editing mechanism is forbidden.
 
-  Before modifying an existing file:
+  Before modifying or removing an existing file:
     1. Resolve SAFE_EDIT_SCRIPT from this SKILL.md location.
     2. Run: python "SAFE_EDIT_SCRIPT" stat --file FILE --json
-    3. Cache editStrategy for that file.
-    4. Follow the returned strategy for ALL edits on that file.
+    3. Cache editStrategy and sha256 for that file.
+    4. Follow the returned strategy for edits; use remove-file only for an
+       explicitly requested deletion.
 
   For a required new file, use the controlled create command. It refuses
   existing targets and requires explicit encoding and line-ending choices.
@@ -73,11 +74,15 @@ Never assume `safe_edit.py` is in the current working directory, never resolve i
 
 ## Required Workflow
 
-Before the first edit of each existing file:
+Before the first edit or removal of each existing file:
 
 ```bash
 python "SAFE_EDIT_SCRIPT" stat --file F --json
 ```
+
+For an explicitly requested file deletion, pass the returned `sha256` and the
+containing workspace root to `remove-file`. Never remove a directory or
+symbolic link.
 
 A new file cannot be inspected first. Create it only when it is a requested task artifact:
 
@@ -103,8 +108,12 @@ On Windows, `py -3` works when `python` is not on PATH.
 These are the ONLY permitted invocations. Any command not listed here is prohibited.
 
 ```bash
-# Before editing any existing file (mandatory first step)
+# Before editing or removing any existing file (mandatory first step)
 python "SAFE_EDIT_SCRIPT" stat --file F --json
+
+# Remove one explicitly requested regular file inside a workspace root
+python "SAFE_EDIT_SCRIPT" remove-file --file F --workspace-root ROOT --expected-sha256 SHA256
+python "SAFE_EDIT_SCRIPT" remove-file --file F --workspace-root ROOT --expected-sha256 SHA256 --dry-run --json
 
 # Create a requested task artifact; target must not exist
 python "SAFE_EDIT_SCRIPT" create --file F --to-encoding ENC --to-line-ending EOL --text-stdin
@@ -181,6 +190,9 @@ python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-base64 B64
 
 ## Command Selection
 
+Handle whole-file removal separately: only an explicit deletion request may select
+`remove-file`, and it must follow the `stat` + workspace-root + SHA-256 workflow.
+
 ```
 Need modification?
 │
@@ -228,8 +240,10 @@ edit                        ← SAFEST
 replace-lines (--anchor-pattern)
 replace-lines (--start/--end)
 insert / delete
-regex                       ← HIGHEST RISK
+regex                       ← HIGHEST EDIT RISK
 ```
+
+`remove-file` is outside the edit hierarchy because it is destructive.
 
 ---
 
@@ -237,19 +251,21 @@ regex                       ← HIGHEST RISK
 
 1. **Create only requested task artifacts** — `create` is for source, test, configuration, documentation, and other deliverables required by the task. It does not authorize temporary scripts, patch tools, or payload files. The target must not exist, the parent directory must already exist, and both `--to-encoding` and `--to-line-ending` are mandatory.
 
-2. **Always add `--expected-count 1` for normal text replacement** — prevents wrong matches from silently succeeding. Do not omit it unless intentionally targeting multiple matches, performing diagnosis, or using commands with their own matching semantics.
+2. **Remove only explicitly requested files** — run `stat --json` immediately before removal, then pass its `sha256` with the exact workspace root. `remove-file` is limited to one regular file, refuses directories and symbolic links, and never accepts recursion or wildcards. Prefer `--dry-run --json` when the target is uncertain.
 
-3. **Do not send complex content through literal argv** — for multiline content, >100 characters, or shell-sensitive characters (`$`, `%`, `!`, `\`, `` ` ``, `'`, `"`), prefer `--ops-stdin` when the execution tool provides native stdin. Otherwise use URL-safe UTF-8 Base64 via `--ops-base64`, `--diff-input-base64`, or `--text-base64`.
+3. **Always add `--expected-count 1` for normal text replacement** — prevents wrong matches from silently succeeding. Do not omit it unless intentionally targeting multiple matches, performing diagnosis, or using commands with their own matching semantics.
 
-4. **Do not bootstrap payload files outside this protocol** — use a `--*-file` option only when that payload file already exists or was created through its own authorized edit workflow. The need for a payload file never authorizes shell redirection or an ad-hoc writer.
+4. **Do not send complex content through literal argv** — for multiline content, >100 characters, or shell-sensitive characters (`$`, `%`, `!`, `\`, `` ` ``, `'`, `"`), prefer `--ops-stdin` when the execution tool provides native stdin. Otherwise use URL-safe UTF-8 Base64 via `--ops-base64`, `--diff-input-base64`, or `--text-base64`.
 
-5. **Use URL-safe Base64 for Windows argv** — unpadded URL-safe Base64 avoids quotes, whitespace, `+`, and `/`. The CLI also accepts padded and standard Base64, and always decodes the result as strict UTF-8.
+5. **Do not bootstrap payload files outside this protocol** — use a `--*-file` option only when that payload file already exists or was created through its own authorized edit workflow. The need for a payload file never authorizes shell redirection or an ad-hoc writer.
 
-6. **Use `--auto-match` for multiline edits** — auto-tries: exact → ignore-eol → ignore-indent → normalize-whitespace.
+6. **Use URL-safe Base64 for Windows argv** — unpadded URL-safe Base64 avoids quotes, whitespace, `+`, and `/`. The CLI also accepts padded and standard Base64, and always decodes the result as strict UTF-8.
 
-7. **Use `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
+7. **Use `--auto-match` for multiline edits** — auto-tries: exact → ignore-eol → ignore-indent → normalize-whitespace.
 
-8. **Re-read and validate after edits** — successful execution confirms only the payload received by `safe_edit.py`. For literal argv, re-read or compile/test to verify intent. Base64/stdin transports substantially reduce this risk.
+8. **Use `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
+
+9. **Re-read and validate after edits** — successful execution confirms only the payload received by `safe_edit.py`. For literal argv, re-read or compile/test to verify intent. Base64/stdin transports substantially reduce this risk.
 
 ---
 
