@@ -9,6 +9,7 @@
 - 单文件 Python 标准库实现，Windows/Linux/macOS 通用。
 - `inspect` 只检查不写入，可输出编码、BOM、行尾统计、文件大小、行数、NUL 字符和权限位。
 - `stat` 简洁摘要，包含编码、BOM、行尾统计、文件大小、行数，以及推荐的编辑策略（`editStrategy`）。
+- `stat-many` 在一个进程内检查多个文件，并按父目录复用文件系统能力探测。
 - `preflight` 在写入前报告 Python、stdin、Base64、临时目录、锁和目标目录能力。
 - `transaction` 接收结构化多文件请求，先全量预演，再按稳定顺序加锁写入；失败时回滚已完成的写入。
 - `create` 受控新建任务成果文件：拒绝覆盖、要求父目录已存在，并强制显式选择编码和行尾。
@@ -71,6 +72,16 @@ python safe_edit.py preflight --file foo.cpp --json
 python safe_edit.py stat --file foo.cpp --json
 ```
 
+多个相关文件优先在一个进程内检查。请求可以是路径字符串或带编码选项的对象：
+
+```json
+{"files":["src/a.py",{"file":"src/b.py","encoding":"utf-8"}]}
+```
+
+```bash
+python safe_edit.py stat-many --request-stdin --json
+```
+
 如果 `python` 和 `py -3` 都不可用，应优先使用宿主提供的 Python
 运行时绝对路径；仍无法执行时，在修改任何文件前停止。
 
@@ -90,6 +101,7 @@ python safe_edit.py stat --file foo.cpp --json
 ```bash
 python safe_edit.py preflight --json
 python safe_edit.py stat --file path/to/file --json
+python safe_edit.py stat-many --request-stdin --json
 python safe_edit.py transaction --request-stdin --json
 python safe_edit.py create --file path/to/new.txt --to-encoding utf-8 --to-line-ending lf --text-base64 B64
 python safe_edit.py remove-file --file path/to/obsolete.txt --workspace-root path/to/workspace --expected-sha256 SHA256
@@ -535,7 +547,7 @@ python safe_edit.py transaction --request-stdin --json
 
 没有原生 stdin 时，官方 fallback 顺序为：已存在的 JSON 文件
 （`--request-file`），然后 URL-safe UTF-8 Base64
-（`--request-base64`）。已有文件必须提供本轮 `stat` 返回的
+（`--request-base64`）。已有文件必须提供本轮 `stat` 或 `stat-many` 返回的
 `expectedSha256`；新文件仍拒绝覆盖并要求显式 `encoding` 和
 `lineEnding`。
 
@@ -569,12 +581,13 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 | 选项 | 说明 |
 | --- | --- |
 | `preflight` | 检查运行时、载荷传输、临时目录、锁和目标目录能力 |
+| `stat-many` | 在一个进程内检查多个文件并返回逐文件摘要和 SHA-256 |
 | `transaction` | 结构化多文件预演、写入和失败回滚 |
 | `create` | 受控创建不存在的任务成果文件；要求显式编码和行尾 |
 | `remove-file` | 受控删除一个明确指定的普通文件；要求工作区根目录和 SHA-256 |
 | `--workspace-root DIR` | `remove-file` 的强制路径边界 |
 | `--expected-sha256 HASH` | 要求当前文件 SHA-256 与 `stat` 输出一致 |
-| `--request-stdin` / `--request-file PATH` / `--request-base64 B64` | 读取 transaction JSON |
+| `--request-stdin` / `--request-file PATH` / `--request-base64 B64` | 读取 `stat-many` 或 transaction JSON |
 | `--encoding` | 指定目标文件编码，默认 `auto` |
 | `--to-encoding` | 指定输出编码，默认 `preserve` |
 | `--to-line-ending` | 指定输出行尾，支持 `preserve`、`lf`、`crlf`、`cr` |
