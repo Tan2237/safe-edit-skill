@@ -40,15 +40,14 @@ def _get_lock_dir():
 
 
 def _get_lock_key(file_path):
-    """Generate lock key based on file identity (matches safe_edit.py logic)."""
-    p = Path(file_path).resolve()
+    """Generate the stable canonical-path lock key used by safe_edit.py."""
     try:
-        stat_info = p.stat()
-        # st_dev:st_ino works on both Unix and Windows
-        identity = f"{stat_info.st_dev}:{stat_info.st_ino}"
-    except OSError:
-        identity = str(p)
-    return hashlib.sha256(identity.encode()).hexdigest()[:32]
+        path = Path(file_path).resolve(strict=False)
+    except (OSError, RuntimeError):
+        path = Path(os.path.abspath(file_path))
+    identity = os.path.normcase(os.path.abspath(str(path)))
+    value = f"path\0{identity}".encode("utf-8", errors="surrogatepass")
+    return hashlib.sha256(value).hexdigest()[:32]
 
 
 def _get_lock_path(target_file):
@@ -5262,6 +5261,269 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertFalse(first.exists())
         self.assertFalse(second.exists())
 
+    def test_path_lock_key_survives_atomic_replace(self):
+        m = self._import_safe_edit()
+        path = self.tmpdir / "stable-path-lock.txt"
+        path.write_bytes(b"before\n")
+        before = m._get_lock_key(str(path))
+        m.atomic_replace(path, b"after\n", False, None, ".bak")
+        self.assertEqual(m._get_lock_key(str(path)), before)
+
+    def test_file_lock_survives_atomic_replace(self):
+        m = self._import_safe_edit()
+        path = self.tmpdir / "held-path-lock.txt"
+        path.write_bytes(b"before\n")
+        with m.FileLock(path, 0.1, 0):
+            m.atomic_replace(path, b"after\n", False, None, ".bak")
+            with self.assertRaises(m.SafeEditError):
+                with m.FileLock(path, 0.05, 0):
+                    pass
+
+    def test_hardlink_alias_uses_inode_lock_and_releases_partial_lock(self):
+        m = self._import_safe_edit()
+        first = self.tmpdir / "hardlink-first.txt"
+        alias = self.tmpdir / "hardlink-alias.txt"
+        first.write_bytes(b"content\n")
+        try:
+            os.link(first, alias)
+        except OSError as exc:
+            self.skipTest(f"hardlinks unavailable: {exc}")
+
+        with m.FileLock(first, 0.1, 0):
+            with self.assertRaises(m.SafeEditError):
+                with m.FileLock(alias, 0.05, 0):
+                    pass
+        with m.FileLock(alias, 0.1, 0):
+            pass
+
+    def test_stat_and_inspect_do_not_split_records_for_line_count(self):
+        m = self._import_safe_edit()
+        path = self.tmpdir / "line-count.txt"
+        original = b"alpha\r\nbeta"
+        path.write_bytes(original)
+        encoding, text = m.detect_and_decode(original, "auto")
+        capability = {
+            "directoryWritable": True,
+            "canWriteTmp": True,
+            "canCreateLock": True,
+            "executionMode": "full",
+            "suggestions": [],
+        }
+        with patch.object(
+            m, "split_records", side_effect=AssertionError("unexpected split")
+        ):
+            stat_result = m.stat_target(
+                path, original, encoding, text, capability
+            )
+            inspect_result = m.inspect_target(path, original, encoding, text)
+        self.assertEqual(stat_result["lineCount"], 2)
+        self.assertEqual(inspect_result["lineCount"], 2)
+
+    def test_apply_operations_reuses_line_records(self):
+        m = self._import_safe_edit()
+        text = "one\ntwo\nthree\nfour\nfive\n"
+        operations = [
+            {"op": "insert", "line": 2, "text": "inserted"},
+            {"op": "replace-lines", "start": 3, "end": 3, "text": "TWO"},
+            {"op": "delete-lines", "start": 5, "end": 5},
+            {"op": "append", "text": "tail"},
+        ]
+        expected = text
+        expected_results = []
+        for operation in operations:
+            expected, changed, op, strategy = m.apply_operation(
+                expected, operation, "\n"
+            )
+            expected_results.append(
+                {"index": len(expected_results) + 1, "op": op,
+                 "changed": changed, "matchStrategy": strategy}
+            )
+
+        with patch.object(
+            m, "split_records", wraps=m.split_records
+        ) as split_mock:
+            actual, actual_results = m.apply_operations(
+                text, operations, "\n"
+            )
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual_results, expected_results)
+        self.assertEqual(split_mock.call_count, 1)
+
+    def test_ignore_indent_builds_line_index_once(self):
+        m = self._import_safe_edit()
+        text = "".join(
+            "    target line\n" if index % 10 == 0 else "    ordinary line\n"
+            for index in range(500)
+        )
+        operation = {
+            "old": "\ttarget line",
+            "new": "changed",
+            "expected_count": 50,
+        }
+        with patch.object(
+            m,
+            "_build_line_position_index",
+            wraps=m._build_line_position_index,
+        ) as index_mock:
+            result, changed, _strategy = m.apply_literal_edit(
+                text, operation, "\n", ignore_indent=True
+            )
+        self.assertEqual(changed, 50)
+        self.assertEqual(result.count("changed"), 50)
+        self.assertEqual(index_mock.call_count, 1)
+
+    def test_context_filter_uses_local_windows(self):
+        m = self._import_safe_edit()
+        text = "scope-A\nneedle\n" * 200
+        operation = {"old": "needle", "new": "changed", "first": True}
+        with patch.object(
+            m, "_context_before_window", wraps=m._context_before_window
+        ) as window_mock:
+            result, changed, _strategy = m.apply_literal_edit(
+                text,
+                operation,
+                "\n",
+                context_before="scope-A",
+            )
+        self.assertEqual(changed, 1)
+        self.assertIn("changed", result)
+        self.assertEqual(window_mock.call_count, 200)
+
+    def test_regex_unlimited_path_skips_precount(self):
+        m = self._import_safe_edit()
+        real_pattern = m.re.compile(r"value=\d+")
+
+        class PatternProxy:
+            def finditer(self, _text):
+                raise AssertionError("unlimited regex path should not pre-count")
+
+            def subn(self, replacement, text, count=0):
+                return real_pattern.subn(replacement, text, count=count)
+
+        operation = {
+            "pattern": r"value=\d+",
+            "replacement": "value=0",
+            "expected_count": 2,
+        }
+        with patch.object(m.re, "compile", return_value=PatternProxy()):
+            result, changed, strategy = m.apply_regex_edit(
+                "value=1 value=2", operation, "\n"
+            )
+        self.assertEqual(result, "value=0 value=0")
+        self.assertEqual(changed, 2)
+        self.assertEqual(strategy, "regex")
+
+    def test_performance_benchmark_quick_json(self):
+        benchmark = REPO_ROOT / "tests" / "perf" / "benchmark.py"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(benchmark),
+                "--sizes-mib",
+                "0.01",
+                "--iterations",
+                "1",
+                "--warmups",
+                "0",
+                "--context-matches",
+                "10",
+                "--json",
+            ],
+            cwd=self.tmpdir,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        names = {item["name"] for item in payload["results"]}
+        self.assertIn("cli.inspect", names)
+        self.assertIn("cli.stat", names)
+        self.assertIn("core.batch-line-ops", names)
+        for item in payload["results"]:
+            self.assertGreaterEqual(item["medianMs"], 0)
+            self.assertGreaterEqual(item["p95Ms"], item["minMs"])
+
+
+    def test_ignore_eol_mapper_reuses_cr_scan(self):
+        m = self._import_safe_edit()
+        text = "value\n" * 500
+        operation = {
+            "old": "value\r\n",
+            "new": "done\n",
+            "expected_count": 500,
+        }
+        scan_count = 0
+        refresh_next_cr = m._EolPositionMapper._refresh_next_cr
+
+        def counted_refresh(mapper):
+            nonlocal scan_count
+            scan_count += 1
+            return refresh_next_cr(mapper)
+
+        with patch.object(
+            m._EolPositionMapper, "_refresh_next_cr", counted_refresh
+        ):
+            result, changed, _strategy = m.apply_literal_edit(
+                text, operation, "\n", ignore_eol=True
+            )
+        self.assertEqual(changed, 500)
+        self.assertEqual(result, "done\n" * 500)
+        self.assertEqual(scan_count, 1)
+
+    def test_ignore_indent_line_index_is_lazy(self):
+        m = self._import_safe_edit()
+        with patch.object(
+            m,
+            "_build_line_position_index",
+            wraps=m._build_line_position_index,
+        ) as index_mock:
+            with self.assertRaises(m.SafeEditError):
+                m.apply_literal_edit(
+                    "    ordinary\n",
+                    {"old": "\tmissing", "new": "changed"},
+                    "\n",
+                    ignore_indent=True,
+                )
+            with self.assertRaises(m.SafeEditError):
+                m.apply_literal_edit(
+                    "    target\n    target\n",
+                    {
+                        "old": "\ttarget",
+                        "new": "changed",
+                        "expected_count": 3,
+                    },
+                    "\n",
+                    ignore_indent=True,
+                )
+            result, changed, _strategy = m.apply_literal_edit(
+                "    target\n    target\n",
+                {
+                    "old": "    target",
+                    "new": "changed",
+                    "expected_count": 2,
+                },
+                "\n",
+                ignore_indent=True,
+            )
+        self.assertEqual(changed, 2)
+        self.assertEqual(result, "    changed\n    changed\n")
+        self.assertEqual(index_mock.call_count, 0)
+
+    def test_regex_no_match_precedes_invalid_replacement(self):
+        m = self._import_safe_edit()
+        operation = {"pattern": "missing", "replacement": r"\9"}
+        with self.assertRaises(m.SafeEditError) as ctx:
+            m.apply_regex_edit("content", operation, "\n")
+        self.assertIn("not found", str(ctx.exception))
+
+        unchanged, changed, strategy = m.apply_regex_edit(
+            "content",
+            {**operation, "no_op_ok": True},
+            "\n",
+        )
+        self.assertEqual((unchanged, changed, strategy), ("content", 0, "regex"))
 
 if __name__ == "__main__":
     unittest.main()

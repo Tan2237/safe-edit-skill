@@ -7,7 +7,8 @@ import argparse
 import base64
 import binascii
 import codecs
-import contextlib
+
+from bisect import bisect_right
 import difflib
 import errno
 import functools
@@ -776,6 +777,7 @@ def _get_tmp_dir() -> str:
     return tempfile.gettempdir()
 
 
+@functools.lru_cache(maxsize=1)
 def _get_lock_dir() -> Path:
     """Get or create the lock directory under tmp.
 
@@ -786,31 +788,46 @@ def _get_lock_dir() -> Path:
     return lock_dir
 
 
-def _get_lock_key(file_path: str) -> str:
-    """Generate a unique lock key based on file identity (device + inode).
-
-    This ensures:
-    - Same file via different paths (symlinks, junctions) → same lock
-    - Same path after rename → same lock (inode unchanged)
-    - Different files at same path → different lock
-
-    Uses st_dev:st_ino on all platforms:
-    - Unix: true device + inode numbers
-    - Windows: volume serial number + file index (via GetFileInformationByHandle)
-
-    Falls back to resolved path hash only when stat() fails (file not yet created).
-    """
-    p = Path(file_path).resolve()
+def _canonical_lock_path(file_path: str) -> Path:
     try:
-        stat_info = p.stat()
-        # st_dev:st_ino works on both Unix and Windows for file identity
-        # Windows: st_dev = volume serial number, st_ino = file index
-        identity = f"{stat_info.st_dev}:{stat_info.st_ino}"
-    except OSError:
-        # File may not exist yet, use resolved path as fallback
-        identity = str(p)
-    return hashlib.sha256(identity.encode()).hexdigest()[:32]
+        return Path(file_path).resolve(strict=False)
+    except (OSError, RuntimeError):
+        return Path(os.path.abspath(file_path))
 
+
+def _hash_lock_identity(kind: str, identity: str) -> str:
+    value = f"{kind}\0{identity}".encode("utf-8", errors="surrogatepass")
+    return hashlib.sha256(value).hexdigest()[:32]
+
+
+def _get_lock_key(file_path: str) -> str:
+    """Return the stable canonical-path lock key for a target."""
+    path = _canonical_lock_path(file_path)
+    identity = os.path.normcase(os.path.abspath(str(path)))
+    return _hash_lock_identity("path", identity)
+
+
+def _get_inode_lock_key(file_path: str) -> Optional[str]:
+    """Return a supplemental inode key used to serialize hardlink aliases."""
+    path = _canonical_lock_path(file_path)
+    try:
+        stat_info = path.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(stat_info.st_mode) or not stat_info.st_ino:
+        return None
+    return _hash_lock_identity(
+        "inode",
+        f"{stat_info.st_dev}:{stat_info.st_ino}",
+    )
+
+
+def _get_lock_keys(file_path: str) -> Tuple[str, ...]:
+    keys = {_get_lock_key(file_path)}
+    inode_key = _get_inode_lock_key(file_path)
+    if inode_key is not None:
+        keys.add(inode_key)
+    return tuple(sorted(keys))
 
 def check_fs_capability(target_file: str) -> Dict[str, Any]:
     """Detect filesystem capability WITHOUT writing into target directory.
@@ -1423,6 +1440,159 @@ def parse_diff_input(diff_text: str) -> List[Dict[str, Any]]:
     return operations
 
 
+@dataclass(frozen=True)
+class _LinePositionIndex:
+    original_starts: Tuple[int, ...]
+    normalized_starts: Tuple[int, ...]
+
+
+def _build_line_position_index(
+    original_text: str,
+    ignore_indent: bool,
+    ignore_eol: bool,
+) -> _LinePositionIndex:
+    original_starts: List[int] = []
+    normalized_starts: List[int] = []
+    original_offset = 0
+    normalized_offset = 0
+    lines = original_text.split("\n")
+
+    for line in lines:
+        original_starts.append(original_offset)
+        normalized_starts.append(normalized_offset)
+        original_offset += len(line) + 1
+
+        normalized_line = line.lstrip(" \t") if ignore_indent else line
+        if ignore_eol and normalized_line.endswith("\r"):
+            normalized_line = normalized_line[:-1]
+        normalized_offset += len(normalized_line) + 1
+
+    return _LinePositionIndex(
+        tuple(original_starts),
+        tuple(normalized_starts),
+    )
+
+
+class _LazyLinePositionIndex:
+    """Build the reusable line index only when position mapping needs it."""
+
+    def __init__(
+        self,
+        original_text: str,
+        ignore_indent: bool,
+        ignore_eol: bool,
+    ) -> None:
+        self.original_text = original_text
+        self.ignore_indent = ignore_indent
+        self.ignore_eol = ignore_eol
+        self._index: Optional[_LinePositionIndex] = None
+
+    def get(self) -> _LinePositionIndex:
+        if self._index is None:
+            self._index = _build_line_position_index(
+                self.original_text,
+                self.ignore_indent,
+                self.ignore_eol,
+            )
+        return self._index
+
+
+class _EolPositionMapper:
+    """Map monotonically increasing LF-normalized offsets to original offsets."""
+
+    def __init__(self, original_text: str) -> None:
+        self.original_text = original_text
+        self.original_pos = 0
+        self.normalized_pos = 0
+        self._next_cr_pos: Optional[int] = None
+
+    def _refresh_next_cr(self) -> int:
+        self._next_cr_pos = self.original_text.find("\r", self.original_pos)
+        return self._next_cr_pos
+
+    def _advance_to(self, boundary: int) -> int:
+        if boundary < self.normalized_pos:
+            self.original_pos = 0
+            self.normalized_pos = 0
+            self._next_cr_pos = None
+
+        while self.normalized_pos < boundary:
+            remaining = boundary - self.normalized_pos
+            cr_pos = self._next_cr_pos
+            if cr_pos is None:
+                cr_pos = self._refresh_next_cr()
+            if cr_pos < 0 or cr_pos - self.original_pos >= remaining:
+                self.original_pos += remaining
+                self.normalized_pos = boundary
+                break
+
+            plain_length = cr_pos - self.original_pos
+            self.original_pos = cr_pos
+            self.normalized_pos += plain_length
+            if (
+                self.original_pos + 1 < len(self.original_text)
+                and self.original_text[self.original_pos + 1] == "\n"
+            ):
+                self.original_pos += 2
+            else:
+                self.original_pos += 1
+            self.normalized_pos += 1
+            self._next_cr_pos = None
+
+        return self.original_pos
+
+    def map_span(self, normalized_start: int, normalized_length: int) -> Tuple[int, int]:
+        original_start = self._advance_to(normalized_start)
+        original_end = self._advance_to(normalized_start + normalized_length)
+        return original_start, original_end - original_start
+
+
+def _context_before_window(text: str, pos: int, line_count: int) -> str:
+    search_end = pos
+    start = 0
+    for _ in range(line_count):
+        newline_pos = text.rfind("\n", 0, search_end)
+        if newline_pos < 0:
+            return text[:pos]
+        start = newline_pos + 1
+        search_end = newline_pos
+    return text[start:pos]
+
+
+def _context_after_window(text: str, pos: int, line_count: int) -> str:
+    start = pos
+    search_start = start
+    end = len(text)
+    for _ in range(line_count):
+        newline_pos = text.find("\n", search_start)
+        if newline_pos < 0:
+            return text[start:]
+        end = newline_pos
+        search_start = newline_pos + 1
+    return text[start:end]
+
+
+def _replace_spans(
+    text: str,
+    spans: List[Tuple[int, int]],
+    new: str,
+    ignore_indent: bool,
+) -> str:
+    chunks: List[str] = []
+    cursor = 0
+    for pos, length in spans:
+        if pos < cursor:
+            fail("internal error: overlapping replacement spans")
+        chunks.append(text[cursor:pos])
+        original_matched = text[pos:pos + length]
+        chunks.append(
+            adjust_replacement_for_indent(original_matched, new, ignore_indent)
+        )
+        cursor = pos + length
+    chunks.append(text[cursor:])
+    return "".join(chunks)
+
+
 def _apply_edit_with_context(
     text: str,
     old: str,
@@ -1437,14 +1607,9 @@ def _apply_edit_with_context(
     normalize_whitespace: bool,
     context_before: str,
     context_after: str,
+    line_index: Optional[Any] = None,
+    eol_mapper: Optional[_EolPositionMapper] = None,
 ) -> Tuple[str, int, str]:
-    """Apply a literal edit with context-based disambiguation.
-    
-    When --context-before or --context-after is specified, find all matches,
-    filter by context text, and replace only context-matching occurrences.
-    Context matching uses substring containment (``in`` operator).
-    """
-    # Find all match positions
     if ignore_indent or ignore_eol or normalize_whitespace:
         positions: List[Tuple[int, int]] = []
         search_start = 0
@@ -1454,9 +1619,17 @@ def _apply_edit_with_context(
             if norm_pos < 0:
                 break
             original_pos, original_len = find_original_position(
-                text, normalized_text, norm_pos, normalized_old, old,
-                ignore_indent, ignore_eol, normalize_whitespace,
+                text,
+                normalized_text,
+                norm_pos,
+                normalized_old,
+                old,
+                ignore_indent,
+                ignore_eol,
+                normalize_whitespace,
                 start_search_pos=search_start_orig,
+                line_index=line_index,
+                eol_mapper=eol_mapper,
             )
             if original_pos >= 0:
                 positions.append((original_pos, original_len))
@@ -1471,137 +1644,130 @@ def _apply_edit_with_context(
                 break
             positions.append((pos, len(old)))
             start = pos + len(old)
-    
-    # Filter by context (search within a window near the match, not the entire file)
-    old_line_count = max(1, old.count('\n') + 1)
-    ctx_window = max(old_line_count, 2)  # lines of context to check
+
+    old_line_count = max(1, old.count("\n") + 1)
+    context_line_count = max(old_line_count, 2)
     filtered: List[Tuple[int, int]] = []
     for pos, length in positions:
         if context_before:
-            # Check only the few lines immediately before the match
-            before_text = text[:pos]
-            before_lines = before_text.split('\n')
-            window = '\n'.join(before_lines[-ctx_window:])
+            window = _context_before_window(text, pos, context_line_count)
             if context_before not in window:
                 continue
         if context_after:
-            # Check only the few lines immediately after the match
-            after_text = text[pos + length:]
-            after_lines = after_text.split('\n')
-            window = '\n'.join(after_lines[:ctx_window])
+            window = _context_after_window(
+                text,
+                pos + length,
+                context_line_count,
+            )
             if context_after not in window:
                 continue
         filtered.append((pos, length))
-    
-    # Check expected_count against filtered matches
+
     expected = operation.get("expected_count")
-    # When filtered is empty, always report "not found" regardless of expected_count
-    if len(filtered) == 0 and not bool(operation.get("no_op_ok", False)):
+    if not filtered and not bool(operation.get("no_op_ok", False)):
         if explain:
             explanation = explain_match_failure(old, text)
             fail(f"old text was not found (after context filtering); refusing a silent no-op\n\n{explanation}")
-        else:
-            fail("old text was not found (after context filtering); refusing a silent no-op")
-    if len(filtered) == 0 and bool(operation.get("no_op_ok", False)):
-        # no_op_ok: if no matches after context filtering, skip count check and return unchanged
+        fail("old text was not found (after context filtering); refusing a silent no-op")
+    if not filtered:
         return (text, 0, effective_strategy)
     if expected is not None and len(filtered) != int(expected):
         fail(f"expected {expected} occurrence(s) after context filtering, found {len(filtered)}")
-    
-    # Apply --first if specified
-    use_first = bool(operation.get("first", False))
-    matches_to_replace = filtered[:1] if use_first else filtered
-    
-    # Replace from end to start to preserve positions
-    result_text = text
-    count_replaced = 0
-    for pos, length in sorted(matches_to_replace, key=lambda x: x[0], reverse=True):
-        original_matched = result_text[pos:pos + length]
-        adjusted_new = adjust_replacement_for_indent(original_matched, new, ignore_indent)
-        result_text = result_text[:pos] + adjusted_new + result_text[pos + length:]
-        count_replaced += 1
-    
-    return (result_text, count_replaced, effective_strategy)
+
+    matches = filtered[:1] if bool(operation.get("first", False)) else filtered
+    return (
+        _replace_spans(text, matches, new, ignore_indent),
+        len(matches),
+        effective_strategy,
+    )
 
 
-def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, explain: bool = False, 
-                        ignore_indent: bool = False, ignore_eol: bool = False, normalize_whitespace: bool = False,
-                        match_strategy: Optional[str] = None, context_before: Optional[str] = None,
-                        context_after: Optional[str] = None) -> Tuple[str, int, str]:
-    """Apply a literal text replacement.
-    
-    Returns (new_text, changed_count, match_strategy).
-    match_strategy indicates how the match was performed (e.g. "exact", "ignore-eol").
-    """
+def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, explain: bool = False,
+                       ignore_indent: bool = False, ignore_eol: bool = False, normalize_whitespace: bool = False,
+                       match_strategy: Optional[str] = None, context_before: Optional[str] = None,
+                       context_after: Optional[str] = None) -> Tuple[str, int, str]:
+    """Apply a literal text replacement."""
     old = str(operation["old"])
     new = normalize_user_newlines(str(operation["new"]), newline)
     if old == "":
         fail("old text must not be empty")
-    
-    # Determine and record the effective match strategy
-    effective_strategy = match_strategy or _determine_match_strategy(ignore_indent, ignore_eol, normalize_whitespace)
-    
-    # Apply controlled whitespace normalization for matching only
-    # The replacement text (new) is NOT normalized - it's used as-is
-    normalized_text = normalize_for_match(text, ignore_indent, ignore_eol, normalize_whitespace)
-    normalized_old = normalize_for_match(old, ignore_indent, ignore_eol, normalize_whitespace)
-    
-    # If context filtering is needed, delegate to position-based approach
+
+    effective_strategy = match_strategy or _determine_match_strategy(
+        ignore_indent,
+        ignore_eol,
+        normalize_whitespace,
+    )
+    normalized_text = normalize_for_match(
+        text, ignore_indent, ignore_eol, normalize_whitespace
+    )
+    normalized_old = normalize_for_match(
+        old, ignore_indent, ignore_eol, normalize_whitespace
+    )
+
+    line_index = None
+    if ignore_indent and "\n" in text and not normalize_whitespace:
+        line_index = _LazyLinePositionIndex(
+            text,
+            ignore_indent,
+            ignore_eol,
+        )
+    eol_mapper = None
+    if ignore_eol and not ignore_indent and not normalize_whitespace:
+        eol_mapper = _EolPositionMapper(text)
+
     if context_before or context_after:
         return _apply_edit_with_context(
-            text, old, new, normalized_text, normalized_old,
-            operation, effective_strategy, explain,
-            ignore_indent, ignore_eol, normalize_whitespace,
-            context_before, context_after,
+            text,
+            old,
+            new,
+            normalized_text,
+            normalized_old,
+            operation,
+            effective_strategy,
+            explain,
+            ignore_indent,
+            ignore_eol,
+            normalize_whitespace,
+            context_before or "",
+            context_after or "",
+            line_index=line_index,
+            eol_mapper=eol_mapper,
         )
-    
-    # Count matches using normalized versions
+
     actual = normalized_text.count(normalized_old)
     expected = operation.get("expected_count")
-    # When actual is 0, always report "not found" regardless of expected_count
-    # (the real problem is missing text, not wrong count)
     if actual == 0 and not bool(operation.get("no_op_ok", False)):
         if explain:
             explanation = explain_match_failure(old, text)
             fail(f"old text was not found; refusing a silent no-op\n\n{explanation}")
-        else:
-            fail("old text was not found; refusing a silent no-op")
-    if actual == 0 and bool(operation.get("no_op_ok", False)):
-        # no_op_ok: if no matches, skip count check and return text unchanged
+        fail("old text was not found; refusing a silent no-op")
+    if actual == 0:
         return (text, 0, effective_strategy)
     if expected is not None and actual != int(expected):
         fail(f"expected {expected} occurrence(s), found {actual}")
-    
-    # Perform replacement on original text (not normalized)
-    # We need to find the actual positions in the original text
+
     if ignore_indent or ignore_eol or normalize_whitespace:
-        # When normalization is used, we need to find matches in original text
-        # by mapping normalized positions back to original positions
-        result_text = text
-        count_replaced = 0
-        
-        # Find all matches in normalized text and map to original
         if bool(operation.get("first", False)):
-            # Replace only first match
-            # Find the first occurrence in normalized text
             norm_pos = normalized_text.find(normalized_old)
-            if norm_pos >= 0:
-                # Find corresponding position in original text
-                # The matched content in original text may have different length than original_old
-                original_pos, original_len = find_original_position(
-                    text, normalized_text, norm_pos, normalized_old, old,
-                    ignore_indent, ignore_eol, normalize_whitespace
-                )
-                if original_pos >= 0:
-                    # Adjust replacement to preserve original indentation
-                    original_matched = text[original_pos:original_pos + original_len]
-                    adjusted_new = adjust_replacement_for_indent(original_matched, new, ignore_indent)
-                    result_text = text[:original_pos] + adjusted_new + text[original_pos + original_len:]
-                    count_replaced = 1
+            if norm_pos < 0:
+                return (text, 0, effective_strategy)
+            original_pos, original_len = find_original_position(
+                text,
+                normalized_text,
+                norm_pos,
+                normalized_old,
+                old,
+                ignore_indent,
+                ignore_eol,
+                normalize_whitespace,
+                line_index=line_index,
+                eol_mapper=eol_mapper,
+            )
+            if original_pos < 0:
+                return (text, 0, effective_strategy)
+            spans = [(original_pos, original_len)]
         else:
-            # Replace all matches
-            # Find all occurrences and replace them
-            positions = []
+            spans = []
             search_start = 0
             search_start_orig = 0
             while True:
@@ -1609,160 +1775,162 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
                 if norm_pos < 0:
                     break
                 original_pos, original_len = find_original_position(
-                    text, normalized_text, norm_pos, normalized_old, old,
-                    ignore_indent, ignore_eol, normalize_whitespace,
-                    start_search_pos=search_start_orig
+                    text,
+                    normalized_text,
+                    norm_pos,
+                    normalized_old,
+                    old,
+                    ignore_indent,
+                    ignore_eol,
+                    normalize_whitespace,
+                    start_search_pos=search_start_orig,
+                    line_index=line_index,
+                    eol_mapper=eol_mapper,
                 )
                 if original_pos >= 0:
-                    positions.append((original_pos, original_len))
+                    spans.append((original_pos, original_len))
                     search_start_orig = original_pos + original_len
                 search_start = norm_pos + len(normalized_old)
-            
-            # Replace from end to start to preserve positions
-            for original_pos, original_len in sorted(positions, key=lambda x: x[0], reverse=True):
-                # Adjust replacement to preserve original indentation
-                original_matched = result_text[original_pos:original_pos + original_len]
-                adjusted_new = adjust_replacement_for_indent(original_matched, new, ignore_indent)
-                result_text = result_text[:original_pos] + adjusted_new + result_text[original_pos + original_len:]
-                count_replaced += 1
-        
-        return (result_text, count_replaced, effective_strategy)
-    else:
-        # No normalization - use original simple logic
-        count = 1 if bool(operation.get("first", False)) else -1
-        return (text.replace(old, new, count), min(actual, 1) if count == 1 else actual, effective_strategy)
+
+        return (
+            _replace_spans(text, spans, new, ignore_indent),
+            len(spans),
+            effective_strategy,
+        )
+
+    count = 1 if bool(operation.get("first", False)) else -1
+    replaced = min(actual, 1) if count == 1 else actual
+    return (text.replace(old, new, count), replaced, effective_strategy)
 
 
-def find_original_position(original_text: str, normalized_text: str, norm_pos: int, 
+def find_original_position(original_text: str, normalized_text: str, norm_pos: int,
                             normalized_old: str, original_old: str,
                             ignore_indent: bool, ignore_eol: bool, normalize_whitespace: bool,
-                            start_search_pos: int = 0) -> Tuple[int, int]:
-    """Find the position in original text corresponding to a normalized match position.
-    
-    This maps a match found in normalized text back to the original text.
-    Returns (position, length) tuple where position is the start in original text
-    and length is the length of the matched content in original text.
-    """
-    # Simple case: if no normalization, position is same
+                            start_search_pos: int = 0,
+                            line_index: Optional[Any] = None,
+                            eol_mapper: Optional[_EolPositionMapper] = None) -> Tuple[int, int]:
+    """Map a normalized match position back to an original-text span."""
     if not ignore_indent and not ignore_eol and not normalize_whitespace:
         pos = original_text.find(original_old, start_search_pos)
         return (pos, len(original_old)) if pos >= 0 else (-1, 0)
-    
-    # Fast path: try original_old as-is first (works when only line endings differ)
+
     candidate = original_text.find(original_old, start_search_pos)
     if candidate >= 0:
         normalized_candidate = normalize_for_match(
             original_text[candidate:candidate + len(original_old)],
-            ignore_indent, ignore_eol, normalize_whitespace,
+            ignore_indent,
+            ignore_eol,
+            normalize_whitespace,
         )
         if normalized_candidate == normalized_old:
             return (candidate, len(original_old))
-    
-    # Line-based fast path for ignore_indent: compute original line offsets
-    # and use normalized match position to find the corresponding original line.
-    # This reduces the search space from O(n * max_len) to O(lines * max_line_len).
+
+    if (
+        eol_mapper is not None
+        and ignore_eol
+        and not ignore_indent
+        and not normalize_whitespace
+    ):
+        return eol_mapper.map_span(norm_pos, len(normalized_old))
+
     if ignore_indent and not normalize_whitespace:
         result = _find_original_position_line_based(
-            original_text, normalized_text, normalized_old, original_old,
-            ignore_indent, ignore_eol, start_search_pos,
+            original_text,
+            normalized_text,
+            normalized_old,
+            original_old,
+            ignore_indent,
+            ignore_eol,
+            start_search_pos,
             norm_pos=norm_pos,
+            line_index=line_index,
         )
         if result[0] >= 0:
             return result
-    
-    # General fallback: scan from start_search_pos with early termination.
-    # Instead of trying all lengths from each position, we use a smart bound:
-    # the original text cannot be shorter than the normalized text, and
-    # unlikely to be more than 3x longer (handles CRLF→LF, tab→spaces).
+
     min_len = max(1, len(normalized_old))
     max_len = max(len(original_old) * 3, len(normalized_old) * 3, 200)
-
     search_start = start_search_pos
     while search_start < len(original_text):
-        for length in range(min_len, min(max_len + 1, len(original_text) - search_start + 1)):
-            candidate = original_text[search_start:search_start + length]
-            normalized_candidate = normalize_for_match(candidate, ignore_indent, ignore_eol, normalize_whitespace)
-
+        for length in range(
+            min_len,
+            min(max_len + 1, len(original_text) - search_start + 1),
+        ):
+            candidate_text = original_text[search_start:search_start + length]
+            normalized_candidate = normalize_for_match(
+                candidate_text,
+                ignore_indent,
+                ignore_eol,
+                normalize_whitespace,
+            )
             if normalized_candidate == normalized_old:
-                # Extend match to include a trailing \n if the match ends with \r
-                # (CRLF boundary: avoid splitting \r\n into \r matched + \n leftover)
-                if ignore_eol and length < len(original_text) - search_start:
-                    if candidate.endswith('\r') and original_text[search_start + length] == '\n':
-                        length += 1
+                if (
+                    ignore_eol
+                    and length < len(original_text) - search_start
+                    and candidate_text.endswith("\r")
+                    and original_text[search_start + length] == "\n"
+                ):
+                    length += 1
                 return (search_start, length)
-
-            # Early termination: if normalized candidate is already longer than target,
-            # no point trying longer substrings from this position
             if len(normalized_candidate) > len(normalized_old):
                 break
-
         search_start += 1
-
     return (-1, 0)
 
 
 def _find_original_position_line_based(
-    original_text: str, normalized_text: str, normalized_old: str, original_old: str,
-    ignore_indent: bool, ignore_eol: bool, start_search_pos: int,
+    original_text: str,
+    normalized_text: str,
+    normalized_old: str,
+    original_old: str,
+    ignore_indent: bool,
+    ignore_eol: bool,
+    start_search_pos: int,
     norm_pos: int = 0,
+    line_index: Optional[Any] = None,
 ) -> Tuple[int, int]:
-    """Line-based fast path for find_original_position with ignore_indent.
-    
-    Uses line offset mapping to narrow the search, falling back to
-    character-level verification within the candidate region.
-    """
-    # Build line offset mapping: for each original line, record its start offset
-    # and the corresponding offset in the normalized text
-    orig_lines = original_text.split('\n')
-    orig_line_starts = []
-    norm_line_starts = []
-    
-    offset = 0
-    norm_offset = 0
-    for line in orig_lines:
-        orig_line_starts.append(offset)
-        norm_line_starts.append(norm_offset)
-        # Original line length (content only, no \n)
-        offset += len(line) + 1  # +1 for \n (or \r\n handled below)
-        # Normalized line length (with indent stripped)
-        norm_line = line.lstrip(' \t') if ignore_indent else line
-        norm_offset += len(norm_line)
-        # Add newline in normalized text
-        if ignore_eol:
-            norm_offset += 1  # always \n
-        else:
-            # Count actual newline length
-            # This is approximate; we'll verify below
-            norm_offset += 1
-    
-    # Find which line the normalized match starts in
-    # by finding the line whose normalized start is <= norm_pos
-    # and whose next line's normalized start is > norm_pos
-    target_line = 0
-    for i in range(len(norm_line_starts) - 1, -1, -1):
-        if norm_line_starts[i] <= norm_pos:
-            target_line = i
-            break
-    
-    # The original text should start at or near the original line start
-    # Search within a small window around the target line
-    search_start = max(start_search_pos, orig_line_starts[target_line])
-    search_end = min(len(original_text), orig_line_starts[target_line] + len(original_old) * 3 + 200)
-    
+    if isinstance(line_index, _LazyLinePositionIndex):
+        line_index = line_index.get()
+    elif line_index is None:
+        line_index = _build_line_position_index(
+            original_text,
+            ignore_indent,
+            ignore_eol,
+        )
+
+    target_line = max(
+        0,
+        bisect_right(line_index.normalized_starts, norm_pos) - 1,
+    )
+    search_start = max(
+        start_search_pos,
+        line_index.original_starts[target_line],
+    )
+    search_end = min(
+        len(original_text),
+        line_index.original_starts[target_line] + len(original_old) * 3 + 200,
+    )
     min_len = max(1, len(normalized_old))
     max_len = max(len(original_old) * 3, len(normalized_old) * 3, 200)
-    
+
     pos = search_start
     while pos < search_end:
-        for length in range(min_len, min(max_len + 1, len(original_text) - pos + 1)):
+        for length in range(
+            min_len,
+            min(max_len + 1, len(original_text) - pos + 1),
+        ):
             candidate = original_text[pos:pos + length]
-            normalized_candidate = normalize_for_match(candidate, ignore_indent, ignore_eol, False)
+            normalized_candidate = normalize_for_match(
+                candidate,
+                ignore_indent,
+                ignore_eol,
+                False,
+            )
             if normalized_candidate == normalized_old:
                 return (pos, length)
             if len(normalized_candidate) > len(normalized_old):
                 break
         pos += 1
-    
     return (-1, 0)
 
 
@@ -1820,96 +1988,63 @@ def apply_regex_edit(text: str, operation: Dict[str, Any], newline: str, explain
     except re.error as exc:
         fail(f"invalid regex pattern: {exc}")
 
-    actual = sum(1 for _ in compiled.finditer(text))
     expected = operation.get("expected_count")
+    count = int(operation.get("count", 0) or 0)
+    if bool(operation.get("first", False)):
+        count = 1
+
+    def substitute(
+        limit: int,
+        preserve_no_match_priority: bool = False,
+    ) -> Tuple[str, int]:
+        if bool(operation.get("literal_replacement", False)):
+            return compiled.subn(lambda _match: replacement, text, count=limit)
+        try:
+            return compiled.subn(replacement, text, count=limit)
+        except re.error as exc:
+            if preserve_no_match_priority and compiled.search(text) is None:
+                return (text, 0)
+            fail(f"invalid regex replacement: {exc}")
+
+    # Unlimited substitution returns the total match count, so counting first
+    # would only duplicate the full scan.
+    if count == 0:
+        new_text, actual = substitute(0, preserve_no_match_priority=True)
+        if actual == 0 and not bool(operation.get("no_op_ok", False)):
+            if explain:
+                explanation = explain_match_failure(pattern, text)
+                fail(f"regex pattern was not found; refusing a silent no-op\n\n{explanation}")
+            fail("regex pattern was not found; refusing a silent no-op")
+        if actual == 0:
+            return (text, 0, "regex")
+        if expected is not None and actual != int(expected):
+            fail(f"expected {expected} regex match(es), found {actual}")
+        return (new_text, actual, "regex")
+
+    actual = sum(1 for _ in compiled.finditer(text))
     if actual == 0 and not bool(operation.get("no_op_ok", False)):
         if explain:
-            # Try to find closest match using the pattern as literal text
             explanation = explain_match_failure(pattern, text)
             fail(f"regex pattern was not found; refusing a silent no-op\n\n{explanation}")
-        else:
-            fail("regex pattern was not found; refusing a silent no-op")
-    if actual == 0 and bool(operation.get("no_op_ok", False)):
-        # no_op_ok: if no matches, skip count check and return text unchanged
+        fail("regex pattern was not found; refusing a silent no-op")
+    if actual == 0:
         return (text, 0, "regex")
     if expected is not None and actual != int(expected):
         fail(f"expected {expected} regex match(es), found {actual}")
 
-    count = int(operation.get("count", 0) or 0)
-    if bool(operation.get("first", False)):
-        count = 1
-    if bool(operation.get("literal_replacement", False)):
-        new_text, n = compiled.subn(lambda _match: replacement, text, count=count)
-        return (new_text, n, "regex")
-    try:
-        new_text, n = compiled.subn(replacement, text, count=count)
-        return (new_text, n, "regex")
-    except re.error as exc:
-        fail(f"invalid regex replacement: {exc}")
-
-
-def apply_insert(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int, str]:
-    records = split_records(text)
-    line = int(operation["line"])
-    line_count = len(records)
-    if line < 1 or line > line_count + 1:
-        fail(f"line must be between 1 and {line_count + 1}, got {line}")
-
-    final_sep = newline
-    if not records:
-        final_sep = "" if not str(operation["text"]).endswith(("\n", "\r")) else newline
-    to_insert = block_records(str(operation["text"]), newline, final_sep)
-
-    index = line - 1
-    if records and index == len(records) and records[-1][1] == "":
-        records[-1] = (records[-1][0], newline)
-    return (join_records(records[:index] + to_insert + records[index:]), len(to_insert), "line-based")
-
-
-def apply_prepend(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int, str]:
-    records = split_records(text)
-    text_value = str(operation["text"])
-    final_sep = newline if records else (newline if text_value.endswith(("\n", "\r")) else "")
-    to_insert = block_records(text_value, newline, final_sep)
-    return (join_records(to_insert + records), len(to_insert), "line-based")
-
-
-def apply_append(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int, str]:
-    records = split_records(text)
-    text_value = str(operation["text"])
-    final_sep = newline if text_value.endswith(("\n", "\r")) else ""
-    to_insert = block_records(text_value, newline, final_sep)
-    if records and records[-1][1] == "":
-        records[-1] = (records[-1][0], newline)
-    return (join_records(records + to_insert), len(to_insert), "line-based")
-
-
-def apply_delete_line(text: str, operation: Dict[str, Any]) -> Tuple[str, int, str]:
-    records = split_records(text)
-    line = int(operation["line"])
-    line_count = len(records)
-    if line < 1 or line > line_count:
-        fail(f"line must be between 1 and {line_count}, got {line}")
-    index = line - 1
-    return (join_records(records[:index] + records[index + 1 :]), 1, "line-based")
+    new_text, replaced = substitute(count)
+    return (new_text, replaced, "regex")
 
 
 def range_bounds(operation: Dict[str, Any], records: List[Tuple[str, str]], text: str = "") -> Tuple[int, int]:
-    """Calculate start and end bounds for line operations.
-    
-    Supports both absolute line numbers and anchor-based offsets.
-    """
-    # Check if anchor-based positioning is used
+    """Calculate start and end bounds for line operations."""
     anchor_pattern = operation.get("anchor_pattern")
     if anchor_pattern:
         occurrence = operation.get("anchor_occurrence")
         anchor_line = find_context_anchor(text, anchor_pattern, occurrence)
-        
-        # Parse offset values (can be like "+2", "-1", or absolute)
         offset_start = operation.get("offset_start", 0)
         offset_end = operation.get("offset_end", 0)
-        
-        # Convert string offsets to integers
+
         if isinstance(offset_start, str):
             if offset_start.startswith("+"):
                 start = anchor_line + int(offset_start[1:])
@@ -1919,7 +2054,7 @@ def range_bounds(operation: Dict[str, Any], records: List[Tuple[str, str]], text
                 start = int(offset_start)
         else:
             start = anchor_line + int(offset_start)
-        
+
         if isinstance(offset_end, str):
             if offset_end.startswith("+"):
                 end = anchor_line + int(offset_end[1:])
@@ -1930,10 +2065,9 @@ def range_bounds(operation: Dict[str, Any], records: List[Tuple[str, str]], text
         else:
             end = anchor_line + int(offset_end)
     else:
-        # Traditional absolute line numbers
         start = int(operation["start"])
         end = int(operation["end"])
-    
+
     if start < 1:
         fail(f"start must be >= 1, got {start}")
     if end < start:
@@ -1943,68 +2077,192 @@ def range_bounds(operation: Dict[str, Any], records: List[Tuple[str, str]], text
     return (start - 1, end)
 
 
+def _extract_indent(line: str) -> str:
+    index = 0
+    while index < len(line) and line[index] in " \t":
+        index += 1
+    return line[:index]
+
+
+_LINE_BUFFER_OPERATIONS = frozenset(
+    {"insert", "prepend", "append", "delete", "delete-lines", "replace-lines"}
+)
+
+
+def _apply_line_operation_to_records(
+    records: List[Tuple[str, str]],
+    op_name: str,
+    operation: Dict[str, Any],
+    newline: str,
+    *,
+    text_for_anchor: str = "",
+) -> int:
+    if op_name == "insert":
+        line = int(operation["line"])
+        line_count = len(records)
+        if line < 1 or line > line_count + 1:
+            fail(f"line must be between 1 and {line_count + 1}, got {line}")
+        text_value = str(operation["text"])
+        final_sep = newline
+        if not records:
+            final_sep = "" if not text_value.endswith(("\n", "\r")) else newline
+        to_insert = block_records(text_value, newline, final_sep)
+        index = line - 1
+        if records and index == len(records) and records[-1][1] == "":
+            records[-1] = (records[-1][0], newline)
+        records[index:index] = to_insert
+        return len(to_insert)
+
+    if op_name == "prepend":
+        text_value = str(operation["text"])
+        final_sep = (
+            newline
+            if records
+            else (newline if text_value.endswith(("\n", "\r")) else "")
+        )
+        to_insert = block_records(text_value, newline, final_sep)
+        records[0:0] = to_insert
+        return len(to_insert)
+
+    if op_name == "append":
+        text_value = str(operation["text"])
+        final_sep = newline if text_value.endswith(("\n", "\r")) else ""
+        to_insert = block_records(text_value, newline, final_sep)
+        if records and records[-1][1] == "":
+            records[-1] = (records[-1][0], newline)
+        records.extend(to_insert)
+        return len(to_insert)
+
+    if op_name == "delete":
+        line = int(operation["line"])
+        if line < 1 or line > len(records):
+            fail(f"line must be between 1 and {len(records)}, got {line}")
+        del records[line - 1]
+        return 1
+
+    start, end = range_bounds(operation, records, text_for_anchor)
+    if op_name == "delete-lines":
+        del records[start:end]
+        return end - start
+
+    if op_name == "replace-lines":
+        preserve_indent = bool(operation.get("preserve_indent", False))
+        replacement_text = str(operation["text"])
+        if preserve_indent and start < len(records):
+            original_indent = _extract_indent(records[start][0])
+            if original_indent:
+                adjusted = []
+                for line in replacement_text.split("\n"):
+                    if line and line[0] not in " \t":
+                        adjusted.append(original_indent + line)
+                    else:
+                        adjusted.append(line)
+                replacement_text = "\n".join(adjusted)
+
+        following_exists = end < len(records)
+        original_final_sep = records[end - 1][1] if end > start else newline
+        final_sep = newline if following_exists else original_final_sep
+        replacement = block_records(replacement_text, newline, final_sep)
+        records[start:end] = replacement
+        return end - start
+
+    fail(f"unknown line operation: {op_name}")
+
+
+def apply_insert(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int, str]:
+    records = split_records(text)
+    changed = _apply_line_operation_to_records(
+        records, "insert", operation, newline
+    )
+    return (join_records(records), changed, "line-based")
+
+
+def apply_prepend(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int, str]:
+    records = split_records(text)
+    changed = _apply_line_operation_to_records(
+        records, "prepend", operation, newline
+    )
+    return (join_records(records), changed, "line-based")
+
+
+def apply_append(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int, str]:
+    records = split_records(text)
+    changed = _apply_line_operation_to_records(
+        records, "append", operation, newline
+    )
+    return (join_records(records), changed, "line-based")
+
+
+def apply_delete_line(text: str, operation: Dict[str, Any]) -> Tuple[str, int, str]:
+    records = split_records(text)
+    changed = _apply_line_operation_to_records(
+        records, "delete", operation, "\n"
+    )
+    return (join_records(records), changed, "line-based")
+
+
 def apply_delete_lines(text: str, operation: Dict[str, Any]) -> Tuple[str, int, str]:
     records = split_records(text)
-    start, end = range_bounds(operation, records, text)
-    return (join_records(records[:start] + records[end:]), end - start, "line-based")
-
-
-def _extract_indent(line: str) -> str:
-    """Extract leading whitespace from a line."""
-    indent = ""
-    for c in line:
-        if c in ' \t':
-            indent += c
-        else:
-            break
-    return indent
+    changed = _apply_line_operation_to_records(
+        records,
+        "delete-lines",
+        operation,
+        "\n",
+        text_for_anchor=text,
+    )
+    return (join_records(records), changed, "line-based")
 
 
 def apply_replace_lines(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int, str]:
     records = split_records(text)
-    start, end = range_bounds(operation, records, text)
-    preserve_indent = bool(operation.get("preserve_indent", False))
-    replacement_text = str(operation["text"])
+    changed = _apply_line_operation_to_records(
+        records,
+        "replace-lines",
+        operation,
+        newline,
+        text_for_anchor=text,
+    )
+    return (join_records(records), changed, "line-based")
 
-    if preserve_indent and start < len(records):
-        original_indent = _extract_indent(records[start][0])
-        if original_indent:
-            lines = replacement_text.split('\n')
-            adjusted = []
-            for line in lines:
-                if line and line[0] not in ' \t':
-                    adjusted.append(original_indent + line)
-                else:
-                    adjusted.append(line)
-            replacement_text = '\n'.join(adjusted)
 
-    following_exists = end < len(records)
-    original_final_sep = records[end - 1][1] if end > start else newline
-    final_sep = newline if following_exists else original_final_sep
-    replacement = block_records(replacement_text, newline, final_sep)
-    return (join_records(records[:start] + replacement + records[end:]), end - start, "line-based")
+class _OperationBuffer:
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self._records: Optional[List[Tuple[str, str]]] = None
+
+    def as_records(self) -> List[Tuple[str, str]]:
+        if self._records is None:
+            self._records = split_records(self._text)
+        return self._records
+
+    def as_text(self) -> str:
+        if self._records is not None:
+            self._text = join_records(self._records)
+            self._records = None
+        return self._text
+
+    def set_text(self, text: str) -> None:
+        self._text = text
+        self._records = None
 
 
 def apply_operation(text: str, operation: Dict[str, Any], newline: str, explain: bool = False,
                     ignore_indent: bool = False, ignore_eol: bool = False, normalize_whitespace: bool = False,
                     auto_match: bool = False, fuzzy: bool = False,
                     context_before: Optional[str] = None, context_after: Optional[str] = None) -> Tuple[str, int, str, str]:
-    """Apply a single operation and return (new_text, changed_count, op_name, match_strategy).
-    
-    match_strategy is "exact", "ignore-eol", "ignore-indent", "normalize-whitespace",
-    "regex", "line-based", or "fuzzy" — indicating how matching was performed.
-    """
+    """Apply a single operation and return text, count, name, and strategy."""
     op = str(operation.get("op") or operation.get("command") or "").replace("_", "-")
-    match_strategy = "exact"  # default
+    match_strategy = "exact"
     if op == "edit":
         if auto_match:
             new_text, changed, match_strategy = apply_literal_edit_cascade(
                 text, operation, newline, explain=explain, fuzzy=fuzzy,
                 context_before=context_before, context_after=context_after)
         else:
-            new_text, changed, match_strategy = apply_literal_edit(text, operation, newline, explain, 
-                                                    ignore_indent, ignore_eol, normalize_whitespace,
-                                                    context_before=context_before, context_after=context_after)
+            new_text, changed, match_strategy = apply_literal_edit(
+                text, operation, newline, explain,
+                ignore_indent, ignore_eol, normalize_whitespace,
+                context_before=context_before, context_after=context_after)
     elif op == "regex":
         new_text, changed, match_strategy = apply_regex_edit(text, operation, newline, explain)
     elif op == "insert":
@@ -2023,6 +2281,69 @@ def apply_operation(text: str, operation: Dict[str, Any], newline: str, explain:
         fail(f"unknown operation: {op or '<missing>'}")
     return (new_text, changed, op, match_strategy)
 
+
+def apply_operations(
+    text: str,
+    operations: List[Dict[str, Any]],
+    newline: str,
+    explain: bool = False,
+    ignore_indent: bool = False,
+    ignore_eol: bool = False,
+    normalize_whitespace: bool = False,
+    auto_match: bool = False,
+    fuzzy: bool = False,
+    context_before: Optional[str] = None,
+    context_after: Optional[str] = None,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Apply an operation list while reusing line records between line edits."""
+    buffer = _OperationBuffer(text)
+    results: List[Dict[str, Any]] = []
+
+    for index, operation in enumerate(operations, start=1):
+        op_name = str(
+            operation.get("op") or operation.get("command") or ""
+        ).replace("_", "-")
+        can_buffer = (
+            op_name in _LINE_BUFFER_OPERATIONS
+            and not operation.get("anchor_pattern")
+        )
+        if can_buffer:
+            changed = _apply_line_operation_to_records(
+                buffer.as_records(),
+                op_name,
+                operation,
+                newline,
+            )
+            op = op_name
+            match_strategy = "line-based"
+        else:
+            op_ctx_before = operation.get("context_before", context_before)
+            op_ctx_after = operation.get("context_after", context_after)
+            updated, changed, op, match_strategy = apply_operation(
+                buffer.as_text(),
+                operation,
+                newline,
+                explain,
+                ignore_indent,
+                ignore_eol,
+                normalize_whitespace,
+                auto_match=auto_match,
+                fuzzy=fuzzy,
+                context_before=op_ctx_before,
+                context_after=op_ctx_after,
+            )
+            buffer.set_text(updated)
+
+        results.append(
+            {
+                "index": index,
+                "op": op,
+                "changed": changed,
+                "matchStrategy": match_strategy,
+            }
+        )
+
+    return buffer.as_text(), results
 
 def apply_post_transforms(text: str, args: argparse.Namespace, newline: str) -> str:
     if args.trim_trailing_whitespace:
@@ -2119,68 +2440,136 @@ def generate_diff(path: Path, before: str, after: str, context: int) -> str:
     return "\n".join(diff)
 
 
-class FileLock:
-    def __init__(self, path: Path, timeout: float, stale_seconds: float) -> None:
-        self.file_path = path
+class FileLockSet:
+    """Acquire stable path locks, then inode alias locks, in global order."""
+
+    def __init__(
+        self,
+        paths: Iterable[Path],
+        timeout: float,
+        stale_seconds: float,
+    ) -> None:
+        canonical: Dict[str, Path] = {}
+        for raw_path in paths:
+            path = _canonical_lock_path(str(raw_path))
+            identity = os.path.normcase(os.path.abspath(str(path)))
+            canonical.setdefault(identity, path)
+        if not canonical:
+            fail("lock set requires at least one path")
+        self.file_paths = tuple(canonical[key] for key in sorted(canonical))
+        self.file_path = self.file_paths[0]
         self.timeout = timeout
         self.stale_seconds = stale_seconds
         self.acquired = False
-        # Use /tmp/safe-edit/locks/ (or system temp equivalent) — sandbox-safe
-        # Key is based on file identity (inode on Unix, path on Windows)
-        lock_key = _get_lock_key(str(path))
-        self.lock_path = _get_lock_dir() / f"{lock_key}.lock"
+        self.acquired_lock_paths: List[Path] = []
+        self.lock_path = _get_lock_dir() / f"{_get_lock_key(str(self.file_path))}.lock"
 
-    def __enter__(self) -> "FileLock":
-        deadline = time.monotonic() + max(0.0, self.timeout)
-        payload = f"pid={os.getpid()} time={time.time()} file={self.file_path.resolve()}\n".encode("utf-8")
-        while True:
-            try:
-                fd = os.open(str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                try:
-                    os.write(fd, payload)
-                finally:
-                    os.close(fd)
-                self.acquired = True
-                return self
-            except FileExistsError:
-                self.remove_stale_lock()
-                if time.monotonic() >= deadline:
-                    fail(f"lock already exists: {self.lock_path}")
-                time.sleep(0.05)
+    def _lock_specs(
+        self,
+        keyed_targets: Iterable[Tuple[str, Path]],
+    ) -> List[Tuple[Path, Path]]:
+        targets_by_key: Dict[str, Path] = {}
+        for key, target in keyed_targets:
+            targets_by_key.setdefault(key, target)
+        lock_dir = _get_lock_dir()
+        return [
+            (lock_dir / f"{key}.lock", targets_by_key[key])
+            for key in sorted(targets_by_key)
+        ]
 
-    def remove_stale_lock(self) -> None:
-        # Path 1: PID check — if lock owner is dead, remove immediately
-        pid = _read_lock_pid(self.lock_path)
+    def _remove_stale_lock(self, lock_path: Path) -> None:
+        pid = _read_lock_pid(lock_path)
         if pid is not None and not _is_process_alive(pid):
             try:
-                self.lock_path.unlink()
+                lock_path.unlink()
             except FileNotFoundError:
                 pass
             return
-
-        # Path 2: Stale age check
         if self.stale_seconds <= 0:
             return
         try:
-            age = time.time() - self.lock_path.stat().st_mtime
+            age = time.time() - lock_path.stat().st_mtime
         except FileNotFoundError:
             return
         if age <= self.stale_seconds:
             return
         try:
-            self.lock_path.unlink()
+            lock_path.unlink()
         except FileNotFoundError:
             return
         except OSError as exc:
-            fail(f"failed to remove stale lock {self.lock_path}: {exc}")
+            fail(f"failed to remove stale lock {lock_path}: {exc}")
 
-    def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
-        if self.acquired:
+    def remove_stale_lock(self) -> None:
+        self._remove_stale_lock(self.lock_path)
+
+    def _acquire_one(
+        self,
+        lock_path: Path,
+        target: Path,
+        deadline: float,
+    ) -> None:
+        payload = (
+            f"pid={os.getpid()} time={time.time()} "
+            f"file={target.resolve(strict=False)}\n"
+        ).encode("utf-8")
+        while True:
             try:
-                self.lock_path.unlink()
+                fd = os.open(
+                    str(lock_path),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                )
+                try:
+                    os.write(fd, payload)
+                finally:
+                    os.close(fd)
+                self.acquired_lock_paths.append(lock_path)
+                return
+            except FileExistsError:
+                self._remove_stale_lock(lock_path)
+                if time.monotonic() >= deadline:
+                    fail(f"lock already exists: {lock_path}")
+                time.sleep(0.05)
+
+    def _release_all(self) -> None:
+        for lock_path in reversed(self.acquired_lock_paths):
+            try:
+                lock_path.unlink()
             except FileNotFoundError:
                 pass
+        self.acquired_lock_paths.clear()
+        self.acquired = False
 
+    def __enter__(self) -> "FileLockSet":
+        deadline = time.monotonic() + max(0.0, self.timeout)
+        try:
+            for lock_path, target in self._lock_specs(
+                (_get_lock_key(str(path)), path)
+                for path in self.file_paths
+            ):
+                self._acquire_one(lock_path, target, deadline)
+
+            for lock_path, target in self._lock_specs(
+                (key, path)
+                for path in self.file_paths
+                for key in [_get_inode_lock_key(str(path))]
+                if key is not None
+            ):
+                self._acquire_one(lock_path, target, deadline)
+
+            self.acquired = True
+            return self
+        except BaseException:
+            self._release_all()
+            raise
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
+        self._release_all()
+
+
+class FileLock(FileLockSet):
+    def __init__(self, path: Path, timeout: float, stale_seconds: float) -> None:
+        super().__init__([path], timeout, stale_seconds)
 
 class NullLock:
     def __enter__(self) -> "NullLock":
@@ -2225,11 +2614,17 @@ def read_target(path: Path, max_bytes: int) -> bytes:
 
 def inspect_target(path: Path, original: bytes, encoding: EncodingInfo, text: str) -> Dict[str, Any]:
     newline_style, line_counts, mixed_line_endings = detect_line_ending(text)
-    records = split_records(text)
-    edit_plan = _compute_edit_plan(encoding, text, path,
-                                   newline_style=newline_style,
-                                   mixed=mixed_line_endings,
-                                   line_count=len(records))
+    line_count = sum(line_counts.values())
+    if text and not text.endswith(("\n", "\r")):
+        line_count += 1
+    edit_plan = _compute_edit_plan(
+        encoding,
+        text,
+        path,
+        newline_style=newline_style,
+        mixed=mixed_line_endings,
+        line_count=line_count,
+    )
     mode = stat.S_IMODE(path.stat().st_mode)
     return {
         "ok": True,
@@ -2243,7 +2638,7 @@ def inspect_target(path: Path, original: bytes, encoding: EncodingInfo, text: st
         "lineEnding": newline_style,
         "mixedLineEndings": mixed_line_endings,
         "lineEndingCounts": line_counts,
-        "lineCount": len(records),
+        "lineCount": line_count,
         "endsWithNewline": bool(text.endswith(("\n", "\r"))),
         "hasNul": "\x00" in text,
         "permissionsOctal": oct(mode),
@@ -2258,7 +2653,6 @@ def inspect_target(path: Path, original: bytes, encoding: EncodingInfo, text: st
         "skipped": True,
         "wouldChangeBytes": False,
     }
-
 
 def _compute_edit_plan(encoding: EncodingInfo, text: str, path: Path,
                        newline_style: Optional[str] = None, mixed: Optional[bool] = None,
@@ -2349,12 +2743,18 @@ def stat_target(
     capability: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Return a concise summary of file metadata with edit strategy for AI agents."""
-    newline_style, _line_counts, _mixed_line_endings = detect_line_ending(text)
-    records = split_records(text)
-    edit_plan = _compute_edit_plan(encoding, text, path,
-                                   newline_style=newline_style,
-                                   mixed=_mixed_line_endings,
-                                   line_count=len(records))
+    newline_style, line_counts, mixed_line_endings = detect_line_ending(text)
+    line_count = sum(line_counts.values())
+    if text and not text.endswith(("\n", "\r")):
+        line_count += 1
+    edit_plan = _compute_edit_plan(
+        encoding,
+        text,
+        path,
+        newline_style=newline_style,
+        mixed=mixed_line_endings,
+        line_count=line_count,
+    )
     cap = capability if capability is not None else check_fs_capability(str(path))
     return {
         "ok": True,
@@ -2363,9 +2763,9 @@ def stat_target(
         "encoding": encoding.name,
         "hasBom": bool(encoding.bom),
         "lineEnding": newline_style,
-        "mixedLineEndings": _mixed_line_endings,
+        "mixedLineEndings": mixed_line_endings,
         "sizeBytes": len(original),
-        "lineCount": len(records),
+        "lineCount": line_count,
         "sha256": hashlib.sha256(original).hexdigest(),
         "editMode": edit_plan["editMode"],
         "editStrategy": edit_plan["editStrategy"],
@@ -2383,7 +2783,6 @@ def stat_target(
         "skipped": True,
         "wouldChangeBytes": False,
     }
-
 
 def make_backup_path(path: Path, backup_dir: Optional[str], backup_suffix: str) -> Path:
     timestamp = time.strftime("%Y%m%d-%H%M%S")
@@ -2986,52 +3385,57 @@ def run_transaction(args: argparse.Namespace) -> Dict[str, Any]:
     if getattr(args, "_fs_capability_cache", None) is None:
         args._fs_capability_cache = {}
     children = [request_item_args(args, item, True) for item in items]
-    identities: Set[str] = set()
-    for child in children:
-        identity = os.path.normcase(os.path.abspath(child.file))
-        if identity in identities:
-            fail(f"transaction contains duplicate file: {child.file}")
-        identities.add(identity)
 
-    lock_paths = [Path(child.file) for child in children]
-    lock_paths.sort(key=lambda path: os.path.normcase(os.path.abspath(str(path))))
+    identities: Set[str] = set()
+    lock_paths: List[Path] = []
+    for child in children:
+        if child.command == "create":
+            target = resolve_create_path(child.file).resolve(strict=False)
+        else:
+            target = resolve_target_path(
+                child.file, child.follow_symlink
+            ).resolve(strict=False)
+        identity = os.path.normcase(os.path.abspath(str(target)))
+        if identity in identities:
+            fail(f"transaction contains duplicate canonical target: {child.file}")
+        identities.add(identity)
+        child.file = str(target)
+        lock_paths.append(target)
+
     previews: List[Dict[str, Any]] = []
     plans: List[Dict[str, Any]] = []
     results: List[Dict[str, Any]] = []
     attempted: List[Dict[str, Any]] = []
 
-    lock_stack = contextlib.ExitStack()
-    try:
-        if not args.no_lock and not args.dry_run:
-            for path in lock_paths:
-                lock_stack.enter_context(
-                    FileLock(path, args.lock_timeout, args.lock_stale_seconds)
-                )
+    # Expected hashes make planning safe outside the lock. Commit still
+    # revalidates every existing file while all cooperative locks are held.
+    for child in children:
+        preview = run(child)
+        plan = getattr(child, "_transaction_plan", None)
+        if not isinstance(plan, dict):
+            fail(f"transaction failed to prepare file: {child.file}")
+        previews.append(preview)
+        plans.append(plan)
 
-        # Each child runs once in dry-run mode and captures the exact bytes that
-        # would be committed. This combines the original snapshot and
-        # prevalidation pass instead of reading and transforming every file twice.
-        for child in children:
-            preview = run(child)
-            plan = getattr(child, "_transaction_plan", None)
-            if not isinstance(plan, dict):
-                fail(f"transaction failed to prepare file: {child.file}")
-            previews.append(preview)
-            plans.append(plan)
+    if args.dry_run:
+        return {
+            "ok": True,
+            "command": "transaction",
+            "file": None,
+            "files": previews,
+            "fileCount": len(previews),
+            "dryRun": True,
+            "written": False,
+            "rolledBack": False,
+            "atomicity": "prevalidated",
+        }
 
-        if args.dry_run:
-            return {
-                "ok": True,
-                "command": "transaction",
-                "file": None,
-                "files": previews,
-                "fileCount": len(previews),
-                "dryRun": True,
-                "written": False,
-                "rolledBack": False,
-                "atomicity": "prevalidated",
-            }
-
+    lock_context = (
+        NullLock()
+        if args.no_lock
+        else FileLockSet(lock_paths, args.lock_timeout, args.lock_stale_seconds)
+    )
+    with lock_context:
         try:
             for child, plan in zip(children, plans):
                 path = plan["path"]
@@ -3040,8 +3444,6 @@ def run_transaction(args: argparse.Namespace) -> Dict[str, Any]:
                 result["dryRun"] = False
 
                 if plan["action"] == "create":
-                    # Recheck immediately before the exclusive create so a file
-                    # that appeared after prevalidation is never overwritten.
                     resolve_create_path(str(path))
                     exclusive_create(path, output)
                     attempted.append(plan)
@@ -3051,9 +3453,6 @@ def run_transaction(args: argparse.Namespace) -> Dict[str, Any]:
                     result["created"] = True
                     plan["output"] = b""
                 else:
-                    # Locks are cooperative. Re-read immediately before commit to
-                    # catch writers that ignored the lock, but reuse the prepared
-                    # output instead of decoding and applying operations again.
                     current = read_target(path, args.max_bytes)
                     current_sha256 = hashlib.sha256(current).hexdigest()
                     if current_sha256 != plan["originalSha256"]:
@@ -3097,8 +3496,6 @@ def run_transaction(args: argparse.Namespace) -> Dict[str, Any]:
             if isinstance(exc, SafeEditError):
                 fail(f"transaction rolled back: {exc}")
             fail(f"transaction rolled back after unexpected error: {exc}")
-    finally:
-        lock_stack.close()
 
     return {
         "ok": True,
@@ -3112,7 +3509,6 @@ def run_transaction(args: argparse.Namespace) -> Dict[str, Any]:
         "atomicity": "prevalidated-with-rollback",
         "crashAtomic": False,
     }
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Safely edit text files.")
@@ -3551,8 +3947,6 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         newline_style, line_counts, mixed_line_endings = detect_line_ending(text)
         newline = line_sep(newline_style)
 
-        new_text = text
-        operation_results: List[Dict[str, Any]] = []
         explain = getattr(args, "explain_match_failure", False)
         ignore_indent = getattr(args, "ignore_indent", False)
         ignore_eol = getattr(args, "ignore_eol", False)
@@ -3561,15 +3955,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         fuzzy = getattr(args, "fuzzy", False)
         context_before = getattr(args, "context_before", None)
         context_after = getattr(args, "context_after", None)
-        for index, operation in enumerate(operations, start=1):
-            # Per-operation context_before/context_after overrides global
-            op_ctx_before = operation.get("context_before", context_before)
-            op_ctx_after = operation.get("context_after", context_after)
-            new_text, changed, op, match_strategy = apply_operation(new_text, operation, newline, explain,
-                                                     ignore_indent, ignore_eol, normalize_whitespace,
-                                                     auto_match=auto_match, fuzzy=fuzzy,
-                                                     context_before=op_ctx_before, context_after=op_ctx_after)
-            operation_results.append({"index": index, "op": op, "changed": changed, "matchStrategy": match_strategy})
+        new_text, operation_results = apply_operations(
+            text,
+            operations,
+            newline,
+            explain,
+            ignore_indent,
+            ignore_eol,
+            normalize_whitespace,
+            auto_match,
+            fuzzy,
+            context_before,
+            context_after,
+        )
 
         new_text = apply_post_transforms(new_text, args, newline)
         output_encoding = encoding_for_output(args.to_encoding, encoding)

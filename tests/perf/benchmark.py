@@ -1,115 +1,295 @@
 #!/usr/bin/env python3
-"""Performance benchmark for safe_edit.py"""
+"""Deterministic performance benchmark for safe_edit.py."""
 
-import time
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import math
+import platform
+import statistics
+import subprocess
 import sys
-import os
+import tempfile
+import time
+import tracemalloc
+from pathlib import Path
+from typing import Any, Callable, Dict, List
 
-sys.path.insert(0, '../../skills/safe-edit')
-from safe_edit import (
-    detect_encoding, strict_decode, detect_line_ending,
-    split_records, normalize_for_match, find_closest_match
-)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = REPO_ROOT / "skills" / "safe-edit" / "safe_edit.py"
+sys.path.insert(0, str(SCRIPT.parent))
 
-def timeit(func, *args, iterations=3):
-    """Run func multiple times and return average time."""
-    times = []
+import safe_edit as se  # noqa: E402
+
+
+def repeat_to_size(unit: str, size: int, suffix: str = "") -> str:
+    if size < len(suffix):
+        raise ValueError("size is smaller than suffix")
+    body_size = size - len(suffix)
+    count, remainder = divmod(body_size, len(unit))
+    return unit * count + unit[:remainder] + suffix
+
+
+def percentile(values: List[float], ratio: float) -> float:
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * ratio) - 1))
+    return ordered[index]
+
+
+def measure(
+    name: str,
+    fn: Callable[[], Any],
+    *,
+    input_bytes: int,
+    iterations: int,
+    warmups: int,
+    validate: Callable[[Any], None],
+    trace_memory: bool,
+) -> Dict[str, Any]:
+    for _ in range(warmups):
+        validate(fn())
+
+    samples: List[float] = []
+    output: Any = None
     for _ in range(iterations):
-        start = time.perf_counter()
-        result = func(*args)
-        elapsed = time.perf_counter() - start
-        times.append(elapsed)
-    return sum(times) / len(times), result
+        gc.collect()
+        started = time.perf_counter_ns()
+        output = fn()
+        samples.append((time.perf_counter_ns() - started) / 1_000_000)
 
-def benchmark_file(filepath, label):
-    """Run benchmarks on a single file."""
-    print(f"\n{'='*60}")
-    print(f"File: {label}")
-    print(f"{'='*60}")
-
-    # Read file
-    with open(filepath, 'rb') as f:
-        data = f.read()
-
-    size_mb = len(data) / 1024 / 1024
-    print(f"Size: {size_mb:.2f} MB ({len(data):,} bytes)")
-
-    # Benchmark 1: Encoding detection
-    t, encoding = timeit(detect_encoding, data, 'auto')
-    print(f"\n[1] detect_encoding:  {t*1000:6.1f} ms  ({encoding.name})")
-
-    # Decode text
-    text = strict_decode(data, encoding)
-
-    # Benchmark 2: Line ending detection
-    t, (le_style, le_counts, le_mixed) = timeit(detect_line_ending, text)
-    print(f"[2] detect_line_ending: {t*1000:6.1f} ms  ({le_style})")
-
-    # Benchmark 3: split_records
-    t, records = timeit(split_records, text)
-    print(f"[3] split_records:     {t*1000:6.1f} ms  ({len(records):,} lines)")
-
-    # Benchmark 4: normalize_for_match (ignore-indent)
-    t, normalized = timeit(normalize_for_match, text, True, False, False)
-    print(f"[4] normalize (indent): {t*1000:6.1f} ms")
-
-    # Benchmark 5: normalize_for_match (ignore-eol)
-    t, normalized = timeit(normalize_for_match, text, False, True, False)
-    print(f"[5] normalize (eol):    {t*1000:6.1f} ms")
-
-    # Benchmark 6: find_closest_match (single line pattern)
-    pattern = "process_item_1000"
-    t, result = timeit(find_closest_match, text, pattern)
-    print(f"[6] find_closest (1ln): {t*1000:6.1f} ms  (found: {result is not None})")
-
-    # Benchmark 7: find_closest_match (multi-line pattern)
-    pattern = "def process_item_500(data: str) -> str:\n    return data.strip()"
-    t, result = timeit(find_closest_match, text, pattern)
-    print(f"[7] find_closest (ml):  {t*1000:6.1f} ms  (found: {result is not None})")
-
-    # Benchmark 8: Simple string operations for comparison
-    t, _ = timeit(text.count, '\n')
-    print(f"[8] text.count('\\n'):  {t*1000:6.1f} ms  (baseline)")
-
-    t, _ = timeit(text.find, "process_item_500")
-    print(f"[9] text.find():       {t*1000:6.1f} ms  (baseline)")
-
-    return {
-        'size_mb': size_mb,
-        'detect_encoding': None,
-        'detect_line_ending': None,
-        'split_records': None,
-        'normalize_indent': None,
-        'normalize_eol': None,
-        'find_closest_single': None,
-        'find_closest_multi': None,
+    validate(output)
+    median_ms = statistics.median(samples)
+    result: Dict[str, Any] = {
+        "name": name,
+        "inputBytes": input_bytes,
+        "iterations": iterations,
+        "minMs": min(samples),
+        "medianMs": median_ms,
+        "p95Ms": percentile(samples, 0.95),
+        "maxMs": max(samples),
+        "throughputMiBPerSecond": (
+            input_bytes / 1024 / 1024 / (median_ms / 1000)
+            if input_bytes and median_ms
+            else None
+        ),
     }
 
-def main():
-    print("safe_edit.py Performance Benchmark")
-    print("="*60)
+    if trace_memory:
+        gc.collect()
+        tracemalloc.start()
+        validate(fn())
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        result["peakTracedMiB"] = peak / 1024 / 1024
+    return result
 
-    test_files = [
-        ('test_100kb.txt', '100 KB'),
-        ('test_1000kb.txt', '1 MB'),
-        ('test_10000kb.txt', '10 MB'),
-        ('test_50000kb.txt', '50 MB'),
+
+def run_cli(command: str, path: Path) -> Dict[str, Any]:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            command,
+            "--file",
+            str(path),
+            "--json",
+        ],
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"{command} failed ({completed.returncode}): "
+            f"stdout={completed.stdout!r} stderr={completed.stderr!r}"
+        )
+    return json.loads(completed.stdout)
+
+
+def validate_cli(value: Dict[str, Any]) -> None:
+    if not value.get("ok") or value.get("written"):
+        raise AssertionError(value)
+
+
+def add_size_cases(
+    results: List[Dict[str, Any]],
+    size: int,
+    path: Path,
+    text: str,
+    args: argparse.Namespace,
+) -> None:
+    common = {
+        "input_bytes": size,
+        "iterations": args.iterations,
+        "warmups": args.warmups,
+        "trace_memory": args.trace_memory,
+    }
+    results.append(
+        measure(
+            "cli.inspect",
+            lambda: run_cli("inspect", path),
+            validate=validate_cli,
+            **{**common, "trace_memory": False},
+        )
+    )
+    results.append(
+        measure(
+            "cli.stat",
+            lambda: run_cli("stat", path),
+            validate=lambda value: (
+                validate_cli(value)
+                if len(value.get("sha256", "")) == 64
+                else (_ for _ in ()).throw(AssertionError(value))
+            ),
+            **{**common, "trace_memory": False},
+        )
+    )
+
+    line_operations = [
+        {"op": "replace-lines", "start": 10, "end": 10, "text": "replacement"},
+        {"op": "insert", "line": 20, "text": "inserted"},
+        {"op": "delete-lines", "start": 30, "end": 31},
     ]
 
-    results = []
-    for filename, label in test_files:
-        if os.path.exists(filename):
-            result = benchmark_file(filename, label)
-            results.append((label, result))
-        else:
-            print(f"\n[SKIP] {filename} not found")
+    results.append(
+        measure(
+            "core.batch-line-ops",
+            lambda: se.apply_operations(text, line_operations, "\r\n"),
+            validate=lambda value: (
+                None
+                if sum(item["changed"] for item in value[1]) == 4
+                else (_ for _ in ()).throw(AssertionError(value))
+            ),
+            **common,
+        )
+    )
 
-    # Summary table
-    print("\n" + "="*60)
-    print("SUMMARY (times in ms)")
-    print("="*60)
-    print(f"{'File':<10} {'encoding':>10} {'line_end':>10} {'split':>10} {'norm_ind':>10}")
-    print("-"*60)
+    regex_text = repeat_to_size("value=123456 other=text\n", size)
+    regex_matches = regex_text.count("value=123456")
+    regex_operation = {
+        "pattern": r"value=\d+",
+        "replacement": "value=0",
+        "expected_count": regex_matches,
+    }
+    results.append(
+        measure(
+            "core.regex-all",
+            lambda: se.apply_regex_edit(regex_text, regex_operation, "\n"),
+            validate=lambda value: (
+                None
+                if value[1] == regex_matches
+                else (_ for _ in ()).throw(AssertionError(value))
+            ),
+            **common,
+        )
+    )
 
-if __name__ == '__main__':
-    main()
+    normalized = repeat_to_size(
+        "ordinary = 123456789\r\n",
+        size,
+        "\r\nneedle_one\r\nneedle_two\r\n",
+    )
+    normalize_operation = {
+        "old": "needle_one\nneedle_two",
+        "new": "done",
+        "first": True,
+    }
+    results.append(
+        measure(
+            "core.normalize-ignore-eol-tail",
+            lambda: se.apply_literal_edit(
+                normalized,
+                normalize_operation,
+                "\r\n",
+                ignore_eol=True,
+            ),
+            validate=lambda value: (
+                None
+                if value[1] == 1
+                else (_ for _ in ()).throw(AssertionError(value))
+            ),
+            **common,
+        )
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sizes-mib", default="1,10")
+    parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument("--warmups", type=int, default=1)
+    parser.add_argument("--context-matches", type=int, default=1000)
+    parser.add_argument("--trace-memory", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    if args.iterations < 1 or args.warmups < 0 or args.context_matches < 1:
+        parser.error("iterations/context-matches must be positive and warmups non-negative")
+
+    sizes = [
+        max(4096, int(float(value) * 1024 * 1024))
+        for value in args.sizes_mib.split(",")
+    ]
+    results: List[Dict[str, Any]] = []
+
+    context_text = "scope-A\nneedle\n" * args.context_matches
+    context_operation = {"old": "needle", "new": "changed", "first": True}
+    results.append(
+        measure(
+            "core.context-before",
+            lambda: se.apply_literal_edit(
+                context_text,
+                context_operation,
+                "\n",
+                context_before="scope-A",
+            ),
+            input_bytes=len(context_text),
+            iterations=args.iterations,
+            warmups=args.warmups,
+            validate=lambda value: (
+                None
+                if value[1] == 1
+                else (_ for _ in ()).throw(AssertionError(value))
+            ),
+            trace_memory=args.trace_memory,
+        )
+    )
+
+    with tempfile.TemporaryDirectory(prefix="safe-edit-benchmark-") as temp_name:
+        temp_dir = Path(temp_name)
+        for size in sizes:
+            text = repeat_to_size(
+                "scope-A\r\n    value = 1234567890\r\n",
+                size,
+            )
+            path = temp_dir / f"input-{size}.txt"
+            path.write_bytes(text.encode("ascii"))
+            before = path.read_bytes()
+            add_size_cases(results, size, path, text, args)
+            if path.read_bytes() != before:
+                raise AssertionError("benchmark modified its input fixture")
+
+    document = {
+        "schemaVersion": 1,
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "script": str(SCRIPT),
+        "results": results,
+    }
+    if args.json:
+        print(json.dumps(document, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"{'case':36} {'bytes':>10} {'median':>11} {'p95':>11} {'MiB/s':>10}")
+        for row in results:
+            throughput = row["throughputMiBPerSecond"] or 0.0
+            print(
+                f"{row['name']:36} {row['inputBytes']:10d} "
+                f"{row['medianMs']:10.2f}ms {row['p95Ms']:10.2f}ms "
+                f"{throughput:10.2f}"
+            )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
