@@ -3935,6 +3935,13 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertEqual(result.name, "utf-8")
         self.assertEqual(result.bom, b"")
 
+    def test_detect_and_decode_reuses_auto_decode_result(self):
+        m = self._import_safe_edit()
+        with patch.object(m, "strict_decode", side_effect=AssertionError):
+            encoding, text = m.detect_and_decode(b"hello world\n", "auto")
+        self.assertEqual(encoding.name, "utf-8")
+        self.assertEqual(text, "hello world\n")
+
     def test_detect_encoding_auto_gbk(self):
         """Test detect_encoding auto falls back to GBK for non-UTF-8 CJK."""
         m = self._import_safe_edit()
@@ -4978,6 +4985,41 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertEqual(dst.read_bytes(), b"old\n")
 
 
+    def test_atomic_replace_stages_beside_target_first(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "target-stage-first.txt"
+        target.write_bytes(b"old\n")
+        real_mkstemp = m.tempfile.mkstemp
+
+        with patch.object(m.tempfile, "mkstemp", wraps=real_mkstemp) as mkstemp_mock:
+            m.atomic_replace(target, b"new\n", False, None, ".bak")
+
+        self.assertEqual(target.read_bytes(), b"new\n")
+        self.assertEqual(len(mkstemp_mock.call_args_list), 1)
+        stage_dir = mkstemp_mock.call_args_list[0].kwargs["dir"]
+        self.assertEqual(Path(stage_dir).resolve(), target.parent.resolve())
+
+    def test_atomic_replace_falls_back_when_target_staging_is_denied(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "target-stage-fallback.txt"
+        target.write_bytes(b"old\n")
+        real_mkstemp = m.tempfile.mkstemp
+        stage_dirs = []
+
+        def deny_target_staging(*args, **kwargs):
+            stage_dir = Path(kwargs["dir"]).resolve()
+            stage_dirs.append(stage_dir)
+            if stage_dir == target.parent.resolve():
+                raise OSError(errno.EACCES, "Permission denied")
+            return real_mkstemp(*args, **kwargs)
+
+        with patch.object(m.tempfile, "mkstemp", side_effect=deny_target_staging):
+            m.atomic_replace(target, b"new\n", False, None, ".bak")
+
+        self.assertEqual(target.read_bytes(), b"new\n")
+        self.assertEqual(stage_dirs[0], target.parent.resolve())
+        self.assertEqual(stage_dirs[1], Path(m._get_tmp_dir()).resolve())
+
     def test_preflight_reports_runtime_and_transports(self):
         result = self.run_tool("preflight", "--json")
         payload = json.loads(result.stdout)
@@ -4985,6 +5027,36 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertTrue(payload["base64Available"])
         self.assertIn("stdin", payload["requestTransports"])
         self.assertTrue(payload["pythonExecutable"])
+
+    def test_stat_many_reuses_parent_capability_probe(self):
+        m = self._import_safe_edit()
+        first = self.tmpdir / "stat-many-first.txt"
+        second = self.tmpdir / "stat-many-second.txt"
+        request = self.tmpdir / "stat-many.json"
+        first.write_bytes(b"first\n")
+        second.write_bytes(b"second\n")
+        request.write_text(
+            json.dumps({"files": [str(first), {"file": str(second)}]}),
+            encoding="utf-8",
+        )
+        args = m.build_parser().parse_args(
+            ["stat-many", "--request-file", str(request)]
+        )
+
+        with patch.object(
+            m, "check_fs_capability", wraps=m.check_fs_capability
+        ) as capability_mock:
+            result = m.run(args)
+
+        self.assertEqual(result["command"], "stat-many")
+        self.assertEqual(result["fileCount"], 2)
+        self.assertEqual(capability_mock.call_count, 1)
+        self.assertEqual(
+            result["files"][0]["sha256"], hashlib.sha256(b"first\n").hexdigest()
+        )
+        self.assertEqual(
+            result["files"][1]["sha256"], hashlib.sha256(b"second\n").hexdigest()
+        )
 
     def test_transaction_edits_and_creates_as_one_request(self):
         existing = self.tmpdir / "existing-transaction.txt"
@@ -5062,7 +5134,8 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         )
 
         with patch.object(m, "read_target", wraps=m.read_target) as read_mock, \
-                patch.object(m, "apply_operation", wraps=m.apply_operation) as apply_mock:
+                patch.object(m, "apply_operation", wraps=m.apply_operation) as apply_mock, \
+                patch.object(m.json, "loads", wraps=m.json.loads) as json_loads_mock:
             result = m.run(args)
 
         target_reads = [
@@ -5071,6 +5144,7 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         ]
         self.assertEqual(len(target_reads), 2)
         self.assertEqual(apply_mock.call_count, 1)
+        self.assertEqual(json_loads_mock.call_count, 1)
         self.assertTrue(result["written"])
         self.assertEqual(target.read_bytes(), b"beta\n")
 

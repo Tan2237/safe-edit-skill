@@ -10,6 +10,7 @@ import codecs
 import contextlib
 import difflib
 import errno
+import functools
 import hashlib
 import json
 import os
@@ -21,7 +22,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
 class SafeEditError(Exception):
@@ -755,6 +756,7 @@ def encode_text(text: str, info: EncodingInfo) -> bytes:
         fail(f"failed to encode as {info.name}: {exc}")
 
 
+@functools.lru_cache(maxsize=1)
 def _get_tmp_dir() -> str:
     """Get the best available temporary directory for sandbox environments.
 
@@ -867,7 +869,26 @@ def check_fs_capability(target_file: str) -> Dict[str, Any]:
     return result
 
 
-def looks_like_utf16_without_bom(data: bytes) -> Optional[EncodingInfo]:
+def _cached_fs_capability(
+    args: argparse.Namespace,
+    target_file: str,
+) -> Dict[str, Any]:
+    cache = getattr(args, "_fs_capability_cache", None)
+    if cache is None:
+        cache = {}
+        args._fs_capability_cache = cache
+    target_dir = os.path.normcase(
+        os.path.abspath(str(Path(target_file).resolve().parent))
+    )
+    if target_dir not in cache:
+        cache[target_dir] = check_fs_capability(target_file)
+    return cache[target_dir]
+
+
+def looks_like_utf16_without_bom(
+    data: bytes,
+    validate: bool = True,
+) -> Optional[EncodingInfo]:
     sample = data[:4096]
     if len(sample) < 4:
         return None
@@ -880,6 +901,8 @@ def looks_like_utf16_without_bom(data: bytes) -> Optional[EncodingInfo]:
         info = EncodingInfo("utf-16-be", "utf-16-be")
     else:
         return None
+    if not validate:
+        return info
     try:
         data.decode(info.codec, errors="strict")
         return info
@@ -887,38 +910,54 @@ def looks_like_utf16_without_bom(data: bytes) -> Optional[EncodingInfo]:
         return None
 
 
-def detect_encoding(data: bytes, requested: str) -> EncodingInfo:
+def detect_and_decode(
+    data: bytes,
+    requested: str,
+) -> Tuple[EncodingInfo, str]:
     requested = normalize_encoding(requested)
     if requested != "auto":
-        return make_encoding_info(requested, data)
+        info = make_encoding_info(requested, data)
+        return info, strict_decode(data, info)
 
     if data.startswith(codecs.BOM_UTF8):
-        return EncodingInfo("utf-8-bom", "utf-8", codecs.BOM_UTF8)
+        info = EncodingInfo("utf-8-bom", "utf-8", codecs.BOM_UTF8)
+        return info, strict_decode(data, info)
     if data.startswith(codecs.BOM_UTF16_LE):
-        return EncodingInfo("utf-16-le", "utf-16-le", codecs.BOM_UTF16_LE)
+        info = EncodingInfo("utf-16-le", "utf-16-le", codecs.BOM_UTF16_LE)
+        return info, strict_decode(data, info)
     if data.startswith(codecs.BOM_UTF16_BE):
-        return EncodingInfo("utf-16-be", "utf-16-be", codecs.BOM_UTF16_BE)
+        info = EncodingInfo("utf-16-be", "utf-16-be", codecs.BOM_UTF16_BE)
+        return info, strict_decode(data, info)
     if not data:
-        return EncodingInfo("utf-8", "utf-8")
+        return EncodingInfo("utf-8", "utf-8"), ""
 
-    utf16 = looks_like_utf16_without_bom(data)
+    utf16 = looks_like_utf16_without_bom(data, validate=False)
     if utf16 is not None:
-        return utf16
+        try:
+            return utf16, data.decode(utf16.codec, errors="strict")
+        except UnicodeDecodeError:
+            pass
 
     try:
-        data.decode("utf-8", errors="strict")
-        return EncodingInfo("utf-8", "utf-8")
+        text = data.decode("utf-8", errors="strict")
+        return EncodingInfo("utf-8", "utf-8"), text
     except UnicodeDecodeError:
         pass
 
     try:
-        data.decode("gbk", errors="strict")
-        return EncodingInfo("gbk", "gbk")
+        text = data.decode("gbk", errors="strict")
+        return EncodingInfo("gbk", "gbk"), text
     except UnicodeDecodeError as exc:
         fail(
-            "unable to auto-detect encoding as UTF-8, UTF-8 BOM, UTF-16 BOM/raw, or GBK; "
+            "unable to auto-detect encoding as UTF-8, UTF-8 BOM, "
+            "UTF-16 BOM/raw, or GBK; "
             f"use --encoding to override ({exc})"
         )
+
+
+def detect_encoding(data: bytes, requested: str) -> EncodingInfo:
+    encoding, _text = detect_and_decode(data, requested)
+    return encoding
 
 
 def detect_line_ending(text: str) -> Tuple[str, Dict[str, int], bool]:
@@ -2302,7 +2341,13 @@ def _compute_edit_plan(encoding: EncodingInfo, text: str, path: Path,
     }
 
 
-def stat_target(path: Path, original: bytes, encoding: EncodingInfo, text: str) -> Dict[str, Any]:
+def stat_target(
+    path: Path,
+    original: bytes,
+    encoding: EncodingInfo,
+    text: str,
+    capability: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Return a concise summary of file metadata with edit strategy for AI agents."""
     newline_style, _line_counts, _mixed_line_endings = detect_line_ending(text)
     records = split_records(text)
@@ -2310,7 +2355,7 @@ def stat_target(path: Path, original: bytes, encoding: EncodingInfo, text: str) 
                                    newline_style=newline_style,
                                    mixed=_mixed_line_endings,
                                    line_count=len(records))
-    cap = check_fs_capability(str(path))
+    cap = capability if capability is not None else check_fs_capability(str(path))
     return {
         "ok": True,
         "file": str(path),
@@ -2513,14 +2558,33 @@ def atomic_replace(
     backup_suffix: str,
 ) -> Optional[str]:
     directory = path.parent
-    # Use /tmp (or system temp) for staging — sandbox-safe
-    tmp_dir = _get_tmp_dir()
     prefix = f".{path.name}.safe-edit."
     fd = -1
     tmp_name = ""
     backup_name = None
     try:
-        fd, tmp_name = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=tmp_dir)
+        # Prefer staging beside the target. This keeps the final replace atomic
+        # and avoids writing the complete output twice when system temp is on a
+        # different filesystem. Sandboxes that forbid target-dir staging still
+        # fall back to the writable system temporary directory.
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=prefix,
+                suffix=".tmp",
+                dir=str(directory),
+            )
+        except OSError:
+            tmp_dir = _get_tmp_dir()
+            if os.path.normcase(os.path.abspath(tmp_dir)) == os.path.normcase(
+                os.path.abspath(str(directory))
+            ):
+                raise
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=prefix,
+                suffix=".tmp",
+                dir=tmp_dir,
+            )
+
         with os.fdopen(fd, "wb") as handle:
             fd = -1
             handle.write(data)
@@ -2549,6 +2613,14 @@ def atomic_replace(
 
 
 def load_batch_operations(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Optional[Path]]:
+    internal_operations = getattr(args, "_batch_operations", None)
+    if internal_operations is not None:
+        operations: List[Dict[str, Any]] = []
+        for index, item in enumerate(internal_operations, start=1):
+            if not isinstance(item, dict):
+                fail(f"batch operation {index} must be an object")
+            operations.append(dict(item))
+        return operations, None
     sources = [
         args.ops is not None,
         args.ops_file is not None,
@@ -2733,6 +2805,7 @@ def command_to_operations(args: argparse.Namespace, warnings: Optional[List[str]
 
 
 def load_request_payload(args: argparse.Namespace) -> Dict[str, Any]:
+    request_name = args.command
     sources = [
         args.request_file is not None,
         args.request_base64 is not None,
@@ -2740,7 +2813,7 @@ def load_request_payload(args: argparse.Namespace) -> Dict[str, Any]:
     ].count(True)
     if sources != 1:
         fail(
-            "transaction requires exactly one of --request-file, "
+            f"{request_name} requires exactly one of --request-file, "
             "--request-base64, or --request-stdin"
         )
     if args.request_file is not None:
@@ -2752,11 +2825,11 @@ def load_request_payload(args: argparse.Namespace) -> Dict[str, Any]:
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        fail(f"invalid transaction JSON: {exc}")
+        fail(f"invalid {request_name} JSON: {exc}")
     if isinstance(payload, list):
         payload = {"files": payload}
     if not isinstance(payload, dict):
-        fail("transaction JSON must be an object or a list of file requests")
+        fail(f"{request_name} JSON must be an object or a list of file requests")
     if "files" not in payload and "file" in payload:
         payload = {"files": [payload]}
     return payload
@@ -2818,7 +2891,8 @@ def request_item_args(
         if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
             fail(f"edit request for {file_value} requires expectedSha256 from stat")
         child.command = "batch"
-        child.ops = json.dumps(operations, ensure_ascii=False)
+        child._batch_operations = operations
+        child.ops = None
         child.ops_file = None
         child.ops_base64 = None
         child.ops_stdin = False
@@ -2851,19 +2925,73 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
+def run_stat_many(args: argparse.Namespace) -> Dict[str, Any]:
+    payload = load_request_payload(args)
+    items = payload.get("files")
+    if not isinstance(items, list) or not items:
+        fail("stat-many request requires a non-empty files list")
+
+    capability_cache: Dict[str, Dict[str, Any]] = {}
+    results: List[Dict[str, Any]] = []
+    identities: Set[str] = set()
+    default_encoding = str(payload.get("encoding", args.encoding))
+
+    for index, item in enumerate(items, start=1):
+        if isinstance(item, str):
+            file_value = item
+            options: Dict[str, Any] = {}
+        elif isinstance(item, dict):
+            file_value = item.get("file")
+            options = item
+        else:
+            fail(f"stat-many file request {index} must be a string or object")
+        if not isinstance(file_value, str) or not file_value:
+            fail(f"stat-many file request {index} requires a non-empty file")
+
+        identity = os.path.normcase(os.path.abspath(file_value))
+        if identity in identities:
+            fail(f"stat-many contains duplicate file: {file_value}")
+        identities.add(identity)
+
+        child = argparse.Namespace(**vars(args))
+        child.command = "stat"
+        child.file = file_value
+        child.encoding = str(
+            options.get("inputEncoding", options.get("encoding", default_encoding))
+        )
+        child.expected_sha256 = options.get("expectedSha256")
+        child.follow_symlink = bool(options.get("followSymlink", False))
+        child.max_bytes = int(options.get("maxBytes", args.max_bytes))
+        child._fs_capability_cache = capability_cache
+        results.append(run(child))
+
+    return {
+        "ok": True,
+        "command": "stat-many",
+        "file": None,
+        "files": results,
+        "fileCount": len(results),
+        "dryRun": True,
+        "written": False,
+        "skipped": True,
+    }
+
+
 def run_transaction(args: argparse.Namespace) -> Dict[str, Any]:
     payload = load_request_payload(args)
     items = payload.get("files")
     if not isinstance(items, list) or not items:
         fail("transaction request requires a non-empty files list")
 
+    if getattr(args, "_fs_capability_cache", None) is None:
+        args._fs_capability_cache = {}
     children = [request_item_args(args, item, True) for item in items]
-    identities: List[str] = []
+    identities: Set[str] = set()
     for child in children:
         identity = os.path.normcase(os.path.abspath(child.file))
         if identity in identities:
             fail(f"transaction contains duplicate file: {child.file}")
-        identities.append(identity)
+        identities.add(identity)
 
     lock_paths = [Path(child.file) for child in children]
     lock_paths.sort(key=lambda path: os.path.normcase(os.path.abspath(str(path))))
@@ -2993,6 +3121,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             "inspect",
             "stat",
+            "stat-many",
             "preflight",
             "transaction",
             "create",
@@ -3121,7 +3250,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--ops-stdin', action='store_true')
     parser.add_argument('--request-file')
     parser.add_argument('--request-base64',
-                        help='URL-safe or standard Base64 containing UTF-8 transaction JSON')
+                        help='URL-safe or standard Base64 containing a UTF-8 structured request')
     parser.add_argument('--request-stdin', action='store_true')
     return parser
 
@@ -3144,7 +3273,7 @@ def run_remove_file(args: argparse.Namespace) -> Dict[str, Any]:
         fail("remove-file requires --expected-sha256 with exactly 64 hexadecimal characters")
 
     path, root = resolve_remove_path(args.file, args.workspace_root)
-    cap = check_fs_capability(str(path))
+    cap = _cached_fs_capability(args, str(path))
     if not cap["directoryWritable"]:
         fail(f"target directory is not writable: {path.parent}")
 
@@ -3230,7 +3359,7 @@ def run_create(args: argparse.Namespace) -> Dict[str, Any]:
     if args.force_write:
         fail("--force-write is not applicable to create")
 
-    cap = check_fs_capability(str(path))
+    cap = _cached_fs_capability(args, str(path))
     if not cap["directoryWritable"]:
         fail(f"target directory is not writable: {path.parent}")
 
@@ -3329,6 +3458,8 @@ def run_create(args: argparse.Namespace) -> Dict[str, Any]:
 def run(args: argparse.Namespace) -> Dict[str, Any]:
     if args.command == "preflight":
         return run_preflight(args)
+    if args.command == "stat-many":
+        return run_stat_many(args)
     if args.command == "transaction":
         return run_transaction(args)
     if not args.file:
@@ -3359,8 +3490,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     "SHA-256 mismatch: "
                     f"expected {expected}, actual {actual}; run stat again"
                 )
-        encoding = detect_encoding(original, args.encoding)
-        text = strict_decode(original, encoding)
+        encoding, text = detect_and_decode(original, args.encoding)
         return inspect_target(path, original, encoding, text)
     if args.command == "stat":
         original = read_target(path, args.max_bytes)
@@ -3374,12 +3504,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     "SHA-256 mismatch: "
                     f"expected {expected}, actual {actual}; run stat again"
                 )
-        encoding = detect_encoding(original, args.encoding)
-        text = strict_decode(original, encoding)
-        return stat_target(path, original, encoding, text)
+        encoding, text = detect_and_decode(original, args.encoding)
+        capability = _cached_fs_capability(args, str(path))
+        return stat_target(path, original, encoding, text, capability)
 
     # Sandbox capability detection
-    cap = check_fs_capability(str(path))
+    cap = _cached_fs_capability(args, str(path))
     if cap["executionMode"] == "readonly-fallback":
         fail(
             "Sandbox does not allow file writes or temp file creation.\n"
@@ -3414,8 +3544,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     "SHA-256 mismatch: "
                     f"expected {expected}, actual {actual}; run stat again"
                 )
-        encoding = detect_encoding(original, args.encoding)
-        text = strict_decode(original, encoding)
+        encoding, text = detect_and_decode(original, args.encoding)
         if "\x00" in text and not args.allow_nul:
             fail("decoded text contains NUL bytes; refusing likely binary content")
 
@@ -3537,6 +3666,9 @@ def emit_summary(summary: Dict[str, Any], as_json: bool) -> None:
             f"written={summary['written']} atomicity={summary['atomicity']}"
         )
         return
+    if summary.get("command") == "stat-many":
+        print(f"Stat-many: files={summary['fileCount']}")
+        return
     if summary.get("command") == "stat":
         # Concise output for AI agents
         size_kb = summary['sizeBytes'] / 1024
@@ -3609,8 +3741,9 @@ def main(argv: List[str]) -> int:
                 try:
                     path = resolve_target_path(file_path, getattr(args, 'follow_symlink', False))
                     original = read_target(path, getattr(args, 'max_bytes', 50 * 1024 * 1024))
-                    encoding = detect_encoding(original, getattr(args, 'encoding', 'auto'))
-                    text = strict_decode(original, encoding)
+                    encoding, text = detect_and_decode(
+                        original, getattr(args, 'encoding', 'auto')
+                    )
 
                     # Get the search pattern (may come from --old, --old-file, or --old-stdin)
                     if command == "edit":

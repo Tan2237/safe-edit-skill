@@ -11,8 +11,9 @@ description: |
 
   Before modifying or removing an existing file:
     1. Resolve SAFE_EDIT_SCRIPT from this SKILL.md location.
-    2. Run: python "SAFE_EDIT_SCRIPT" stat --file FILE --json
-    3. Cache editStrategy and sha256 for that file.
+    2. Run `stat --file FILE --json` for one file, or one structured
+       `stat-many` request for a related multi-file set.
+    3. Cache editStrategy and sha256 for every file.
     4. Follow the returned strategy for edits; use remove-file only for an
        explicitly requested deletion.
 
@@ -80,6 +81,20 @@ Before the first edit or removal of each existing file:
 ```bash
 python "SAFE_EDIT_SCRIPT" stat --file F --json
 ```
+
+For two or more related existing files, prefer one structured request so Python
+startup and filesystem capability probes are shared:
+
+```json
+{"files":["src/a.py",{"file":"src/b.py","encoding":"utf-8"}]}
+```
+
+```bash
+python "SAFE_EDIT_SCRIPT" stat-many --request-stdin --json
+```
+
+The returned `files` array contains the same per-file `editStrategy` and
+`sha256` fields as individual `stat` calls.
 
 For an explicitly requested file deletion, pass the returned `sha256` and the
 containing workspace root to `remove-file`. Never remove a directory or
@@ -150,6 +165,11 @@ python "SAFE_EDIT_SCRIPT" preflight --file F --json
 
 # Before editing or removing any existing file (mandatory first step)
 python "SAFE_EDIT_SCRIPT" stat --file F --json
+
+# Inspect a related multi-file set in one process
+python "SAFE_EDIT_SCRIPT" stat-many --request-stdin --json
+python "SAFE_EDIT_SCRIPT" stat-many --request-file EXISTING_JSON --json
+python "SAFE_EDIT_SCRIPT" stat-many --request-base64 B64 --json
 
 # Prevalidate and apply a related multi-file request with rollback on failure
 python "SAFE_EDIT_SCRIPT" transaction --request-stdin --json
@@ -311,7 +331,7 @@ regex                       ← HIGHEST EDIT RISK
 
 8. **Use `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
 
-9. **Use transactions for related files** — obtain `stat` hashes for existing files, require `expectedSha256` on every edit request, and include controlled creates in the same request. Treat `atomicity: prevalidated-with-rollback` as process-level rollback, not crash-atomicity.
+9. **Use transactions for related files** — obtain hashes with one `stat-many` request when possible, require `expectedSha256` on every edit request, and include controlled creates in the same transaction. Treat `atomicity: prevalidated-with-rollback` as process-level rollback, not crash-atomicity.
 
 10. **Re-read and validate after edits** — successful execution confirms only the payload received by `safe_edit.py`. For literal argv, re-read or compile/test to verify intent. Base64/stdin transports substantially reduce this risk.
 
