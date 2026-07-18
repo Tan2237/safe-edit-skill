@@ -2788,6 +2788,7 @@ def request_item_args(
     child.no_lock = True
     child.interactive = False
     child.backup = False
+    child._capture_transaction_plan = True
     child.backup_dir = None
     child.follow_symlink = bool(item.get("followSymlink", False))
     child.expected_sha256 = item.get("expectedSha256")
@@ -2866,9 +2867,10 @@ def run_transaction(args: argparse.Namespace) -> Dict[str, Any]:
 
     lock_paths = [Path(child.file) for child in children]
     lock_paths.sort(key=lambda path: os.path.normcase(os.path.abspath(str(path))))
-    originals: Dict[str, Tuple[bool, bytes]] = {}
     previews: List[Dict[str, Any]] = []
+    plans: List[Dict[str, Any]] = []
     results: List[Dict[str, Any]] = []
+    attempted: List[Dict[str, Any]] = []
 
     lock_stack = contextlib.ExitStack()
     try:
@@ -2877,14 +2879,17 @@ def run_transaction(args: argparse.Namespace) -> Dict[str, Any]:
                 lock_stack.enter_context(
                     FileLock(path, args.lock_timeout, args.lock_stale_seconds)
                 )
+
+        # Each child runs once in dry-run mode and captures the exact bytes that
+        # would be committed. This combines the original snapshot and
+        # prevalidation pass instead of reading and transforming every file twice.
         for child in children:
-            path = Path(child.file)
-            exists = path.exists()
-            originals[os.path.normcase(os.path.abspath(child.file))] = (
-                exists,
-                read_target(path, args.max_bytes) if exists else b"",
-            )
-            previews.append(run(child))
+            preview = run(child)
+            plan = getattr(child, "_transaction_plan", None)
+            if not isinstance(plan, dict):
+                fail(f"transaction failed to prepare file: {child.file}")
+            previews.append(preview)
+            plans.append(plan)
 
         if args.dry_run:
             return {
@@ -2899,35 +2904,71 @@ def run_transaction(args: argparse.Namespace) -> Dict[str, Any]:
                 "atomicity": "prevalidated",
             }
 
-        for child in children:
-            actual = argparse.Namespace(**vars(child))
-            actual.dry_run = False
-            results.append(run(actual))
-    except Exception as exc:
-        rollback_errors: List[str] = []
-        for child in reversed(children):
-            key = os.path.normcase(os.path.abspath(child.file))
-            existed, original = originals[key]
-            path = Path(child.file)
-            try:
-                if existed:
-                    if not path.exists():
-                        fail("target disappeared during transaction")
-                    if path.read_bytes() != original:
-                        atomic_replace(path, original, False, None, ".bak")
-                elif path.exists():
-                    path.unlink()
-                    fsync_directory(path.parent)
-            except Exception as rollback_exc:
-                rollback_errors.append(f"{child.file}: {rollback_exc}")
-        if rollback_errors:
-            fail(
-                f"transaction failed ({exc}); rollback also failed: "
-                + "; ".join(rollback_errors)
-            )
-        if isinstance(exc, SafeEditError):
-            fail(f"transaction rolled back: {exc}")
-        fail(f"transaction rolled back after unexpected error: {exc}")
+        try:
+            for child, plan in zip(children, plans):
+                path = plan["path"]
+                output = plan["output"]
+                result = dict(plan["summary"])
+                result["dryRun"] = False
+
+                if plan["action"] == "create":
+                    # Recheck immediately before the exclusive create so a file
+                    # that appeared after prevalidation is never overwritten.
+                    resolve_create_path(str(path))
+                    exclusive_create(path, output)
+                    attempted.append(plan)
+                    if path.read_bytes() != output:
+                        fail("post-write verification failed: bytes on disk do not match intended output")
+                    result["written"] = True
+                    result["created"] = True
+                    plan["output"] = b""
+                else:
+                    # Locks are cooperative. Re-read immediately before commit to
+                    # catch writers that ignored the lock, but reuse the prepared
+                    # output instead of decoding and applying operations again.
+                    current = read_target(path, args.max_bytes)
+                    current_sha256 = hashlib.sha256(current).hexdigest()
+                    if current_sha256 != plan["originalSha256"]:
+                        fail(f"target changed after transaction prevalidation: {path}")
+                    if output == current and not child.force_write:
+                        result["skipped"] = True
+                    else:
+                        plan["original"] = current
+                        attempted.append(plan)
+                        backup = atomic_replace(
+                            path, output, False, None, child.backup_suffix
+                        )
+                        if path.read_bytes() != output:
+                            fail("post-write verification failed: bytes on disk do not match intended output")
+                        result["backup"] = backup
+                        result["written"] = True
+                    plan["output"] = b""
+                results.append(result)
+        except Exception as exc:
+            rollback_errors: List[str] = []
+            for plan in reversed(attempted):
+                path = plan["path"]
+                try:
+                    if plan["action"] == "create":
+                        if path.exists():
+                            path.unlink()
+                            fsync_directory(path.parent)
+                    else:
+                        original = plan["original"]
+                        if not path.exists():
+                            fail("target disappeared during transaction")
+                        if path.read_bytes() != original:
+                            atomic_replace(path, original, False, None, ".bak")
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"{path}: {rollback_exc}")
+            if rollback_errors:
+                fail(
+                    f"transaction failed ({exc}); rollback also failed: "
+                    + "; ".join(rollback_errors)
+                )
+            if isinstance(exc, SafeEditError):
+                fail(f"transaction rolled back: {exc}")
+            fail(f"transaction rolled back after unexpected error: {exc}")
     finally:
         lock_stack.close()
 
@@ -3254,6 +3295,13 @@ def run_create(args: argparse.Namespace) -> Dict[str, Any]:
     if args.diff:
         summary["diff"] = diff_text
 
+    if getattr(args, "_capture_transaction_plan", False):
+        args._transaction_plan = {
+            "action": "create",
+            "path": path,
+            "output": output,
+            "summary": summary,
+        }
     if args.dry_run:
         return summary
 
@@ -3437,6 +3485,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         if args.diff:
             summary["diff"] = diff_text
 
+        if getattr(args, "_capture_transaction_plan", False):
+            args._transaction_plan = {
+                "action": "edit",
+                "path": path,
+                "originalSha256": args.expected_sha256.lower(),
+                "output": output,
+                "summary": summary,
+            }
         if not args.dry_run:
             # Interactive mode: prompt before writing
             interactive = getattr(args, 'interactive', False)

@@ -5030,6 +5030,97 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertEqual(existing.read_bytes(), b"beta\n")
         self.assertEqual(created.read_bytes(), b"new\nfile\n")
 
+    def test_transaction_reuses_prevalidated_edit_plan(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "planned-transaction.txt"
+        request = self.tmpdir / "planned-transaction.json"
+        target.write_bytes(b"alpha\n")
+        request.write_text(
+            json.dumps(
+                {
+                    "files": [
+                        {
+                            "file": str(target),
+                            "action": "edit",
+                            "expectedSha256": hashlib.sha256(b"alpha\n").hexdigest(),
+                            "operations": [
+                                {
+                                    "op": "edit",
+                                    "old": "alpha",
+                                    "new": "beta",
+                                    "expected_count": 1,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = m.build_parser().parse_args(
+            ["transaction", "--request-file", str(request)]
+        )
+
+        with patch.object(m, "read_target", wraps=m.read_target) as read_mock, \
+                patch.object(m, "apply_operation", wraps=m.apply_operation) as apply_mock:
+            result = m.run(args)
+
+        target_reads = [
+            call for call in read_mock.call_args_list
+            if Path(call.args[0]) == target
+        ]
+        self.assertEqual(len(target_reads), 2)
+        self.assertEqual(apply_mock.call_count, 1)
+        self.assertTrue(result["written"])
+        self.assertEqual(target.read_bytes(), b"beta\n")
+
+    def test_transaction_revalidates_target_before_committing_plan(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "concurrent-transaction.txt"
+        request = self.tmpdir / "concurrent-transaction.json"
+        target.write_bytes(b"alpha\n")
+        request.write_text(
+            json.dumps(
+                {
+                    "files": [
+                        {
+                            "file": str(target),
+                            "action": "edit",
+                            "expectedSha256": hashlib.sha256(b"alpha\n").hexdigest(),
+                            "operations": [
+                                {
+                                    "op": "edit",
+                                    "old": "alpha",
+                                    "new": "beta",
+                                    "expected_count": 1,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = m.build_parser().parse_args(
+            ["transaction", "--request-file", str(request)]
+        )
+        real_read_target = m.read_target
+        reads = {"target": 0}
+
+        def mutate_before_commit(path, max_bytes):
+            if Path(path) == target:
+                reads["target"] += 1
+                if reads["target"] == 2:
+                    target.write_bytes(b"external\n")
+            return real_read_target(path, max_bytes)
+
+        with patch.object(m, "read_target", side_effect=mutate_before_commit):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run(args)
+
+        self.assertIn("target changed after transaction prevalidation", str(ctx.exception))
+        self.assertEqual(target.read_bytes(), b"external\n")
+
     def test_transaction_request_base64_dry_run_does_not_write(self):
         created = self.tmpdir / "base64-transaction.txt"
         request = json.dumps(

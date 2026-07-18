@@ -539,8 +539,10 @@ python safe_edit.py transaction --request-stdin --json
 `expectedSha256`；新文件仍拒绝覆盖并要求显式 `encoding` 和
 `lineEnding`。
 
-事务会在持锁后预演全部文件，并在进程内写入失败时恢复原字节、删除本事务已创建
-的文件。返回的 `atomicity` 为 `prevalidated-with-rollback`；
+事务会在持锁后预演全部文件，并复用预演生成的最终字节作为提交计划；提交前仅重新
+读取目标以拦截忽略协作锁的并发写入，不会重复解码、匹配和计算编辑。进程内写入失败
+时会恢复原字节、删除本事务已创建的文件。返回的 `atomicity` 为
+`prevalidated-with-rollback`；
 这不是跨文件系统或断电级原子提交。
 
 ## 编码注意事项
