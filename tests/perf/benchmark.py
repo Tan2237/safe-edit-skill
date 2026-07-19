@@ -214,6 +214,51 @@ def add_size_cases(
         )
     )
 
+    whitespace_text = repeat_to_size(
+        "ordinary value ",
+        size,
+        "needle   one",
+    )
+    whitespace_operation = {
+        "old": "needle one",
+        "new": "done",
+        "first": True,
+    }
+    results.append(
+        measure(
+            "core.normalize-whitespace-tail",
+            lambda: se.apply_literal_edit(
+                whitespace_text,
+                whitespace_operation,
+                "\n",
+                normalize_whitespace=True,
+            ),
+            validate=lambda value: (
+                None
+                if value[1] == 1
+                else (_ for _ in ()).throw(AssertionError(value))
+            ),
+            **common,
+        )
+    )
+
+    repeated_lines = repeat_to_size(
+        "ordinary generated line\n",
+        size,
+    )
+    results.append(
+        measure(
+            "core.closest-match-repeated-miss",
+            lambda: se.find_closest_match(repeated_lines, "zzzzzzzzzz"),
+            validate=lambda value: (
+                None
+                if value is None
+                else (_ for _ in ()).throw(AssertionError(value))
+            ),
+            **common,
+        )
+    )
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()

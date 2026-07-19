@@ -13,6 +13,7 @@ import difflib
 import errno
 import functools
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -501,6 +502,7 @@ def find_closest_match(text: str, pattern: str, max_lines: int = 10) -> Optional
         best_score = 0.0
         best_line = 0
         best_fragment = ""
+        score_cache: Dict[str, float] = {}
         
         for i, line in enumerate(text_lines):
             # Check if pattern is substring of line
@@ -516,9 +518,14 @@ def find_closest_match(text: str, pattern: str, max_lines: int = 10) -> Optional
                     best_fragment = line
                 continue
             
-            # Character-level similarity
-            matcher = difflib.SequenceMatcher(None, pattern, line)
-            score = matcher.ratio()
+            # Repeated generated/config lines are common in large files.
+            # Cache their score so diagnostics do not rerun SequenceMatcher.
+            score = score_cache.get(line)
+            if score is None:
+                matcher = difflib.SequenceMatcher(None, pattern, line)
+                score = matcher.ratio()
+                if len(score_cache) < 4096:
+                    score_cache[line] = score
             if score > best_score:
                 best_score = score
                 best_line = i
@@ -1004,41 +1011,56 @@ def line_sep(style: str) -> str:
     return {"crlf": "\r\n", "cr": "\r", "lf": "\n"}[style]
 
 
-def split_records(text: str) -> List[Tuple[str, str]]:
-    """Split text into (line_content, line_ending) tuples.
+def _split_homogeneous_records(
+    text: str,
+    separator: str,
+) -> List[Tuple[str, str]]:
+    """Split text that is known to use one line-ending sequence."""
+    records: List[Any] = text.split(separator)
+    last_index = len(records) - 1
+    for index in range(last_index):
+        records[index] = (records[index], separator)
+    if records[last_index]:
+        records[last_index] = (records[last_index], "")
+    else:
+        records.pop()
+    return records
 
-    Uses pre-compiled regex for C-optimized performance.
-    Handles CRLF, CR, and LF line endings correctly.
-    """
+
+def split_records(text: str) -> List[Tuple[str, str]]:
+    """Split text into (line_content, line_ending) tuples."""
     if not text:
         return []
 
-    # Split by line endings, keeping the separators
+    # Homogeneous files are overwhelmingly common. str.split is substantially
+    # faster and reuses one separator object instead of materializing a regex
+    # capture for every line ending.
+    if "\r" not in text:
+        return _split_homogeneous_records(text, "\n")
+    if "\n" not in text:
+        return _split_homogeneous_records(text, "\r")
+    crlf_count = text.count("\r\n")
+    if crlf_count == text.count("\r") == text.count("\n"):
+        return _split_homogeneous_records(text, "\r\n")
+
+    # Mixed line endings require preserving the separator of every record.
     parts = _LINE_ENDING_RE.split(text)
-
-    # parts alternates: [content, ending, content, ending, ..., content]
-    # If text ends with line ending, last part is empty string
     records: List[Tuple[str, str]] = []
-
-    i = 0
-    while i < len(parts):
-        content = parts[i]
-        if i + 1 < len(parts):
-            # Has a line ending
-            ending = parts[i + 1]
-            records.append((content, ending))
-            i += 2
+    index = 0
+    while index < len(parts):
+        content = parts[index]
+        if index + 1 < len(parts):
+            records.append((content, parts[index + 1]))
+            index += 2
         else:
-            # Last content without ending
-            if content:  # Skip empty trailing content
+            if content:
                 records.append((content, ""))
-            i += 1
-
+            index += 1
     return records
 
 
 def join_records(records: Iterable[Tuple[str, str]]) -> str:
-    return "".join(line + sep for line, sep in records)
+    return "".join(itertools.chain.from_iterable(records))
 
 
 def normalize_user_newlines(text: str, sep: str) -> str:
@@ -1504,42 +1526,71 @@ class _EolPositionMapper:
         self.original_text = original_text
         self.original_pos = 0
         self.normalized_pos = 0
-        self._next_cr_pos: Optional[int] = None
-
-    def _refresh_next_cr(self) -> int:
-        self._next_cr_pos = self.original_text.find("\r", self.original_pos)
-        return self._next_cr_pos
 
     def _advance_to(self, boundary: int) -> int:
         if boundary < self.normalized_pos:
             self.original_pos = 0
             self.normalized_pos = 0
-            self._next_cr_pos = None
+        remaining = boundary - self.normalized_pos
+        if remaining <= 0:
+            return self.original_pos
 
-        while self.normalized_pos < boundary:
-            remaining = boundary - self.normalized_pos
-            cr_pos = self._next_cr_pos
-            if cr_pos is None:
-                cr_pos = self._refresh_next_cr()
-            if cr_pos < 0 or cr_pos - self.original_pos >= remaining:
-                self.original_pos += remaining
-                self.normalized_pos = boundary
+        # A normalized boundary differs from its original boundary only by the
+        # number of CRLF pairs before it. Repeated C-level count() calls converge
+        # quickly and avoid one Python loop per line ending.
+        base_original = self.original_pos
+        candidate = base_original + remaining
+        text_size = len(self.original_text)
+        while True:
+            extra = self.original_text.count(
+                "\r\n",
+                base_original,
+                min(text_size, candidate + 1),
+            )
+            updated = base_original + remaining + extra
+            if updated == candidate:
                 break
+            candidate = updated
 
-            plain_length = cr_pos - self.original_pos
-            self.original_pos = cr_pos
-            self.normalized_pos += plain_length
-            if (
-                self.original_pos + 1 < len(self.original_text)
-                and self.original_text[self.original_pos + 1] == "\n"
-            ):
-                self.original_pos += 2
+        self.original_pos = candidate
+        self.normalized_pos = boundary
+        return candidate
+
+    def map_span(self, normalized_start: int, normalized_length: int) -> Tuple[int, int]:
+        original_start = self._advance_to(normalized_start)
+        original_end = self._advance_to(normalized_start + normalized_length)
+        return original_start, original_end - original_start
+
+
+class _WhitespacePositionMapper:
+    r"""Map offsets after re.sub(r"\s+", " ", text) back to original text."""
+
+    def __init__(self, original_text: str) -> None:
+        self.original_text = original_text
+        self.original_pos = 0
+        self.normalized_pos = 0
+
+    def _advance_to(self, boundary: int) -> int:
+        if boundary < self.normalized_pos:
+            self.original_pos = 0
+            self.normalized_pos = 0
+
+        text = self.original_text
+        text_size = len(text)
+        original_pos = self.original_pos
+        normalized_pos = self.normalized_pos
+        while normalized_pos < boundary and original_pos < text_size:
+            if text[original_pos].isspace():
+                original_pos += 1
+                while original_pos < text_size and text[original_pos].isspace():
+                    original_pos += 1
             else:
-                self.original_pos += 1
-            self.normalized_pos += 1
-            self._next_cr_pos = None
+                original_pos += 1
+            normalized_pos += 1
 
-        return self.original_pos
+        self.original_pos = original_pos
+        self.normalized_pos = normalized_pos
+        return original_pos
 
     def map_span(self, normalized_start: int, normalized_length: int) -> Tuple[int, int]:
         original_start = self._advance_to(normalized_start)
@@ -1608,7 +1659,7 @@ def _apply_edit_with_context(
     context_before: str,
     context_after: str,
     line_index: Optional[Any] = None,
-    eol_mapper: Optional[_EolPositionMapper] = None,
+    position_mapper: Optional[Any] = None,
 ) -> Tuple[str, int, str]:
     if ignore_indent or ignore_eol or normalize_whitespace:
         positions: List[Tuple[int, int]] = []
@@ -1629,7 +1680,7 @@ def _apply_edit_with_context(
                 normalize_whitespace,
                 start_search_pos=search_start_orig,
                 line_index=line_index,
-                eol_mapper=eol_mapper,
+                position_mapper=position_mapper,
             )
             if original_pos >= 0:
                 positions.append((original_pos, original_len))
@@ -1711,9 +1762,11 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
             ignore_indent,
             ignore_eol,
         )
-    eol_mapper = None
+    position_mapper = None
     if ignore_eol and not ignore_indent and not normalize_whitespace:
-        eol_mapper = _EolPositionMapper(text)
+        position_mapper = _EolPositionMapper(text)
+    elif normalize_whitespace and not ignore_indent:
+        position_mapper = _WhitespacePositionMapper(text)
 
     if context_before or context_after:
         return _apply_edit_with_context(
@@ -1731,7 +1784,7 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
             context_before or "",
             context_after or "",
             line_index=line_index,
-            eol_mapper=eol_mapper,
+            position_mapper=position_mapper,
         )
 
     actual = normalized_text.count(normalized_old)
@@ -1761,7 +1814,7 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
                 ignore_eol,
                 normalize_whitespace,
                 line_index=line_index,
-                eol_mapper=eol_mapper,
+                position_mapper=position_mapper,
             )
             if original_pos < 0:
                 return (text, 0, effective_strategy)
@@ -1785,7 +1838,7 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
                     normalize_whitespace,
                     start_search_pos=search_start_orig,
                     line_index=line_index,
-                    eol_mapper=eol_mapper,
+                    position_mapper=position_mapper,
                 )
                 if original_pos >= 0:
                     spans.append((original_pos, original_len))
@@ -1808,11 +1861,14 @@ def find_original_position(original_text: str, normalized_text: str, norm_pos: i
                             ignore_indent: bool, ignore_eol: bool, normalize_whitespace: bool,
                             start_search_pos: int = 0,
                             line_index: Optional[Any] = None,
-                            eol_mapper: Optional[_EolPositionMapper] = None) -> Tuple[int, int]:
+                            position_mapper: Optional[Any] = None) -> Tuple[int, int]:
     """Map a normalized match position back to an original-text span."""
     if not ignore_indent and not ignore_eol and not normalize_whitespace:
         pos = original_text.find(original_old, start_search_pos)
         return (pos, len(original_old)) if pos >= 0 else (-1, 0)
+
+    if position_mapper is not None:
+        return position_mapper.map_span(norm_pos, len(normalized_old))
 
     candidate = original_text.find(original_old, start_search_pos)
     if candidate >= 0:
@@ -1824,14 +1880,6 @@ def find_original_position(original_text: str, normalized_text: str, norm_pos: i
         )
         if normalized_candidate == normalized_old:
             return (candidate, len(original_old))
-
-    if (
-        eol_mapper is not None
-        and ignore_eol
-        and not ignore_indent
-        and not normalize_whitespace
-    ):
-        return eol_mapper.map_span(norm_pos, len(normalized_old))
 
     if ignore_indent and not normalize_whitespace:
         result = _find_original_position_line_based(

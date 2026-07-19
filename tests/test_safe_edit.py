@@ -3792,6 +3792,24 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertIsNone(m.find_closest_match("text", ""))
         self.assertIsNone(m.find_closest_match("", "text"))
 
+    def test_find_closest_match_caches_repeated_lines(self):
+        m = self._import_safe_edit()
+        sequence_matcher = m.difflib.SequenceMatcher
+        calls = 0
+
+        def counted_matcher(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return sequence_matcher(*args, **kwargs)
+
+        with patch.object(m.difflib, "SequenceMatcher", side_effect=counted_matcher):
+            result = m.find_closest_match(
+                "ordinary generated line\n" * 1000,
+                "zzzzzzzzzz",
+            )
+        self.assertIsNone(result)
+        self.assertEqual(calls, 1)
+
     def test_extract_nearby_content_no_match(self):
         """Test extract_nearby_content returns None when no close match found."""
         m = self._import_safe_edit()
@@ -4024,6 +4042,24 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         records = m.split_records(text)
         result = m.join_records(records)
         self.assertEqual(result, text)
+
+    def test_split_records_homogeneous_fast_paths(self):
+        m = self._import_safe_edit()
+
+        class RejectRegexSplit:
+            def split(self, _text):
+                raise AssertionError("homogeneous input used regex fallback")
+
+        samples = (
+            "alpha\nbeta\n",
+            "alpha\r\nbeta\r\n",
+            "alpha\rbeta\r",
+            "alpha",
+        )
+        with patch.object(m, "_LINE_ENDING_RE", RejectRegexSplit()):
+            for text in samples:
+                with self.subTest(text=repr(text)):
+                    self.assertEqual(m.join_records(m.split_records(text)), text)
 
     def test_detect_line_ending_no_newlines(self):
         """Test detect_line_ending returns 'lf' for text with no newlines."""
@@ -5441,36 +5477,59 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertIn("cli.inspect", names)
         self.assertIn("cli.stat", names)
         self.assertIn("core.batch-line-ops", names)
+        self.assertIn("core.normalize-whitespace-tail", names)
+        self.assertIn("core.closest-match-repeated-miss", names)
         for item in payload["results"]:
             self.assertGreaterEqual(item["medianMs"], 0)
             self.assertGreaterEqual(item["p95Ms"], item["minMs"])
 
 
-    def test_ignore_eol_mapper_reuses_cr_scan(self):
+    def test_ignore_eol_mapper_maps_mixed_line_endings(self):
         m = self._import_safe_edit()
-        text = "value\n" * 500
+        text = "a\r\nb\rc\nd\r\n"
+        mapper = m._EolPositionMapper(text)
+        expected_boundaries = (0, 1, 3, 4, 5, 6, 7, 8, 10)
+        self.assertEqual(
+            [mapper._advance_to(index) for index in range(9)],
+            list(expected_boundaries),
+        )
+        self.assertEqual(mapper._advance_to(2), 3)
+
+    def test_ignore_eol_mapper_handles_many_matches(self):
+        m = self._import_safe_edit()
+        text = "value\r\n" * 500
         operation = {
-            "old": "value\r\n",
+            "old": "value\n",
             "new": "done\n",
             "expected_count": 500,
         }
-        scan_count = 0
-        refresh_next_cr = m._EolPositionMapper._refresh_next_cr
-
-        def counted_refresh(mapper):
-            nonlocal scan_count
-            scan_count += 1
-            return refresh_next_cr(mapper)
-
-        with patch.object(
-            m._EolPositionMapper, "_refresh_next_cr", counted_refresh
-        ):
-            result, changed, _strategy = m.apply_literal_edit(
-                text, operation, "\n", ignore_eol=True
-            )
+        result, changed, _strategy = m.apply_literal_edit(
+            text, operation, "\r\n", ignore_eol=True
+        )
         self.assertEqual(changed, 500)
-        self.assertEqual(result, "done\n" * 500)
-        self.assertEqual(scan_count, 1)
+        self.assertEqual(result, "done\r\n" * 500)
+
+    def test_normalize_whitespace_mapper_handles_tail_and_multiple_matches(self):
+        m = self._import_safe_edit()
+        prefix = "ordinary value " * 1000
+        text = prefix + "alpha   beta / alpha beta"
+        normalized = m.normalize_for_match(text, normalize_whitespace=True)
+        normalized_start = normalized.index("alpha beta")
+        mapper = m._WhitespacePositionMapper(text)
+        original_start, original_length = mapper.map_span(
+            normalized_start,
+            len("alpha beta"),
+        )
+        self.assertEqual(text[original_start:original_start + original_length], "alpha   beta")
+
+        result, changed, _strategy = m.apply_literal_edit(
+            text,
+            {"old": "alpha beta", "new": "done", "expected_count": 2},
+            "\n",
+            normalize_whitespace=True,
+        )
+        self.assertEqual(changed, 2)
+        self.assertEqual(result, prefix + "done / done")
 
     def test_ignore_indent_line_index_is_lazy(self):
         m = self._import_safe_edit()
