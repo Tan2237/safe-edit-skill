@@ -2,6 +2,7 @@ import base64
 import codecs
 import errno
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -3810,6 +3811,32 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertIsNone(result)
         self.assertEqual(calls, 1)
 
+    def test_find_closest_match_skips_disjoint_multiline_windows(self):
+        m = self._import_safe_edit()
+        sequence_matcher = m.difflib.SequenceMatcher
+        calls = 0
+
+        def counted_matcher(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return sequence_matcher(*args, **kwargs)
+
+        with patch.object(m.difflib, "SequenceMatcher", side_effect=counted_matcher):
+            result = m.find_closest_match(
+                "ordinary generated line\n" * 1000,
+                "missing one\nmissing two\nmissing three",
+            )
+        self.assertIsNone(result)
+        self.assertEqual(calls, 0)
+
+    def test_find_closest_match_multiline_shared_line(self):
+        m = self._import_safe_edit()
+        result = m.find_closest_match(
+            "beta\ngamma\nalpha\nbeta\nsame\ndelta\nbeta",
+            "delta\nbeta\ngamma",
+        )
+        self.assertEqual(result, (1, "beta\ngamma\nalpha"))
+
     def test_extract_nearby_content_no_match(self):
         """Test extract_nearby_content returns None when no close match found."""
         m = self._import_safe_edit()
@@ -3843,6 +3870,44 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         m = self._import_safe_edit()
         with self.assertRaises(m.SafeEditError):
             m.set_final_newline("hello\n", "invalid_mode", "\n")
+
+    def test_linear_post_transforms_preserve_semantics(self):
+        m = self._import_safe_edit()
+        self.assertEqual(
+            m.trim_trailing_whitespace("a  \r\nb\t\rc \n d\t"),
+            "a\r\nb\rc\n d",
+        )
+        self.assertEqual(
+            m.set_final_newline("payload\r\n\r\n\n\r", "strip", "\n"),
+            "payload",
+        )
+
+    def test_json_match_failure_reuses_loaded_text(self):
+        m = self._import_safe_edit()
+        path = self.tmpdir / "diagnostic_reuse.txt"
+        path.write_bytes(b"present\n")
+        stdout = io.StringIO()
+
+        with (
+            patch.object(m, "read_target", wraps=m.read_target) as read_mock,
+            patch("sys.stdout", stdout),
+        ):
+            result = m.main([
+                "edit",
+                "--file",
+                str(path),
+                "--old",
+                "missing",
+                "--new",
+                "changed",
+                "--json",
+                "--no-lock",
+            ])
+
+        self.assertEqual(result, 2)
+        self.assertEqual(read_mock.call_count, 1)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["error"]["type"], "match_not_found")
 
     def test_make_backup_path_with_slash_fails(self):
         """Test make_backup_path rejects path separators in suffix."""
@@ -5376,7 +5441,9 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
             )
 
         with patch.object(
-            m, "split_records", wraps=m.split_records
+            m,
+            "_split_keepends_records",
+            wraps=m._split_keepends_records,
         ) as split_mock:
             actual, actual_results = m.apply_operations(
                 text, operations, "\n"
@@ -5424,6 +5491,30 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertEqual(changed, 1)
         self.assertIn("changed", result)
         self.assertEqual(window_mock.call_count, 200)
+
+    def test_normalize_whitespace_context_uses_direct_spans(self):
+        m = self._import_safe_edit()
+        text = "scope-A\nneedle   one\nscope-B\nneedle \t one\n"
+        operation = {
+            "old": "needle one",
+            "new": "changed",
+            "expected_count": 1,
+        }
+        with patch.object(
+            m,
+            "_WhitespacePositionMapper",
+            side_effect=AssertionError("direct spans should bypass the mapper"),
+        ):
+            result, changed, strategy = m.apply_literal_edit(
+                text,
+                operation,
+                "\n",
+                normalize_whitespace=True,
+                context_before="scope-B",
+            )
+        self.assertEqual(result, "scope-A\nneedle   one\nscope-B\nchanged\n")
+        self.assertEqual(changed, 1)
+        self.assertEqual(strategy, "normalize-whitespace")
 
     def test_regex_unlimited_path_skips_precount(self):
         m = self._import_safe_edit()
@@ -5478,7 +5569,10 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertIn("cli.stat", names)
         self.assertIn("core.batch-line-ops", names)
         self.assertIn("core.normalize-whitespace-tail", names)
+        self.assertIn("core.normalize-whitespace-context-tail", names)
+        self.assertIn("core.trim-trailing-whitespace", names)
         self.assertIn("core.closest-match-repeated-miss", names)
+        self.assertIn("core.closest-match-multiline-miss", names)
         for item in payload["results"]:
             self.assertGreaterEqual(item["medianMs"], 0)
             self.assertGreaterEqual(item["p95Ms"], item["minMs"])

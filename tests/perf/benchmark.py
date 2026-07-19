@@ -242,6 +242,44 @@ def add_size_cases(
         )
     )
 
+    whitespace_context_text = repeat_to_size(
+        "ordinary value\n",
+        size,
+        "scope-B\nneedle   one\n",
+    )
+    results.append(
+        measure(
+            "core.normalize-whitespace-context-tail",
+            lambda: se.apply_literal_edit(
+                whitespace_context_text,
+                whitespace_operation,
+                "\n",
+                normalize_whitespace=True,
+                context_before="scope-B",
+            ),
+            validate=lambda value: (
+                None
+                if value[1] == 1
+                else (_ for _ in ()).throw(AssertionError(value))
+            ),
+            **common,
+        )
+    )
+
+    trailing_whitespace_text = repeat_to_size("value   \r\n", size)
+    results.append(
+        measure(
+            "core.trim-trailing-whitespace",
+            lambda: se.trim_trailing_whitespace(trailing_whitespace_text),
+            validate=lambda value: (
+                None
+                if "   \r\n" not in value
+                else (_ for _ in ()).throw(AssertionError("whitespace remains"))
+            ),
+            **common,
+        )
+    )
+
     repeated_lines = repeat_to_size(
         "ordinary generated line\n",
         size,
@@ -250,6 +288,21 @@ def add_size_cases(
         measure(
             "core.closest-match-repeated-miss",
             lambda: se.find_closest_match(repeated_lines, "zzzzzzzzzz"),
+            validate=lambda value: (
+                None
+                if value is None
+                else (_ for _ in ()).throw(AssertionError(value))
+            ),
+            **common,
+        )
+    )
+    results.append(
+        measure(
+            "core.closest-match-multiline-miss",
+            lambda: se.find_closest_match(
+                repeated_lines,
+                "missing one\nmissing two\nmissing three",
+            ),
             validate=lambda value: (
                 None
                 if value is None

@@ -86,6 +86,9 @@ def _read_lock_pid(lock_path: Path) -> Optional[int]:
 # Pre-compiled regex for line ending detection (used by split_records)
 # Matches CRLF, CR, or LF - order matters: CRLF must be first to avoid partial matches
 _LINE_ENDING_RE = re.compile(r'(\r\n|\r|\n)')
+_WHITESPACE_RE = re.compile(r"\s+")
+_TRAILING_WHITESPACE_RE = re.compile(r"[ \t]+(?=\r\n|\r|\n|\Z)")
+_NON_CRLF_LINE_SEPARATOR_RE = re.compile(r"[\v\f\x1c-\x1e\x85\u2028\u2029]")
 
 
 @dataclass(frozen=True)
@@ -537,25 +540,46 @@ def find_closest_match(text: str, pattern: str, max_lines: int = 10) -> Optional
         
         return None
     
-    # Multi-line pattern matching
+    # A line-level SequenceMatcher can only score above zero when a
+    # candidate window shares at least one exact line with the pattern.
+    max_start = len(text_lines) - pattern_len
+    if max_start < 0:
+        return None
+
+    pattern_line_set = set(pattern_lines)
+    candidate_starts = set()
+    for text_index, line in enumerate(text_lines):
+        if line not in pattern_line_set:
+            continue
+        first_start = max(0, text_index - pattern_len + 1)
+        last_start = min(text_index, max_start)
+        candidate_starts.update(range(first_start, last_start + 1))
+
     best_score = 0.0
     best_start = 0
-    
-    for i in range(len(text_lines) - pattern_len + 1):
-        fragment = text_lines[i:i + pattern_len]
-        # Calculate similarity using SequenceMatcher
-        matcher = difflib.SequenceMatcher(None, pattern_lines, fragment)
-        score = matcher.ratio()
+    pattern_tuple = tuple(pattern_lines)
+    score_cache: Dict[Tuple[str, ...], float] = {}
+
+    for start in sorted(candidate_starts):
+        fragment = tuple(text_lines[start:start + pattern_len])
+        if fragment == pattern_tuple:
+            return (start + 1, "\n".join(fragment))
+
+        score = score_cache.get(fragment)
+        if score is None:
+            score = difflib.SequenceMatcher(None, pattern_tuple, fragment).ratio()
+            if len(score_cache) < 4096:
+                score_cache[fragment] = score
         if score > best_score:
             best_score = score
-            best_start = i
-    
+            best_start = start
+
     # Only return if we found something reasonably close (>= 50% similar)
     if best_score >= 0.5:
         fragment_lines = text_lines[best_start:best_start + pattern_len]
         fragment_text = "\n".join(fragment_lines)
         return (best_start + 1, fragment_text)  # 1-based line number
-    
+
     return None
 
 
@@ -661,7 +685,12 @@ def explain_match_failure(expected: str, actual_text: str, context_lines: int = 
     return "\n".join(lines)
 
 
-def find_context_anchor(text: str, context_pattern: str, occurrence: Optional[int] = None) -> int:
+def find_context_anchor(
+    text: str,
+    context_pattern: str,
+    occurrence: Optional[int] = None,
+    records: Optional[List[Tuple[str, str]]] = None,
+) -> int:
     """Find the line number of a context anchor pattern.
     
     Args:
@@ -675,10 +704,16 @@ def find_context_anchor(text: str, context_pattern: str, occurrence: Optional[in
     Raises:
         SafeEditError if pattern not found or ambiguous
     """
-    lines = text.splitlines()
     matches = []
-    
-    for i, line in enumerate(lines):
+    if records is None:
+        line_iter = enumerate(text.splitlines())
+    else:
+        line_iter = (
+            (i, line)
+            for i, (line, _separator) in enumerate(records)
+        )
+
+    for i, line in line_iter:
         if context_pattern in line:
             matches.append(i + 1)  # 1-based line number
     
@@ -1074,7 +1109,7 @@ def convert_line_endings(text: str, style: str) -> str:
 
 
 def trim_trailing_whitespace(text: str) -> str:
-    return join_records((line.rstrip(" \t"), sep) for line, sep in split_records(text))
+    return _TRAILING_WHITESPACE_RE.sub("", text)
 
 
 def set_final_newline(text: str, mode: str, sep: str) -> str:
@@ -1083,11 +1118,7 @@ def set_final_newline(text: str, mode: str, sep: str) -> str:
     if mode == "ensure":
         return text if text.endswith(("\n", "\r")) else text + sep
     if mode == "strip":
-        while text.endswith("\r\n"):
-            text = text[:-2]
-        while text.endswith(("\n", "\r")):
-            text = text[:-1]
-        return text
+        return text.rstrip("\r\n")
     fail(f"unsupported final newline mode: {mode}")
 
 
@@ -1127,6 +1158,24 @@ def parse_regex_flags(value: str) -> int:
     return flags
 
 
+def _compile_whitespace_literal(pattern: str) -> re.Pattern[str]:
+    """Compile a literal pattern whose whitespace runs may vary."""
+    pieces: List[str] = []
+    for part in re.split(r"(\s+)", pattern):
+        if not part:
+            continue
+        pieces.append(r"\s+" if part[0].isspace() else re.escape(part))
+    return re.compile("".join(pieces))
+
+
+def _find_whitespace_spans(text: str, pattern: str) -> List[Tuple[int, int]]:
+    matcher = _compile_whitespace_literal(pattern)
+    return [
+        (match.start(), match.end() - match.start())
+        for match in matcher.finditer(text)
+    ]
+
+
 def normalize_for_match(text: str, ignore_indent: bool = False, ignore_eol: bool = False, normalize_whitespace: bool = False) -> str:
     """Normalize text for matching with controlled whitespace flexibility.
     
@@ -1152,7 +1201,7 @@ def normalize_for_match(text: str, ignore_indent: bool = False, ignore_eol: bool
     
     if normalize_whitespace:
         # Collapse consecutive whitespace to single space
-        text = re.sub(r'\s+', ' ', text)
+        text = _WHITESPACE_RE.sub(" ", text)
     
     return text
 
@@ -1346,7 +1395,37 @@ def apply_literal_edit_cascade(
     
     Raises SafeEditError if no level can find a match.
     """
-    last_error: Optional[SafeEditError] = None
+    old = str(operation["old"])
+    normalized_cache: Dict[Tuple[bool, bool, bool], Tuple[str, str]] = {}
+
+    def get_normalized_pair(
+        ignore_indent: bool,
+        ignore_eol: bool,
+        normalize_whitespace: bool,
+    ) -> Tuple[str, str]:
+        key = (ignore_indent, ignore_eol, normalize_whitespace)
+        cached = normalized_cache.get(key)
+        if cached is not None:
+            return cached
+        if not any(key):
+            pair = (text, old)
+        elif ignore_indent and ignore_eol and not normalize_whitespace:
+            base_text, base_old = get_normalized_pair(True, False, False)
+            pair = (
+                base_text.replace("\r\n", "\n").replace("\r", "\n"),
+                base_old.replace("\r\n", "\n").replace("\r", "\n"),
+            )
+        else:
+            pair = (
+                normalize_for_match(
+                    text, ignore_indent, ignore_eol, normalize_whitespace
+                ),
+                normalize_for_match(
+                    old, ignore_indent, ignore_eol, normalize_whitespace
+                ),
+            )
+        normalized_cache[key] = pair
+        return pair
     
     for strategy_label, ignore_indent, ignore_eol, normalize_whitespace in _AUTO_MATCH_PIPELINE:
         try:
@@ -1359,6 +1438,15 @@ def apply_literal_edit_cascade(
                 match_strategy=strategy_label,
                 context_before=context_before,
                 context_after=context_after,
+                _normalized_pair=(
+                    None
+                    if normalize_whitespace and not context_before and not context_after
+                    else get_normalized_pair(
+                        ignore_indent,
+                        ignore_eol,
+                        normalize_whitespace,
+                    )
+                ),
             )
             # Success — return with the strategy that worked
             return (new_text, changed, strategy_label)
@@ -1660,9 +1748,12 @@ def _apply_edit_with_context(
     context_after: str,
     line_index: Optional[Any] = None,
     position_mapper: Optional[Any] = None,
+    positions_override: Optional[List[Tuple[int, int]]] = None,
 ) -> Tuple[str, int, str]:
-    if ignore_indent or ignore_eol or normalize_whitespace:
-        positions: List[Tuple[int, int]] = []
+    if positions_override is not None:
+        positions = positions_override
+    elif ignore_indent or ignore_eol or normalize_whitespace:
+        positions = []
         search_start = 0
         search_start_orig = 0
         while True:
@@ -1736,7 +1827,8 @@ def _apply_edit_with_context(
 def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, explain: bool = False,
                        ignore_indent: bool = False, ignore_eol: bool = False, normalize_whitespace: bool = False,
                        match_strategy: Optional[str] = None, context_before: Optional[str] = None,
-                       context_after: Optional[str] = None) -> Tuple[str, int, str]:
+                       context_after: Optional[str] = None,
+                       _normalized_pair: Optional[Tuple[str, str]] = None) -> Tuple[str, int, str]:
     """Apply a literal text replacement."""
     old = str(operation["old"])
     new = normalize_user_newlines(str(operation["new"]), newline)
@@ -1748,12 +1840,52 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
         ignore_eol,
         normalize_whitespace,
     )
-    normalized_text = normalize_for_match(
-        text, ignore_indent, ignore_eol, normalize_whitespace
-    )
-    normalized_old = normalize_for_match(
-        old, ignore_indent, ignore_eol, normalize_whitespace
-    )
+    if normalize_whitespace:
+        spans = _find_whitespace_spans(text, old)
+        if context_before or context_after:
+            return _apply_edit_with_context(
+                text,
+                old,
+                new,
+                text,
+                old,
+                operation,
+                effective_strategy,
+                explain,
+                ignore_indent,
+                ignore_eol,
+                normalize_whitespace,
+                context_before or "",
+                context_after or "",
+                positions_override=spans,
+            )
+        actual = len(spans)
+        expected = operation.get("expected_count")
+        if actual == 0 and not bool(operation.get("no_op_ok", False)):
+            if explain:
+                explanation = explain_match_failure(old, text)
+                fail(f"old text was not found; refusing a silent no-op\n\n{explanation}")
+            fail("old text was not found; refusing a silent no-op")
+        if actual == 0:
+            return (text, 0, effective_strategy)
+        if expected is not None and actual != int(expected):
+            fail(f"expected {expected} occurrence(s), found {actual}")
+        matches = spans[:1] if bool(operation.get("first", False)) else spans
+        return (
+            _replace_spans(text, matches, new, ignore_indent),
+            len(matches),
+            effective_strategy,
+        )
+
+    if _normalized_pair is None:
+        normalized_text = normalize_for_match(
+            text, ignore_indent, ignore_eol, normalize_whitespace
+        )
+        normalized_old = normalize_for_match(
+            old, ignore_indent, ignore_eol, normalize_whitespace
+        )
+    else:
+        normalized_text, normalized_old = _normalized_pair
 
     line_index = None
     if ignore_indent and "\n" in text and not normalize_whitespace:
@@ -2069,6 +2201,20 @@ def apply_regex_edit(text: str, operation: Dict[str, Any], newline: str, explain
             fail(f"expected {expected} regex match(es), found {actual}")
         return (new_text, actual, "regex")
 
+    if expected is None:
+        new_text, replaced = substitute(
+            count,
+            preserve_no_match_priority=True,
+        )
+        if replaced == 0 and not bool(operation.get("no_op_ok", False)):
+            if explain:
+                explanation = explain_match_failure(pattern, text)
+                fail(f"regex pattern was not found; refusing a silent no-op\n\n{explanation}")
+            fail("regex pattern was not found; refusing a silent no-op")
+        if replaced == 0:
+            return (text, 0, "regex")
+        return (new_text, replaced, "regex")
+
     actual = sum(1 for _ in compiled.finditer(text))
     if actual == 0 and not bool(operation.get("no_op_ok", False)):
         if explain:
@@ -2077,7 +2223,7 @@ def apply_regex_edit(text: str, operation: Dict[str, Any], newline: str, explain
         fail("regex pattern was not found; refusing a silent no-op")
     if actual == 0:
         return (text, 0, "regex")
-    if expected is not None and actual != int(expected):
+    if actual != int(expected):
         fail(f"expected {expected} regex match(es), found {actual}")
 
     new_text, replaced = substitute(count)
@@ -2089,7 +2235,12 @@ def range_bounds(operation: Dict[str, Any], records: List[Tuple[str, str]], text
     anchor_pattern = operation.get("anchor_pattern")
     if anchor_pattern:
         occurrence = operation.get("anchor_occurrence")
-        anchor_line = find_context_anchor(text, anchor_pattern, occurrence)
+        anchor_line = find_context_anchor(
+            text,
+            anchor_pattern,
+            occurrence,
+            records=records,
+        )
         offset_start = operation.get("offset_start", 0)
         offset_end = operation.get("offset_end", 0)
 
@@ -2137,13 +2288,68 @@ _LINE_BUFFER_OPERATIONS = frozenset(
 )
 
 
+def _split_keepends_records(text: str) -> List[str]:
+    """Split common CR/LF text into strings that retain their line endings."""
+    if not text:
+        return []
+    if _NON_CRLF_LINE_SEPARATOR_RE.search(text):
+        return [
+            content + separator
+            for content, separator in split_records(text)
+        ]
+    return text.splitlines(keepends=True)
+
+
+def _join_keepends_records(records: Iterable[str]) -> str:
+    return "".join(records)
+
+
+def _record_content(record: Any, keepends: bool) -> str:
+    if not keepends:
+        return record[0]
+    if record.endswith("\r\n"):
+        return record[:-2]
+    if record.endswith(("\r", "\n")):
+        return record[:-1]
+    return record
+
+
+def _record_separator(record: Any, keepends: bool) -> str:
+    if not keepends:
+        return record[1]
+    if record.endswith("\r\n"):
+        return "\r\n"
+    if record.endswith("\r"):
+        return "\r"
+    if record.endswith("\n"):
+        return "\n"
+    return ""
+
+
+def _make_record(content: str, separator: str, keepends: bool) -> Any:
+    return content + separator if keepends else (content, separator)
+
+
+def _block_records_for_mode(
+    text: str,
+    separator: str,
+    final_separator: str,
+    keepends: bool,
+) -> List[Any]:
+    records = block_records(text, separator, final_separator)
+    if keepends:
+        return [content + line_end for content, line_end in records]
+    return records
+
+
 def _apply_line_operation_to_records(
-    records: List[Tuple[str, str]],
+    records: List[Any],
     op_name: str,
     operation: Dict[str, Any],
     newline: str,
     *,
     text_for_anchor: str = "",
+    keepends: bool = False,
 ) -> int:
     if op_name == "insert":
         line = int(operation["line"])
@@ -2154,10 +2360,23 @@ def _apply_line_operation_to_records(
         final_sep = newline
         if not records:
             final_sep = "" if not text_value.endswith(("\n", "\r")) else newline
-        to_insert = block_records(text_value, newline, final_sep)
+        to_insert = _block_records_for_mode(
+            text_value,
+            newline,
+            final_sep,
+            keepends,
+        )
         index = line - 1
-        if records and index == len(records) and records[-1][1] == "":
-            records[-1] = (records[-1][0], newline)
+        if (
+            records
+            and index == len(records)
+            and _record_separator(records[-1], keepends) == ""
+        ):
+            records[-1] = _make_record(
+                _record_content(records[-1], keepends),
+                newline,
+                keepends,
+            )
         records[index:index] = to_insert
         return len(to_insert)
 
@@ -2168,16 +2387,30 @@ def _apply_line_operation_to_records(
             if records
             else (newline if text_value.endswith(("\n", "\r")) else "")
         )
-        to_insert = block_records(text_value, newline, final_sep)
+        to_insert = _block_records_for_mode(
+            text_value,
+            newline,
+            final_sep,
+            keepends,
+        )
         records[0:0] = to_insert
         return len(to_insert)
 
     if op_name == "append":
         text_value = str(operation["text"])
         final_sep = newline if text_value.endswith(("\n", "\r")) else ""
-        to_insert = block_records(text_value, newline, final_sep)
-        if records and records[-1][1] == "":
-            records[-1] = (records[-1][0], newline)
+        to_insert = _block_records_for_mode(
+            text_value,
+            newline,
+            final_sep,
+            keepends,
+        )
+        if records and _record_separator(records[-1], keepends) == "":
+            records[-1] = _make_record(
+                _record_content(records[-1], keepends),
+                newline,
+                keepends,
+            )
         records.extend(to_insert)
         return len(to_insert)
 
@@ -2197,7 +2430,9 @@ def _apply_line_operation_to_records(
         preserve_indent = bool(operation.get("preserve_indent", False))
         replacement_text = str(operation["text"])
         if preserve_indent and start < len(records):
-            original_indent = _extract_indent(records[start][0])
+            original_indent = _extract_indent(
+                _record_content(records[start], keepends)
+            )
             if original_indent:
                 adjusted = []
                 for line in replacement_text.split("\n"):
@@ -2208,9 +2443,18 @@ def _apply_line_operation_to_records(
                 replacement_text = "\n".join(adjusted)
 
         following_exists = end < len(records)
-        original_final_sep = records[end - 1][1] if end > start else newline
+        original_final_sep = (
+            _record_separator(records[end - 1], keepends)
+            if end > start
+            else newline
+        )
         final_sep = newline if following_exists else original_final_sep
-        replacement = block_records(replacement_text, newline, final_sep)
+        replacement = _block_records_for_mode(
+            replacement_text,
+            newline,
+            final_sep,
+            keepends,
+        )
         records[start:end] = replacement
         return end - start
 
@@ -2276,16 +2520,16 @@ def apply_replace_lines(text: str, operation: Dict[str, Any], newline: str) -> T
 class _OperationBuffer:
     def __init__(self, text: str) -> None:
         self._text = text
-        self._records: Optional[List[Tuple[str, str]]] = None
+        self._records: Optional[List[str]] = None
 
-    def as_records(self) -> List[Tuple[str, str]]:
+    def as_records(self) -> List[str]:
         if self._records is None:
-            self._records = split_records(self._text)
+            self._records = _split_keepends_records(self._text)
         return self._records
 
     def as_text(self) -> str:
         if self._records is not None:
-            self._text = join_records(self._records)
+            self._text = _join_keepends_records(self._records)
             self._records = None
         return self._text
 
@@ -2361,6 +2605,7 @@ def apply_operations(
                 op_name,
                 operation,
                 newline,
+                keepends=True,
             )
             op = op_name
             match_strategy = "line-based"
@@ -4003,19 +4248,25 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         fuzzy = getattr(args, "fuzzy", False)
         context_before = getattr(args, "context_before", None)
         context_after = getattr(args, "context_after", None)
-        new_text, operation_results = apply_operations(
-            text,
-            operations,
-            newline,
-            explain,
-            ignore_indent,
-            ignore_eol,
-            normalize_whitespace,
-            auto_match,
-            fuzzy,
-            context_before,
-            context_after,
-        )
+        try:
+            new_text, operation_results = apply_operations(
+                text,
+                operations,
+                newline,
+                explain,
+                ignore_indent,
+                ignore_eol,
+                normalize_whitespace,
+                auto_match,
+                fuzzy,
+                context_before,
+                context_after,
+            )
+        except SafeEditError as exc:
+            setattr(exc, "_diagnostic_text", text)
+            if len(operations) == 1:
+                setattr(exc, "_diagnostic_operation", operations[0])
+            raise
 
         new_text = apply_post_transforms(new_text, args, newline)
         output_encoding = encoding_for_output(args.to_encoding, encoding)
@@ -4162,6 +4413,59 @@ def emit_summary(summary: Dict[str, Any], as_json: bool) -> None:
         print(f"Backup: {summary['backup']}")
 
 
+def _match_error_context(
+    exc: SafeEditError,
+    args: argparse.Namespace,
+    file_path: str,
+    command: str,
+) -> Tuple[str, str]:
+    diagnostic_text = getattr(exc, "_diagnostic_text", None)
+    diagnostic_operation = getattr(exc, "_diagnostic_operation", None)
+    if diagnostic_text is not None:
+        old = ""
+        if isinstance(diagnostic_operation, dict):
+            operation_name = str(
+                diagnostic_operation.get("op") or command
+            ).replace("_", "-")
+            key = "old" if operation_name == "edit" else "pattern"
+            value = diagnostic_operation.get(key)
+            old = "" if value is None else str(value)
+        return old, diagnostic_text
+
+    old = ""
+    text = ""
+    try:
+        path = resolve_target_path(
+            file_path, getattr(args, "follow_symlink", False)
+        )
+        original = read_target(
+            path, getattr(args, "max_bytes", 50 * 1024 * 1024)
+        )
+        _encoding, text = detect_and_decode(
+            original, getattr(args, "encoding", "auto")
+        )
+
+        if command == "edit":
+            try:
+                stdin_taken: List[str] = []
+                old = resolve_cli_value(
+                    args, "old", False, stdin_taken=stdin_taken
+                ) or ""
+            except Exception:
+                old = getattr(args, "old", "") or ""
+        elif command == "regex":
+            try:
+                stdin_taken = []
+                old = resolve_cli_value(
+                    args, "pattern", False, stdin_taken=stdin_taken
+                ) or ""
+            except Exception:
+                old = getattr(args, "pattern", "") or ""
+    except Exception:
+        pass
+    return old, text
+
+
 def main(argv: List[str]) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -4183,31 +4487,12 @@ def main(argv: List[str]) -> int:
             lock_info = None
 
             if error_type in ("match_not_found", "match_ambiguous", "match_count_mismatch"):
-                # Try to read file content for analysis
-                try:
-                    path = resolve_target_path(file_path, getattr(args, 'follow_symlink', False))
-                    original = read_target(path, getattr(args, 'max_bytes', 50 * 1024 * 1024))
-                    encoding, text = detect_and_decode(
-                        original, getattr(args, 'encoding', 'auto')
-                    )
-
-                    # Get the search pattern (may come from --old, --old-file, or --old-stdin)
-                    if command == "edit":
-                        # Use resolve_cli_value to handle all input modes
-                        try:
-                            stdin_taken: List[str] = []
-                            old = resolve_cli_value(args, "old", False, stdin_taken=stdin_taken) or ""
-                        except Exception:
-                            old = getattr(args, 'old', '') or ""
-                    elif command == "regex":
-                        try:
-                            stdin_taken: List[str] = []
-                            old = resolve_cli_value(args, "pattern", False, stdin_taken=stdin_taken) or ""
-                        except Exception:
-                            old = getattr(args, 'pattern', '') or ""
-                except Exception:
-                    # If we can't read the file, emit basic error
-                    pass
+                old, text = _match_error_context(
+                    exc,
+                    args,
+                    file_path,
+                    command,
+                )
 
             elif error_type == "lock_error":
                 # Try to read lock file for structured recovery info
