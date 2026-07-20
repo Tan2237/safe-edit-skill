@@ -5240,7 +5240,7 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
 
         target_reads = [
             call for call in read_mock.call_args_list
-            if Path(call.args[0]) == target
+            if os.path.samefile(str(call.args[0]), str(target))
         ]
         self.assertEqual(len(target_reads), 2)
         self.assertEqual(apply_mock.call_count, 1)
@@ -5282,7 +5282,7 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         reads = {"target": 0}
 
         def mutate_before_commit(path, max_bytes):
-            if Path(path) == target:
+            if os.path.samefile(str(path), str(target)):
                 reads["target"] += 1
                 if reads["target"] == 2:
                     target.write_bytes(b"external\n")
