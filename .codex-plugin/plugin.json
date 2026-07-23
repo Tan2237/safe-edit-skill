@@ -1,0 +1,38 @@
+{
+  "name": "safe-edit-skill",
+  "version": "1.0.0",
+  "description": "Safe, format-preserving text edits through a structured MCP transport and CLI fallback.",
+  "author": {
+    "name": "Tan2237",
+    "email": "tanyu2237@outlook.com",
+    "url": "https://github.com/Tan2237"
+  },
+  "homepage": "https://github.com/Tan2237/safe-edit-skill",
+  "repository": "https://github.com/Tan2237/safe-edit-skill",
+  "license": "MIT",
+  "keywords": [
+    "safe-edit",
+    "mcp",
+    "text-editing",
+    "encoding",
+    "atomic-write"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "safe-edit",
+    "shortDescription": "Format-preserving structured file edits",
+    "longDescription": "Inspect encodings and line endings, then apply guarded multi-file edits through a persistent structured tool service with CLI fallback.",
+    "developerName": "Tan2237",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Write"
+    ],
+    "websiteURL": "https://github.com/Tan2237/safe-edit-skill",
+    "defaultPrompt": [
+      "Safely update these files without changing their encoding or line endings.",
+      "Inspect these files and apply the edits as one guarded transaction."
+    ],
+    "brandColor": "#2E7D6E"
+  }
+}

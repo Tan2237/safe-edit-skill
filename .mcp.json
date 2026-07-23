@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "safe-edit": {
+      "command": "python",
+      "args": [
+        "./mcp/safe_edit_server.py"
+      ],
+      "cwd": "."
+    }
+  }
+}

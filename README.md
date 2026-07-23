@@ -12,6 +12,7 @@
 - `stat-many` 在一个进程内检查多个文件，并按父目录复用文件系统能力探测。
 - `preflight` 在写入前报告 Python、stdin、Base64、临时目录、锁和目标目录能力。
 - `transaction` 接收结构化多文件请求，先全量预演，再按稳定顺序加锁写入；失败时回滚已完成的写入。
+- Codex 插件提供常驻 MCP 工具，直接接收结构化正文，避免 Base64、Windows argv 限制和重复启动 Python。
 - `create` 受控新建任务成果文件：拒绝覆盖、要求父目录已存在，并强制显式选择编码和行尾。
 - `convert` 显式转换编码、行尾、最终换行，或清理尾随空白；普通编辑默认仍保留原格式。
 - 自动检测并保留 `utf-8`、`utf-8-bom`、`gbk`、UTF-16 BOM，以及清晰 NUL 模式下的无 BOM UTF-16。
@@ -63,9 +64,44 @@ skills/safe-edit/
   safe_edit.py
 ```
 
+## Codex 结构化工具（推荐）
+
+仓库根目录同时是一个 Codex 插件，`.codex-plugin/plugin.json` 会加载
+`skills/` 与 `.mcp.json`。插件启用后提供三个工具：
+
+- `safe_edit_preflight`：检查 Python、临时目录、锁和目标目录能力。
+- `safe_edit_stat`：一次检查一个或多个文件，返回 `editStrategy` 与 SHA-256。
+- `safe_edit_transaction`：直接接收 `old`、`new`、`text` 和 `operations`，
+  完成多文件预演、加锁写入和失败回滚。
+
+推荐一次批量 `stat`，随后一次批量 transaction。MCP 服务是常驻进程，
+只导入一次编辑内核并只构建一次参数解析器；热路径不会启动子进程、
+不会把已结构化请求再次 JSON 解码，也不会产生 Base64 的约 33% 体积膨胀。
+
+结构化 transaction 示例：
+
+```json
+{
+  "files": [
+    {
+      "file": "src/a.py",
+      "action": "edit",
+      "expectedSha256": "SHA256_FROM_SAFE_EDIT_STAT",
+      "operations": [
+        {"op": "edit", "old": "before", "new": "after", "expected_count": 1}
+      ]
+    }
+  ],
+  "dryRun": false
+}
+```
+
+CLI 保留为未加载插件时的兼容回退。
+
 ## Recommended Workflow
 
-先确认运行时和传输能力，再检查文件属性：
+插件工具可用时，先用 `safe_edit_preflight` 检查能力，再把所有相关文件
+放进一次 `safe_edit_stat` 调用。CLI 回退流程如下：
 
 ```bash
 python safe_edit.py preflight --file foo.cpp --json
@@ -384,10 +420,11 @@ PowerShell、Windows 原生命令行和 MSYS2 都可能在 Python 收到参数�
 
 推荐顺序：
 
-1. 调用工具提供原生 stdin 时，使用 `--ops-stdin`、`--diff-input-stdin` 或 `--text-stdin`。
-2. 没有原生 stdin 时，使用 URL-safe UTF-8 Base64：`--ops-base64`、`--diff-input-base64` 或字段级 `--*-base64`。
+1. 插件工具可用时，直接调用 `safe_edit_stat` 和 `safe_edit_transaction`，传入原始结构化字符串。
+2. CLI 回退且执行工具提供原生 stdin 时，使用 `--ops-stdin`、`--diff-input-stdin` 或 `--text-stdin`。
 3. 载荷文件已经存在时，使用 `--ops-file`、`--old-file`、`--new-file` 或 `--text-file`。
-4. 仅对短且不含 shell 敏感字符的内容使用字面 `--old`、`--new`、`--text`。
+4. 没有原生 stdin 或现有载荷文件时，使用 URL-safe UTF-8 Base64。
+5. 仅对短且不含 shell 敏感字符的内容使用字面 `--old`、`--new`、`--text`。
 
 ### Stdin 方式
 
@@ -459,7 +496,7 @@ python safe_edit.py insert --file a.cpp --line 5 --text-file block.txt
 
 ## 多行内容
 
-多行、超过 100 个字符，或包含 `"`、`'`、`%`、`!`、反引号、反斜杠等字符时，不要使用字面 argv。优先使用完整的 `batch --ops-stdin` JSON；无原生 stdin 时使用 `batch --ops-base64`。完成后仍应重新读取，并按文件类型执行编译或测试。
+多行、超过 100 个字符，或包含 `"`、`'`、`%`、`!`、反引号、反斜杠等字符时，优先直接通过 `safe_edit_transaction` 传递原始结构化正文。只有 CLI 回退才使用 `batch --ops-stdin`；无原生 stdin 时再使用 `batch --ops-base64`。完成后仍应重新读取，并按文件类型执行编译或测试。
 
 ## 正则替换
 
@@ -580,7 +617,10 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 
 | 选项 | 说明 |
 | --- | --- |
-| `preflight` | 检查运行时、载荷传输、临时目录、锁和目标目录能力 |
+| `safe_edit_preflight` | 常驻结构化工具：检查运行时、临时目录、锁和目标目录能力 |
+| `safe_edit_stat` | 常驻结构化工具：批量检查文件并返回 SHA-256 |
+| `safe_edit_transaction` | 常驻结构化工具：直接传递正文并执行受保护事务 |
+| `preflight` | CLI 回退：检查运行时、载荷传输、临时目录、锁和目标目录能力 |
 | `stat-many` | 在一个进程内检查多个文件并返回逐文件摘要和 SHA-256 |
 | `transaction` | 结构化多文件预演、写入和失败回滚 |
 | `create` | 受控创建不存在的任务成果文件；要求显式编码和行尾 |

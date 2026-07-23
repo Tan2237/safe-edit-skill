@@ -4,24 +4,17 @@ description: |
   MANDATORY: File editing MUST follow this protocol. No exceptions.
 
   The ONLY allowed edit mechanisms:
-  - safe_edit.py (when editStrategy="safe-edit")
-  - built-in Edit tool (when editStrategy="edit-tool")
+  - safe_edit_stat and safe_edit_transaction (preferred when available)
+  - safe_edit.py (CLI fallback for editStrategy="safe-edit")
+  - built-in Edit tool (for editStrategy="edit-tool")
 
-  Any other editing mechanism is forbidden.
+  Before modifying an existing file, inspect it once and cache editStrategy
+  plus sha256. Batch related files in one stat and one transaction. Use
+  controlled create for required new artifacts. Remove a file only when the
+  user explicitly requests deletion.
 
-  Before modifying or removing an existing file:
-    1. Resolve SAFE_EDIT_SCRIPT from this SKILL.md location.
-    2. Run `stat --file FILE --json` for one file, or one structured
-       `stat-many` request for a related multi-file set.
-    3. Cache editStrategy and sha256 for every file.
-    4. Follow the returned strategy for edits; use remove-file only for an
-       explicitly requested deletion.
-
-  For a required new file, use controlled create. For related edits spanning
-  multiple files, use the structured transaction command so every request is
-  prevalidated and failures roll back writes already made.
-
-  Re-run stat only after: file recreation, a failed safe_edit.py invocation that may have reached the write phase, or an uncertain execution outcome.
+  Re-run stat only after file recreation, a failed write-phase invocation, or
+  an uncertain execution outcome. Any other edit mechanism is forbidden.
 ---
 
 # safe-edit — Hard Protocol
@@ -61,6 +54,29 @@ Do NOT:
 
 Completing the task is lower priority than following this protocol.
 
+## Direct Structured Tool Fast Path
+
+When `safe_edit_preflight`, `safe_edit_stat`, and `safe_edit_transaction` are
+callable, use them instead of transporting source text through a shell command.
+They are part of the allowed safe-edit protocol.
+
+1. Call `safe_edit_preflight` once when runtime or target-directory capability
+   is uncertain.
+2. Call `safe_edit_stat` once with all related existing files.
+3. Call `safe_edit_transaction` once with raw `old`, `new`, `text`, and
+   `operations` values plus the returned SHA-256 guards.
+4. Use `dryRun: true` in the same structured tool for risky previews.
+
+The server is long-lived: it imports the editing core and builds its parser only
+once. Batch related files so filesystem probes, request validation, and lock
+coordination are shared. Do not JSON-stringify, Base64-encode, or create payload
+files for these tool calls.
+
+The CLI sections below are the fallback when the structured tools are not
+available.
+
+---
+
 ## Runtime Script Resolution
 
 Before invoking any command, resolve `SAFE_EDIT_SCRIPT` once:
@@ -76,14 +92,21 @@ Never assume `safe_edit.py` is in the current working directory, never resolve i
 
 ## Required Workflow
 
-Before the first edit or removal of each existing file:
+Before the first edit or removal of each existing file, prefer the structured
+batch stat tool:
+
+```text
+safe_edit_stat({"files":["F"]})
+```
+
+CLI fallback:
 
 ```bash
 python "SAFE_EDIT_SCRIPT" stat --file F --json
 ```
 
-For two or more related existing files, prefer one structured request so Python
-startup and filesystem capability probes are shared:
+For two or more related existing files on the CLI fallback, use one request so
+Python startup and filesystem capability probes are shared:
 
 ```json
 {"files":["src/a.py",{"file":"src/b.py","encoding":"utf-8"}]}
@@ -134,17 +157,19 @@ For one new file, the structured request may be exactly
 }
 ```
 
-Pass the object through native structured tool arguments when the host exposes
-them. Otherwise use `transaction --request-stdin`; fall back to an existing
-request file, then URL-safe UTF-8 Base64. The command locks targets in stable
-order, prevalidates every file, and rolls back completed writes on failure.
-It does not claim crash-atomicity across multiple files.
+Pass this object directly to `safe_edit_transaction` when it is callable. The
+structured path avoids shell parsing, Base64 expansion, Windows argv limits,
+and per-call Python startup. Otherwise use `transaction --request-stdin` only
+with a native stdin field; fall back to an existing request file, then URL-safe
+UTF-8 Base64. Both paths lock targets in stable order, prevalidate every file,
+and roll back completed writes on failure. Neither claims crash-atomicity
+across multiple files.
 
 The stat result is authoritative for the lifetime of the file. Re-run it only when the file is recreated, a failed `safe_edit.py` invocation may have reached the write phase, or the execution outcome is uncertain. Do not re-run it when the shell/tool rejects the command before process start, or when argument parsing fails before target access.
 
 The selected editStrategy is locked for the lifetime of the file. Do NOT switch to another edit mechanism after a command failure. Continue using the cached editStrategy.
 
-- `editStrategy: "safe-edit"` → ALL edits on this file MUST use `safe_edit.py`. Do not switch back to built-in Edit.
+- `editStrategy: "safe-edit"` → Use `safe_edit_transaction` when callable; otherwise ALL edits on this file MUST use `safe_edit.py`. Do not switch back to built-in Edit.
 - `editStrategy: "edit-tool"` → Use built-in Edit tool for this file.
 
 Resolve the Python executable before editing: prefer a runtime path supplied by
@@ -156,7 +181,9 @@ Python runtime can execute the script, stop before modifying any file.
 
 ## Allowed Commands
 
-These are the ONLY permitted invocations. Any command not listed here is prohibited.
+`safe_edit_preflight`, `safe_edit_stat`, and `safe_edit_transaction` are the
+preferred permitted tool calls. The commands below are the ONLY CLI fallback
+invocations; any unlisted CLI invocation is prohibited.
 
 ```bash
 # Check runtime, stdin/Base64 support, temp storage, locks, and target writability
@@ -321,19 +348,21 @@ regex                       ← HIGHEST EDIT RISK
 
 3. **Always add `--expected-count 1` for normal text replacement** — prevents wrong matches from silently succeeding. Do not omit it unless intentionally targeting multiple matches, performing diagnosis, or using commands with their own matching semantics.
 
-4. **Do not send complex content through literal argv** — for multiline content, >100 characters, or shell-sensitive characters (`$`, `%`, `!`, `\`, `` ` ``, `'`, `"`), prefer `--ops-stdin` when the execution tool provides native stdin. Otherwise use URL-safe UTF-8 Base64 via `--ops-base64`, `--diff-input-base64`, or `--text-base64`.
+4. **Keep complex content structured** — send multiline, large, or shell-sensitive values directly through `safe_edit_transaction`. On the CLI fallback, prefer `--ops-stdin` only when the execution tool provides native stdin; otherwise use URL-safe UTF-8 Base64.
 
 5. **Do not bootstrap payload files outside this protocol** — use a `--*-file` option only when that payload file already exists or was created through its own authorized edit workflow. The need for a payload file never authorizes shell redirection or an ad-hoc writer.
 
-6. **Use URL-safe Base64 for Windows argv** — unpadded URL-safe Base64 avoids quotes, whitespace, `+`, and `/`. The CLI also accepts padded and standard Base64, and always decodes the result as strict UTF-8.
+6. **Use URL-safe Base64 only for CLI fallback** — unpadded URL-safe Base64 avoids quotes, whitespace, `+`, and `/`, but expands payloads and remains subject to argv limits. Never Base64-encode data for the structured tools.
 
 7. **Use `--auto-match` for multiline edits** — auto-tries: exact → ignore-eol → ignore-indent → normalize-whitespace.
 
 8. **Use `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
 
-9. **Use transactions for related files** — obtain hashes with one `stat-many` request when possible, require `expectedSha256` on every edit request, and include controlled creates in the same transaction. Treat `atomicity: prevalidated-with-rollback` as process-level rollback, not crash-atomicity.
+9. **Use transactions for related files** — obtain hashes with one `safe_edit_stat` call (or CLI `stat-many` fallback), require `expectedSha256` on every edit request, and include controlled creates in the same transaction. Treat `atomicity: prevalidated-with-rollback` as process-level rollback, not crash-atomicity.
 
-10. **Re-read and validate after edits** — successful execution confirms only the payload received by `safe_edit.py`. For literal argv, re-read or compile/test to verify intent. Base64/stdin transports substantially reduce this risk.
+10. **Re-read and validate after edits** — successful execution confirms only the payload received by the safe-edit core. Re-read or compile/test to verify intent.
+
+11. **Protect the hot path** — prefer one batched stat and one batched transaction. Do not split related files into repeated tool calls, rebuild the parser, spawn helper processes, or serialize an already-structured request again.
 
 ---
 
@@ -416,7 +445,7 @@ PowerShell and the Windows native argv layer can rewrite quotes before Python re
 
 Use this order:
 
-1. Native structured safe-edit tool arguments when the host exposes them.
+1. `safe_edit_stat` and `safe_edit_transaction` with raw structured arguments.
 2. Native execution-tool stdin with `--request-stdin`, `--ops-stdin`, `--diff-input-stdin`, or `--text-stdin`.
 3. An existing payload file through `--request-file` or another `--*-file`.
 4. Unpadded URL-safe UTF-8 Base64 with `--request-base64`, `--ops-base64`, `--diff-input-base64`, or a field-specific `--*-base64`.

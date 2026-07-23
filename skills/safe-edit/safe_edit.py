@@ -3496,6 +3496,17 @@ def command_to_operations(args: argparse.Namespace, warnings: Optional[List[str]
     return resolved, base_dir
 
 
+def normalize_request_payload(payload: Any, request_name: str) -> Dict[str, Any]:
+    """Normalize an already-decoded structured request without serializing it."""
+    if isinstance(payload, list):
+        payload = {"files": payload}
+    if not isinstance(payload, dict):
+        fail(f"{request_name} JSON must be an object or a list of file requests")
+    if "files" not in payload and "file" in payload:
+        payload = {"files": [payload]}
+    return payload
+
+
 def load_request_payload(args: argparse.Namespace) -> Dict[str, Any]:
     request_name = args.command
     sources = [
@@ -3518,13 +3529,7 @@ def load_request_payload(args: argparse.Namespace) -> Dict[str, Any]:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         fail(f"invalid {request_name} JSON: {exc}")
-    if isinstance(payload, list):
-        payload = {"files": payload}
-    if not isinstance(payload, dict):
-        fail(f"{request_name} JSON must be an object or a list of file requests")
-    if "files" not in payload and "file" in payload:
-        payload = {"files": [payload]}
-    return payload
+    return normalize_request_payload(payload, request_name)
 
 
 def request_item_args(
@@ -3618,7 +3623,13 @@ def run_preflight(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def run_stat_many(args: argparse.Namespace) -> Dict[str, Any]:
-    payload = load_request_payload(args)
+    return run_stat_many_payload(args, load_request_payload(args))
+
+
+def run_stat_many_payload(
+    args: argparse.Namespace, payload: Any
+) -> Dict[str, Any]:
+    payload = normalize_request_payload(payload, "stat-many")
     items = payload.get("files")
     if not isinstance(items, list) or not items:
         fail("stat-many request requires a non-empty files list")
@@ -3670,7 +3681,13 @@ def run_stat_many(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def run_transaction(args: argparse.Namespace) -> Dict[str, Any]:
-    payload = load_request_payload(args)
+    return run_transaction_payload(args, load_request_payload(args))
+
+
+def run_transaction_payload(
+    args: argparse.Namespace, payload: Any
+) -> Dict[str, Any]:
+    payload = normalize_request_payload(payload, "transaction")
     items = payload.get("files")
     if not isinstance(items, list) or not items:
         fail("transaction request requires a non-empty files list")
@@ -4105,6 +4122,7 @@ def run_create(args: argparse.Namespace) -> Dict[str, Any]:
         "written": False,
         "created": False,
         "skipped": False,
+        "sizeBytes": len(output),
         "wouldChangeBytes": True,
         "wouldCreate": True,
     }
