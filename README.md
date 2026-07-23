@@ -12,7 +12,7 @@
 - `stat-many` 在一个进程内检查多个文件，并按父目录复用文件系统能力探测。
 - `preflight` 在写入前报告 Python、stdin、Base64、临时目录、锁和目标目录能力。
 - `transaction` 接收结构化多文件请求，先全量预演，再按稳定顺序加锁写入；失败时回滚已完成的写入。
-- Codex 插件提供常驻 MCP 工具，直接接收结构化正文，避免 Base64、Windows argv 限制和重复启动 Python。
+- Codex 插件及跨客户端安装器提供常驻 MCP 工具，直接接收结构化正文，避免 Base64、Windows argv 限制和重复启动 Python。
 - `create` 受控新建任务成果文件：拒绝覆盖、要求父目录已存在，并强制显式选择编码和行尾。
 - `convert` 显式转换编码、行尾、最终换行，或清理尾随空白；普通编辑默认仍保留原格式。
 - 自动检测并保留 `utf-8`、`utf-8-bom`、`gbk`、UTF-16 BOM，以及清晰 NUL 模式下的无 BOM UTF-16。
@@ -37,37 +37,51 @@
 
 ## 安装
 
-使用支持 `skills` 生态的安装器：
+### 仅安装 Skill / CLI 回退
+
+现有安装方式保持兼容，适合尚不支持 MCP 的 Agent：
 
 ```bash
 npx skills add Tan2237/safe-edit-skill
-```
-
-全局安装：
-
-```bash
 npx skills add Tan2237/safe-edit-skill -g
-```
-
-指定 Agent：
-
-```bash
 npx skills add Tan2237/safe-edit-skill -a opencode
 npx skills add Tan2237/safe-edit-skill -a claude-code
 ```
 
-仓库中的 skill 位于：
+这一路径安装 `skills/safe-edit/` 下的工作流和 `safe_edit.py`，
+不会自动注册常驻 MCP 服务。
 
-```text
-skills/safe-edit/
-  SKILL.md
-  safe_edit.py
+### 安装跨客户端 MCP 命令（推荐）
+
+使用 `pipx` 或 `uv` 从 Git 仓库安装零运行时依赖的命令：
+
+```bash
+pipx install git+https://github.com/Tan2237/safe-edit-skill.git
+# 或
+uv tool install git+https://github.com/Tan2237/safe-edit-skill.git
+```
+
+安装后会得到两个稳定入口：
+
+- `safe-edit`：原 CLI 回退。
+- `safe-edit-mcp`：常驻 stdio MCP 服务及跨客户端安装器。
+
+```bash
+safe-edit-mcp --version
+safe-edit-mcp install --client all --scope project --project-dir . --dry-run
 ```
 
 ## Codex 结构化工具（推荐）
 
-仓库根目录同时是一个 Codex 插件，`.codex-plugin/plugin.json` 会加载
-`skills/` 与 `.mcp.json`。插件启用后提供三个工具：
+仓库自带 Codex marketplace 和插件清单，可直接安装 skill 与常驻 MCP：
+
+```bash
+codex plugin marketplace add Tan2237/safe-edit-skill
+codex plugin add safe-edit-skill@safe-edit
+```
+
+仓库根目录的 `.codex-plugin/plugin.json` 会加载 `skills/` 与
+`.mcp.json`。插件启用后提供三个工具：
 
 - `safe_edit_preflight`：检查 Python、临时目录、锁和目标目录能力。
 - `safe_edit_stat`：一次检查一个或多个文件，返回 `editStrategy` 与 SHA-256。
@@ -97,6 +111,36 @@ skills/safe-edit/
 ```
 
 CLI 保留为未加载插件时的兼容回退。
+
+## Claude Code、Cursor、OpenCode 与 VS Code
+
+这些客户端都连接同一个 `safe-edit-mcp` stdio 进程；每个客户端或工作区
+只启动一个常驻进程，工具调用不会重复启动 Python。统一安装器只合并
+`safe-edit` 条目，不覆盖其它 MCP 配置；修改已有 JSON 前会创建
+`.safe-edit.bak` 备份。
+
+```bash
+# 当前用户；VS Code 需要 code CLI
+safe-edit-mcp install --client all --scope user
+
+# 当前项目，适合提交团队配置
+safe-edit-mcp install --client all --scope project --project-dir .
+
+# 先查看将写入的路径和配置
+safe-edit-mcp install --client cursor --scope user --dry-run --json
+```
+
+客户端配置位置：
+
+| 客户端 | 用户级 | 项目级 |
+|---|---|---|
+| Claude Code | `~/.claude.json` | `.mcp.json` |
+| Cursor | `~/.cursor/mcp.json` | `.cursor/mcp.json` |
+| OpenCode | `~/.config/opencode/opencode.json` | `opencode.json` |
+| VS Code | 通过 `code --add-mcp` | `.vscode/mcp.json` |
+
+如果目标配置不是有效 JSON（例如含 JSONC 注释），安装器会拒绝重写并保持
+原文件不变；此时使用 `--dry-run --json` 获取配置片段后手工合并。
 
 ## Recommended Workflow
 

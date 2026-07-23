@@ -1,0 +1,21 @@
+{
+  "name": "safe-edit",
+  "interface": {
+    "displayName": "Safe Edit"
+  },
+  "plugins": [
+    {
+      "name": "safe-edit-skill",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/Tan2237/safe-edit-skill.git",
+        "ref": "main"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

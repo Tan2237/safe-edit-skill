@@ -1,0 +1,6 @@
+.agents/*
+!.agents/plugins/
+.agents/plugins/*
+!.agents/plugins/marketplace.json
+__pycache__/
+tests/perf/

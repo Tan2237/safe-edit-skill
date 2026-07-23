@@ -173,6 +173,52 @@ class SafeEditMcpTests(unittest.TestCase):
         )
         self.assertEqual(len(responses[1]["result"]["tools"]), 3)
 
+    def test_initialize_negotiates_supported_protocol_version(self):
+        supported = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05"},
+            }
+        )
+        unsupported = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "initialize",
+                "params": {"protocolVersion": "2099-01-01"},
+            }
+        )
+
+        self.assertEqual(
+            supported["result"]["protocolVersion"], "2024-11-05"
+        )
+        self.assertEqual(
+            unsupported["result"]["protocolVersion"], "2025-11-25"
+        )
+
+    def test_non_object_params_return_json_rpc_error(self):
+        response = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": [],
+            }
+        )
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_repository_launcher_reports_package_version(self):
+        completed = subprocess.run(
+            [sys.executable, str(SERVER_PATH), "--version"],
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            check=True,
+        )
+        self.assertEqual(completed.stdout.strip(), "1.1.0")
+
 
 if __name__ == "__main__":
     unittest.main()

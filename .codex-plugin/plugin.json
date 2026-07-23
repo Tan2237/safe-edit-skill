@@ -1,6 +1,6 @@
 {
   "name": "safe-edit-skill",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Safe, format-preserving text edits through a structured MCP transport and CLI fallback.",
   "author": {
     "name": "Tan2237",
@@ -22,7 +22,7 @@
   "interface": {
     "displayName": "safe-edit",
     "shortDescription": "Format-preserving structured file edits",
-    "longDescription": "Inspect encodings and line endings, then apply guarded multi-file edits through a persistent structured tool service with CLI fallback.",
+    "longDescription": "Inspect encodings and line endings, then apply guarded multi-file edits through a persistent structured MCP service for Codex, Claude Code, Cursor, OpenCode, and VS Code.",
     "developerName": "Tan2237",
     "category": "Developer Tools",
     "capabilities": [
