@@ -89,6 +89,38 @@ def _configure_common(args: Any, arguments: Dict[str, Any]) -> None:
     )
 
 
+def _configure_match_options(
+    args: Any, arguments: Dict[str, Any]
+) -> None:
+    for source, target in (
+        ("autoMatch", "auto_match"),
+        ("fuzzy", "fuzzy"),
+    ):
+        if source not in arguments:
+            continue
+        value = arguments[source]
+        if not isinstance(value, bool):
+            raise ToolInputError(f"{source} must be a boolean")
+        setattr(args, target, value)
+
+    if "fuzzyWorkers" not in arguments:
+        return
+    value = arguments["fuzzyWorkers"]
+    if value == "auto":
+        args.fuzzy_workers = "auto"
+        return
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > core._FUZZY_MAX_WORKERS
+    ):
+        raise ToolInputError(
+            "fuzzyWorkers must be auto or an integer from 1 to 8"
+        )
+    args.fuzzy_workers = value
+
+
 def execute_tool(name: str, raw_arguments: Any) -> Dict[str, Any]:
     """Execute one tool call with an already-decoded request object."""
     arguments = _require_arguments(raw_arguments)
@@ -116,6 +148,7 @@ def execute_tool(name: str, raw_arguments: Any) -> Dict[str, Any]:
     elif name == "safe_edit_transaction":
         args = _fresh_args("transaction")
         _configure_common(args, arguments)
+        _configure_match_options(args, arguments)
         dry_run = arguments.get("dryRun", False)
         if not isinstance(dry_run, bool):
             raise ToolInputError("dryRun must be a boolean")
@@ -322,6 +355,19 @@ TOOLS = [
                 },
                 "dryRun": {"type": "boolean", "default": False},
                 "maxBytes": {"type": "integer", "minimum": 1},
+                "autoMatch": {"type": "boolean", "default": False},
+                "fuzzy": {"type": "boolean", "default": False},
+                "fuzzyWorkers": {
+                    "oneOf": [
+                        {"const": "auto"},
+                        {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 8,
+                        },
+                    ],
+                    "default": "auto",
+                },
                 "lockTimeout": {
                     "type": "number",
                     "exclusiveMinimum": 0,

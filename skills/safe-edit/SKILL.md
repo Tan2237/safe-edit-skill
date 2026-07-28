@@ -264,7 +264,7 @@ python "SAFE_EDIT_SCRIPT" delete --file F --line N
 python "SAFE_EDIT_SCRIPT" delete-lines --file F --start N --end M
 
 # Fuzzy matching (for approximate text)
-python "SAFE_EDIT_SCRIPT" edit --file F --old "old" --new "new" --fuzzy --expected-count 1
+python "SAFE_EDIT_SCRIPT" edit --file F --old "old" --new "new" --auto-match --fuzzy --expected-count 1
 
 # Diagnose match failure
 python "SAFE_EDIT_SCRIPT" edit --file F --old "old" --new "new" --explain-match-failure
@@ -398,6 +398,7 @@ Most failures are whitespace differences. Use `--explain-match-failure` before a
 |--------|--------|-------------|
 | `--auto-match` | Auto-try: exact → ignore-eol → ignore-indent → normalize-whitespace | **Default for multiline** |
 | `--fuzzy` | Fuzzy matching (≥0.6); ignores per-line boundary whitespace, EOL style, and final EOL | AI-generated approximate text |
+| `--fuzzy-workers auto\|N` | Conditional low-priority fuzzy processes; `1` forces serial, `N` is 2–8 | Large CPU-heavy fuzzy searches |
 | `--normalize-whitespace` | Collapse whitespace | **JSON/YAML/Markdown** |
 | `--context-before/after` | Disambiguate matches | Multiple occurrences |
 

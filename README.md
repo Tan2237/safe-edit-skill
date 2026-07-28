@@ -89,7 +89,7 @@ codex plugin add safe-edit-skill@safe-edit
   完成多文件预演、加锁写入和失败回滚。
 
 推荐一次批量 `stat`，随后一次批量 transaction。MCP 服务是常驻进程，
-只导入一次编辑内核并只构建一次参数解析器；热路径不会启动子进程、
+只导入一次编辑内核并只构建一次参数解析器；普通热路径不启动子进程（大型 fuzzy 查找除外），
 不会把已结构化请求再次 JSON 解码，也不会产生 Base64 的约 33% 体积膨胀。
 
 结构化 transaction 示例：
@@ -273,6 +273,8 @@ python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-matc
 ```
 
 模糊比较会忽略每行开头和结尾的空白、CRLF/LF/CR 差异，以及文件末尾是否有换行；行内空白仍然有意义，不会被折叠。
+
+`--fuzzy-workers auto`（默认）只为解码后占用约 8 MiB 以上且计算量足够的 fuzzy 查找启用低优先级多进程，最多使用 4 个进程并预留 2 个逻辑核；低基数重复内容和普通文件保持串行。使用 `--fuzzy-workers 1` 可强制串行，`2`–`8` 可显式设置进程上限。
 
 **关键安全约束**：自动容错在输出中报告使用的匹配级别（`matchStrategy` 字段），不会静默降级。
 
@@ -687,6 +689,7 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 | `--explain-match-failure` | 匹配失败时显示诊断 |
 | `--auto-match` | 自动容错匹配（exact → ignore-eol → ignore-indent → normalize-whitespace） |
 | `--fuzzy` | 启用模糊匹配（需配合 `--auto-match`，相似度 ≥ 0.6；忽略逐行首尾空白、行尾格式和最终换行） |
+| `--fuzzy-workers auto\|N` | fuzzy 进程上限；默认 `auto`，`1` 强制串行，`N` 为 2–8 |
 | `--context-before T` | 匹配位置前面必须包含的文本 |
 | `--context-after T` | 匹配位置后面必须包含的文本 |
 | `--diff-input TEXT` | SEARCH/REPLACE 格式输入 |

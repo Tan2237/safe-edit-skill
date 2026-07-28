@@ -26,6 +26,7 @@ def _load_server():
 
 
 server = _load_server()
+ToolInputError = server.execute_tool.__globals__["ToolInputError"]
 
 
 class SafeEditMcpTests(unittest.TestCase):
@@ -92,6 +93,100 @@ class SafeEditMcpTests(unittest.TestCase):
             target.read_text(encoding="utf-8"), replacement + "\n"
         )
         self.assertEqual(result["transport"], "mcp-structured")
+
+    def test_transaction_exposes_fuzzy_worker_options(self):
+        response = server.handle_message(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        )
+        transaction = next(
+            tool
+            for tool in response["result"]["tools"]
+            if tool["name"] == "safe_edit_transaction"
+        )
+        properties = transaction["inputSchema"]["properties"]
+        self.assertIn("autoMatch", properties)
+        self.assertIn("fuzzy", properties)
+        self.assertIn("fuzzyWorkers", properties)
+
+    def test_transaction_validates_fuzzy_worker_options(self):
+        for value in (0, 9, True, 2.5, "2"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ToolInputError,
+                    "fuzzyWorkers must be auto or an integer from 1 to 8",
+                ):
+                    server.execute_tool(
+                        "safe_edit_transaction",
+                        {
+                            "files": [{"file": "unused"}],
+                            "fuzzyWorkers": value,
+                        },
+                    )
+
+    def test_transaction_validates_fuzzy_flags(self):
+        for name in ("autoMatch", "fuzzy"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    ToolInputError,
+                    f"{name} must be a boolean",
+                ):
+                    server.execute_tool(
+                        "safe_edit_transaction",
+                        {
+                            "files": [{"file": "unused"}],
+                            name: 1,
+                        },
+                    )
+
+    def test_transaction_runs_fuzzy_workers(self):
+        target = self.root / "fuzzy-workers.txt"
+        target.write_bytes(
+            b"prefix\r\n"
+            b"def calculate(price, qty):\r\n"
+            b"value = price * qty\r\n"
+            b"return value\r\n"
+            b"suffix\r\n"
+        )
+        stat_summary = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )
+        expected = stat_summary["files"][0]["sha256"]
+
+        result = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "autoMatch": True,
+                "fuzzy": True,
+                "fuzzyWorkers": 2,
+                "files": [
+                    {
+                        "file": str(target),
+                        "action": "edit",
+                        "expectedSha256": expected,
+                        "operations": [
+                            {
+                                "op": "edit",
+                                "old": (
+                                    "def calculate(cost, qty):\n"
+                                    "value = price * qty\n"
+                                    "return value"
+                                ),
+                                "new": "done",
+                                "expected_count": 1,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+
+        self.assertTrue(result["written"])
+        self.assertEqual(
+            result["files"][0]["matchOptions"]["fuzzyWorkers"], 2
+        )
+        self.assertEqual(
+            target.read_bytes(), b"prefix\r\ndone\r\nsuffix\r\n"
+        )
 
     def test_large_create_dry_run_stays_in_memory(self):
         target = self.root / "large.html"

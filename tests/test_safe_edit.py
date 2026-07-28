@@ -3893,6 +3893,175 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         )
         self.assertEqual(result, (1, "beta\ngamma\nalpha"))
 
+    def test_fuzzy_workers_parser(self):
+        m = self._import_safe_edit()
+        self.assertEqual(m.parse_fuzzy_workers("auto"), "auto")
+        self.assertEqual(m.parse_fuzzy_workers("1"), 1)
+        self.assertEqual(m.parse_fuzzy_workers("8"), 8)
+        for invalid in ("0", "9", "two"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(m.argparse.ArgumentTypeError):
+                    m.parse_fuzzy_workers(invalid)
+
+    def test_choose_fuzzy_worker_plan(self):
+        m = self._import_safe_edit()
+        heavy = m.FuzzyWorkload(
+            text_storage_bytes=9 * 1024 * 1024,
+            line_count=100000,
+            pattern_line_count=1,
+            candidate_count=100000,
+            comparison_units=20000000,
+            unique_line_count=4097,
+        )
+        light = m.FuzzyWorkload(
+            text_storage_bytes=9 * 1024 * 1024,
+            line_count=100000,
+            pattern_line_count=1,
+            candidate_count=100000,
+            comparison_units=100,
+            unique_line_count=1,
+        )
+
+        self.assertEqual(
+            m.choose_fuzzy_worker_plan("auto", heavy, logical_cpus=16),
+            m.FuzzyWorkerPlan(4, "auto-heavy"),
+        )
+        self.assertEqual(
+            m.choose_fuzzy_worker_plan("auto", light, logical_cpus=16).workers,
+            1,
+        )
+        self.assertEqual(
+            m.choose_fuzzy_worker_plan("auto", heavy, logical_cpus=3).workers,
+            1,
+        )
+        self.assertEqual(
+            m.choose_fuzzy_worker_plan(2, light, logical_cpus=16).workers,
+            2,
+        )
+
+    def test_fuzzy_workload_extrapolates_high_diversity(self):
+        m = self._import_safe_edit()
+        lines = [f"{index:04x}" + ("x" * 96) for index in range(5000)]
+        workload = m._build_fuzzy_workload(
+            "\n".join(lines), lines, ("z" * 100,)
+        )
+        self.assertGreater(workload.comparison_units, 40_000_000)
+
+    def test_parallel_fuzzy_process_pool_executes(self):
+        m = self._import_safe_edit()
+        module_dir = str(REPO_ROOT / "skills" / "safe-edit")
+        sys.path.insert(0, module_dir)
+        try:
+            outcomes = m._run_parallel_fuzzy_tasks(
+                [(["target"], ("target",), 0, 7)],
+                2,
+            )
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(outcomes, [(1, 1.0, 7)])
+
+    def test_parallel_fuzzy_avoids_unhelpful_processes(self):
+        m = self._import_safe_edit()
+        no_pool = AssertionError("fuzzy pool should not start")
+        with patch.object(m, "_FUZZY_AUTO_MIN_TEXT_BYTES", 1):
+            with patch.object(
+                m, "_run_parallel_fuzzy_tasks", side_effect=no_pool
+            ):
+                repeated = m.find_closest_match_parallel(
+                    "same\n" * 32,
+                    "changed\nsame\nsame",
+                    "auto",
+                )
+                lines = [f"line-{index}" for index in range(20)]
+                large_pattern = m.find_closest_match_parallel(
+                    "\n".join(lines),
+                    "\n".join(lines[:15]),
+                    4,
+                )
+        self.assertEqual(repeated, (1, "same\nsame\nsame"))
+        self.assertEqual(large_pattern, (1, "\n".join(lines[:15])))
+
+    def test_parallel_fuzzy_preserves_global_priority_and_crlf(self):
+        m = self._import_safe_edit()
+        text = (
+            "a\r\nb\r\nx\r\nseparator\r\n"
+            "  a  \r\n\tb\r\nc  \r\n"
+        )
+        pattern = "a\nb\nc"
+
+        def run_in_process(tasks, _workers):
+            return [m._fuzzy_chunk_worker(task) for task in tasks]
+
+        with patch.object(
+            m,
+            "_run_parallel_fuzzy_tasks",
+            side_effect=run_in_process,
+        ) as runner:
+            parallel = m.find_closest_match_parallel(text, pattern, 3)
+
+        self.assertEqual(parallel, m.find_closest_match(text, pattern))
+        self.assertEqual(parallel, (5, "  a  \r\n\tb\r\nc  "))
+        self.assertEqual(runner.call_count, 1)
+
+    def test_parallel_fuzzy_falls_back_after_pool_failure(self):
+        m = self._import_safe_edit()
+        text = "a\nb\nx\nseparator\na\nb\nc\n"
+        pattern = "a\nb\nc"
+        with patch.object(
+            m,
+            "_run_parallel_fuzzy_tasks",
+            side_effect=OSError("process creation failed"),
+        ):
+            result = m.find_closest_match_parallel(text, pattern, 2)
+        self.assertEqual(result, m.find_closest_match(text, pattern))
+
+    def test_exact_auto_match_does_not_start_fuzzy_workers(self):
+        m = self._import_safe_edit()
+        operation = {"old": "target", "new": "done"}
+        with patch.object(
+            m,
+            "_run_parallel_fuzzy_tasks",
+            side_effect=AssertionError("fuzzy pool should not start"),
+        ):
+            result, changed, strategy = m.apply_literal_edit_cascade(
+                "target\n",
+                operation,
+                "\n",
+                fuzzy=True,
+                fuzzy_workers=4,
+            )
+        self.assertEqual((result, changed, strategy), ("done\n", 1, "exact"))
+
+    def test_fuzzy_workers_cli_processes(self):
+        path = self.tmpdir / "fuzzy_workers_processes.txt"
+        path.write_bytes(
+            b"prefix\r\n"
+            b"def calculate(price, qty):\r\n"
+            b"value = price * qty\r\n"
+            b"return value\r\n"
+            b"suffix\r\n"
+        )
+        result = self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "def calculate(cost, qty):\nvalue = price * qty\nreturn value",
+            "--new",
+            "done",
+            "--auto-match",
+            "--fuzzy",
+            "--fuzzy-workers",
+            "2",
+            "--expected-count",
+            "1",
+            "--json",
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "fuzzy")
+        self.assertEqual(payload["matchOptions"]["fuzzyWorkers"], 2)
+        self.assertEqual(path.read_bytes(), b"prefix\r\ndone\r\nsuffix\r\n")
+
     def test_extract_nearby_content_no_match(self):
         """Test extract_nearby_content returns None when no close match found."""
         m = self._import_safe_edit()

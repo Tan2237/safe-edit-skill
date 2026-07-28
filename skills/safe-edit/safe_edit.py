@@ -9,6 +9,8 @@ import binascii
 import codecs
 from bisect import bisect_right
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 import difflib
 import errno
 import functools
@@ -572,37 +574,183 @@ def _candidate_start_intervals(
         yield current_start, current_end
 
 
-def find_closest_match(text: str, pattern: str, max_lines: int = 10) -> Optional[Tuple[int, str]]:
-    """Find the closest line-aligned fragment in text for a pattern.
+_FUZZY_AUTO_MIN_TEXT_BYTES = 8 * 1024 * 1024
+_FUZZY_AUTO_MIN_COMPARISON_UNITS = 10_000_000
+_FUZZY_AUTO_HIGH_WORK_UNITS = 40_000_000
+_FUZZY_AUTO_MIN_SINGLE_CANDIDATES = 10_000
+_FUZZY_AUTO_MIN_MULTILINE_CANDIDATES = 50_000
+_FUZZY_AUTO_MAX_WORKERS = 4
+_FUZZY_MAX_WORKERS = 8
+_FUZZY_CPU_RESERVE = 2
 
-    Fuzzy comparison ignores leading and trailing whitespace on every line,
-    line-ending style, and the presence of a final line ending. Returned
-    fragments retain the original text so callers can replace them safely.
-    """
-    if not pattern or not text:
-        return None
 
-    pattern_raw_lines = pattern.splitlines()
-    if not pattern_raw_lines:
-        return None
+@dataclass(frozen=True)
+class FuzzyWorkload:
+    text_storage_bytes: int
+    line_count: int
+    pattern_line_count: int
+    candidate_count: int
+    comparison_units: int
+    unique_line_count: int
 
-    text_records = text.splitlines(keepends=True)
-    text_raw_lines = text.splitlines()
-    pattern_lines = [line.strip() for line in pattern_raw_lines]
-    text_lines = [line.strip() for line in text_raw_lines]
+
+@dataclass(frozen=True)
+class FuzzyWorkerPlan:
+    workers: int
+    reason: str
+
+
+def parse_fuzzy_workers(value: str) -> Any:
+    """Parse auto or an explicit fuzzy process count."""
+    normalized = str(value).strip().lower()
+    if normalized == "auto":
+        return "auto"
+    try:
+        workers = int(normalized)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--fuzzy-workers must be auto or an integer from 1 to 8"
+        ) from exc
+    if workers < 1 or workers > _FUZZY_MAX_WORKERS:
+        raise argparse.ArgumentTypeError(
+            "--fuzzy-workers must be auto or an integer from 1 to 8"
+        )
+    return workers
+
+
+def _build_fuzzy_workload(
+    text: str,
+    text_lines: List[str],
+    pattern_lines: Tuple[str, ...],
+) -> FuzzyWorkload:
     pattern_len = len(pattern_lines)
+    line_count = len(text_lines)
+    if pattern_len == 1:
+        unique_lines: Set[str] = set()
+        unique_characters = 0
+        for line in text_lines:
+            if line in unique_lines:
+                continue
+            unique_lines.add(line)
+            unique_characters += len(line)
+            if len(unique_lines) > 4096:
+                break
+        estimated_characters = unique_characters
+        if len(unique_lines) > 4096:
+            average_characters = unique_characters / len(unique_lines)
+            estimated_characters = max(
+                unique_characters,
+                int(average_characters * line_count),
+            )
+        comparison_units = max(1, len(pattern_lines[0])) * max(
+            1, estimated_characters
+        )
+        candidate_count = line_count
+        unique_line_count = len(unique_lines)
+    else:
+        max_start = line_count - pattern_len
+        if max_start < 0:
+            candidate_count = 0
+        else:
+            candidate_count = sum(
+                end - start + 1
+                for start, end in _candidate_start_intervals(
+                    text_lines,
+                    set(pattern_lines),
+                    pattern_len,
+                    max_start,
+                )
+            )
+        comparison_units = candidate_count * pattern_len
+        unique_line_count = 0
+
+    return FuzzyWorkload(
+        text_storage_bytes=text.__sizeof__(),
+        line_count=line_count,
+        pattern_line_count=pattern_len,
+        candidate_count=candidate_count,
+        comparison_units=comparison_units,
+        unique_line_count=unique_line_count,
+    )
+
+
+def choose_fuzzy_worker_plan(
+    requested: Any,
+    workload: FuzzyWorkload,
+    logical_cpus: Optional[int] = None,
+) -> FuzzyWorkerPlan:
+    """Choose a deterministic process count from task shape and CPU topology."""
+    detected_cpus = os.cpu_count() or 1
+    if logical_cpus is None and hasattr(os, "sched_getaffinity"):
+        try:
+            detected_cpus = len(os.sched_getaffinity(0))
+        except OSError:
+            pass
+    cpus = max(1, int(logical_cpus or detected_cpus))
+    if requested != "auto":
+        requested_count = int(requested)
+        if requested_count <= 1 or workload.candidate_count < 2:
+            return FuzzyWorkerPlan(1, "explicit-serial")
+        return FuzzyWorkerPlan(
+            min(requested_count, cpus, workload.candidate_count),
+            "explicit",
+        )
+
+    if workload.text_storage_bytes < _FUZZY_AUTO_MIN_TEXT_BYTES:
+        return FuzzyWorkerPlan(1, "small-text")
+    if workload.candidate_count < 2:
+        return FuzzyWorkerPlan(1, "insufficient-candidates")
+
+    minimum_candidates = (
+        _FUZZY_AUTO_MIN_SINGLE_CANDIDATES
+        if workload.pattern_line_count == 1
+        else _FUZZY_AUTO_MIN_MULTILINE_CANDIDATES
+    )
+    if (
+        workload.candidate_count < minimum_candidates
+        and workload.comparison_units < _FUZZY_AUTO_HIGH_WORK_UNITS
+    ):
+        return FuzzyWorkerPlan(1, "light-candidate-set")
+    if workload.comparison_units < _FUZZY_AUTO_MIN_COMPARISON_UNITS:
+        return FuzzyWorkerPlan(1, "light-comparison-work")
+
+    available = max(1, cpus - _FUZZY_CPU_RESERVE)
+    workers = min(
+        _FUZZY_AUTO_MAX_WORKERS,
+        available,
+        workload.candidate_count,
+    )
+    if workers < 2:
+        return FuzzyWorkerPlan(1, "cpu-reserve")
+    return FuzzyWorkerPlan(workers, "auto-heavy")
+
+
+def _find_closest_start(
+    text_lines: List[str],
+    pattern_lines: Tuple[str, ...],
+    max_start: Optional[int] = None,
+) -> Optional[Tuple[int, float, int]]:
+    """Return priority, score, and zero-based start for one line slice."""
+    pattern_len = len(pattern_lines)
+    available_max_start = len(text_lines) - pattern_len
+    if available_max_start < 0:
+        return None
+    if max_start is None or max_start > available_max_start:
+        max_start = available_max_start
+    if max_start < 0:
+        return None
 
     if pattern_len == 1:
         pattern_line = pattern_lines[0]
         best_score = 0.0
-        best_line = 0
-        best_fragment = ""
+        best_start = 0
         score_cache: Dict[str, float] = {}
         matcher = difflib.SequenceMatcher(None, pattern_line, "")
 
-        for index, (raw_line, line) in enumerate(zip(text_raw_lines, text_lines)):
+        for index in range(max_start + 1):
+            line = text_lines[index]
             if line == pattern_line or (pattern_line and pattern_line in line):
-                return (index + 1, raw_line)
+                return 1, 1.0, index
 
             if line and line in pattern_line:
                 score = len(line) / len(pattern_line) if pattern_line else 0.0
@@ -622,26 +770,19 @@ def find_closest_match(text: str, pattern: str, max_lines: int = 10) -> Optional
 
             if score > best_score:
                 best_score = score
-                best_line = index
-                best_fragment = raw_line
+                best_start = index
+        return 0, best_score, best_start
 
-        if best_score >= 0.3:
-            return (best_line + 1, best_fragment)
-        return None
-
-    max_start = len(text_lines) - pattern_len
-    if max_start < 0:
-        return None
-
-    pattern_tuple = tuple(pattern_lines)
-    pattern_counts = Counter(pattern_tuple)
+    pattern_counts = Counter(pattern_lines)
     best_matches = 0
     best_start = 0
+    saw_candidate = False
     score_cache: Dict[Tuple[str, ...], int] = {}
 
     for interval_start, interval_end in _candidate_start_intervals(
-        text_lines, set(pattern_tuple), pattern_len, max_start
+        text_lines, set(pattern_lines), pattern_len, max_start
     ):
+        saw_candidate = True
         window_counts = Counter(
             text_lines[interval_start:interval_start + pattern_len]
         )
@@ -653,18 +794,13 @@ def find_closest_match(text: str, pattern: str, max_lines: int = 10) -> Optional
         for start in range(interval_start, interval_end + 1):
             if overlap > best_matches:
                 fragment = tuple(text_lines[start:start + pattern_len])
-                if fragment == pattern_tuple:
-                    return (
-                        start + 1,
-                        _raw_line_fragment(
-                            text_records, text_raw_lines, start, pattern_len
-                        ),
-                    )
+                if fragment == pattern_lines:
+                    return 1, 1.0, start
 
                 matched = score_cache.get(fragment)
                 if matched is None:
                     line_matcher = difflib.SequenceMatcher(
-                        None, pattern_tuple, fragment
+                        None, pattern_lines, fragment
                     )
                     matched = sum(
                         block.size for block in line_matcher.get_matching_blocks()
@@ -698,14 +834,227 @@ def find_closest_match(text: str, pattern: str, max_lines: int = 10) -> Optional
                 overlap += 1
             window_counts[incoming] = incoming_count + 1
 
-    if best_matches * 2 >= pattern_len:
-        return (
-            best_start + 1,
-            _raw_line_fragment(
-                text_records, text_raw_lines, best_start, pattern_len
-            ),
+    if not saw_candidate:
+        return None
+    return 0, best_matches / pattern_len, best_start
+
+
+def _fuzzy_outcome_is_acceptable(
+    outcome: Optional[Tuple[int, float, int]],
+    pattern_len: int,
+) -> bool:
+    if outcome is None:
+        return False
+    priority, score, _start = outcome
+    if priority:
+        return True
+    return score >= (0.3 if pattern_len == 1 else 0.5)
+
+
+def _fuzzy_outcome_is_better(
+    candidate: Tuple[int, float, int],
+    best: Optional[Tuple[int, float, int]],
+) -> bool:
+    if best is None:
+        return True
+    candidate_priority, candidate_score, candidate_start = candidate
+    best_priority, best_score, best_start = best
+    return (
+        candidate_priority > best_priority
+        or (
+            candidate_priority == best_priority
+            and (
+                candidate_score > best_score
+                or (
+                    candidate_score == best_score
+                    and candidate_start < best_start
+                )
+            )
         )
-    return None
+    )
+
+
+def _configure_fuzzy_worker_priority() -> None:
+    """Run fuzzy workers below normal priority so foreground work wins."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            below_normal_priority_class = 0x00004000
+            process = ctypes.windll.kernel32.GetCurrentProcess()
+            ctypes.windll.kernel32.SetPriorityClass(
+                process, below_normal_priority_class
+            )
+        elif hasattr(os, "nice"):
+            os.nice(5)
+    except Exception:
+        pass
+
+
+def _fuzzy_chunk_worker(
+    task: Tuple[List[str], Tuple[str, ...], int, int],
+) -> Optional[Tuple[int, float, int]]:
+    lines, pattern_lines, local_max_start, global_start = task
+    outcome = _find_closest_start(lines, pattern_lines, local_max_start)
+    if outcome is None:
+        return None
+    priority, score, local_start = outcome
+    return priority, score, global_start + local_start
+
+
+def _run_parallel_fuzzy_tasks(
+    tasks: List[Tuple[List[str], Tuple[str, ...], int, int]],
+    workers: int,
+) -> List[Optional[Tuple[int, float, int]]]:
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_configure_fuzzy_worker_priority,
+    ) as executor:
+        return list(executor.map(_fuzzy_chunk_worker, tasks))
+
+
+def _render_fuzzy_outcome(
+    outcome: Optional[Tuple[int, float, int]],
+    text_records: List[str],
+    text_raw_lines: List[str],
+    pattern_len: int,
+) -> Optional[Tuple[int, str]]:
+    if not _fuzzy_outcome_is_acceptable(outcome, pattern_len):
+        return None
+    assert outcome is not None
+    start = outcome[2]
+    return (
+        start + 1,
+        _raw_line_fragment(
+            text_records,
+            text_raw_lines,
+            start,
+            pattern_len,
+        ),
+    )
+
+
+def find_closest_match(
+    text: str,
+    pattern: str,
+    max_lines: int = 10,
+) -> Optional[Tuple[int, str]]:
+    """Find the closest line-aligned fragment in text for a pattern.
+
+    Fuzzy comparison ignores leading and trailing whitespace on every line,
+    line-ending style, and the presence of a final line ending. Returned
+    fragments retain the original text so callers can replace them safely.
+    """
+    if not pattern or not text:
+        return None
+
+    pattern_raw_lines = pattern.splitlines()
+    if not pattern_raw_lines:
+        return None
+
+    text_records = text.splitlines(keepends=True)
+    text_raw_lines = text.splitlines()
+    pattern_lines = tuple(line.strip() for line in pattern_raw_lines)
+    text_lines = [line.strip() for line in text_raw_lines]
+    outcome = _find_closest_start(text_lines, pattern_lines)
+    return _render_fuzzy_outcome(
+        outcome,
+        text_records,
+        text_raw_lines,
+        len(pattern_lines),
+    )
+
+
+def find_closest_match_parallel(
+    text: str,
+    pattern: str,
+    workers: Any = 1,
+    max_lines: int = 10,
+) -> Optional[Tuple[int, str]]:
+    """Find a fuzzy match using conditional low-priority processes."""
+    requested = parse_fuzzy_workers(str(workers))
+    if requested == 1 or not pattern or not text:
+        return find_closest_match(text, pattern, max_lines)
+    if (
+        requested == "auto"
+        and text.__sizeof__() < _FUZZY_AUTO_MIN_TEXT_BYTES
+    ):
+        return find_closest_match(text, pattern, max_lines)
+
+    pattern_raw_lines = pattern.splitlines()
+    if not pattern_raw_lines:
+        return None
+    pattern_lines = tuple(line.strip() for line in pattern_raw_lines)
+    pattern_len = len(pattern_lines)
+    text_records = text.splitlines(keepends=True)
+    text_raw_lines = text.splitlines()
+    text_lines = [line.strip() for line in text_raw_lines]
+    low_diversity = False
+    if requested == "auto" and text_lines:
+        sample_step = max(1, len(text_lines) // 512)
+        sampled_lines = text_lines[::sample_step][:513]
+        low_diversity = len(set(sampled_lines)) <= 4
+    if low_diversity:
+        plan = FuzzyWorkerPlan(1, "low-diversity")
+    else:
+        workload = _build_fuzzy_workload(text, text_lines, pattern_lines)
+        plan = choose_fuzzy_worker_plan(requested, workload)
+
+    if plan.workers <= 1:
+        outcome = _find_closest_start(text_lines, pattern_lines)
+        return _render_fuzzy_outcome(
+            outcome,
+            text_records,
+            text_raw_lines,
+            pattern_len,
+        )
+
+    total_starts = len(text_lines) - pattern_len + 1
+    actual_workers = min(plan.workers, total_starts)
+    max_payload_tasks = max(1, ((2 * len(text_lines)) // pattern_len + 1) // 2)
+    task_count = min(total_starts, actual_workers * 2, max_payload_tasks)
+    actual_workers = min(actual_workers, task_count)
+    if actual_workers <= 1:
+        outcome = _find_closest_start(text_lines, pattern_lines)
+        return _render_fuzzy_outcome(
+            outcome,
+            text_records,
+            text_raw_lines,
+            pattern_len,
+        )
+    chunk_size = (total_starts + task_count - 1) // task_count
+    tasks: List[Tuple[List[str], Tuple[str, ...], int, int]] = []
+    for global_start in range(0, total_starts, chunk_size):
+        global_end = min(total_starts, global_start + chunk_size)
+        tasks.append(
+            (
+                text_lines[global_start:global_end + pattern_len - 1],
+                pattern_lines,
+                global_end - global_start - 1,
+                global_start,
+            )
+        )
+
+    try:
+        outcomes = _run_parallel_fuzzy_tasks(tasks, actual_workers)
+    except (KeyboardInterrupt, MemoryError):
+        raise
+    except (BrokenProcessPool, OSError, RuntimeError):
+        outcomes = []
+
+    best: Optional[Tuple[int, float, int]] = None
+    for outcome in outcomes:
+        if outcome is not None and _fuzzy_outcome_is_better(outcome, best):
+            best = outcome
+    if not outcomes:
+        best = _find_closest_start(text_lines, pattern_lines)
+
+    return _render_fuzzy_outcome(
+        best,
+        text_records,
+        text_raw_lines,
+        pattern_len,
+    )
 
 def extract_nearby_content(
     text: str,
@@ -1512,6 +1861,7 @@ def apply_literal_edit_cascade(
     fuzzy: bool = False,
     context_before: Optional[str] = None,
     context_after: Optional[str] = None,
+    fuzzy_workers: Any = 1,
 ) -> Tuple[str, int, str]:
     """Apply a literal edit with automatic progressive relaxation of match strictness.
     
@@ -1591,7 +1941,11 @@ def apply_literal_edit_cascade(
     # All normalization levels failed — try fuzzy if enabled
     if fuzzy:
         old = str(operation["old"])
-        result = find_closest_match(text, old)
+        result = find_closest_match_parallel(
+            text,
+            old,
+            fuzzy_workers,
+        )
         if result is not None:
             line_num, fragment = result
             similarity = _fuzzy_similarity(old, fragment)
@@ -2715,15 +3069,23 @@ class _OperationBuffer:
 def apply_operation(text: str, operation: Dict[str, Any], newline: str, explain: bool = False,
                     ignore_indent: bool = False, ignore_eol: bool = False, normalize_whitespace: bool = False,
                     auto_match: bool = False, fuzzy: bool = False,
-                    context_before: Optional[str] = None, context_after: Optional[str] = None) -> Tuple[str, int, str, str]:
+                    context_before: Optional[str] = None, context_after: Optional[str] = None,
+                    fuzzy_workers: Any = 1) -> Tuple[str, int, str, str]:
     """Apply a single operation and return text, count, name, and strategy."""
     op = str(operation.get("op") or operation.get("command") or "").replace("_", "-")
     match_strategy = "exact"
     if op == "edit":
         if auto_match:
             new_text, changed, match_strategy = apply_literal_edit_cascade(
-                text, operation, newline, explain=explain, fuzzy=fuzzy,
-                context_before=context_before, context_after=context_after)
+                text,
+                operation,
+                newline,
+                explain=explain,
+                fuzzy=fuzzy,
+                context_before=context_before,
+                context_after=context_after,
+                fuzzy_workers=fuzzy_workers,
+            )
         else:
             new_text, changed, match_strategy = apply_literal_edit(
                 text, operation, newline, explain,
@@ -2760,6 +3122,7 @@ def apply_operations(
     fuzzy: bool = False,
     context_before: Optional[str] = None,
     context_after: Optional[str] = None,
+    fuzzy_workers: Any = 1,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Apply an operation list while reusing line records between line edits."""
     buffer = _OperationBuffer(text)
@@ -2802,6 +3165,7 @@ def apply_operations(
                 fuzzy=fuzzy,
                 context_before=op_ctx_before,
                 context_after=op_ctx_after,
+                fuzzy_workers=fuzzy_workers,
             )
             buffer.set_text(updated)
 
@@ -4096,6 +4460,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="automatically try progressively relaxed matching: exact → ignore-eol → ignore-indent → normalize-whitespace")
     parser.add_argument("--fuzzy", action="store_true",
                         help="enable fuzzy matching as last resort (requires --auto-match, similarity >= 0.6)")
+    parser.add_argument(
+        "--fuzzy-workers",
+        type=parse_fuzzy_workers,
+        default="auto",
+        metavar="auto|N",
+        help=(
+            "fuzzy process limit: auto uses low-priority workers only for "
+            "large CPU-heavy searches; 1 disables multiprocessing; N is 2-8"
+        ),
+    )
     parser.add_argument("--context-before",
                         help="text that must appear before the match for disambiguation")
     parser.add_argument("--context-after",
@@ -4291,6 +4665,7 @@ def run_create(args: argparse.Namespace) -> Dict[str, Any]:
         "matchOptions": {
             "autoMatch": False,
             "fuzzy": False,
+            "fuzzyWorkers": getattr(args, "fuzzy_workers", "auto"),
             "ignoreIndent": False,
             "ignoreEol": False,
             "normalizeWhitespace": False,
@@ -4442,6 +4817,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         normalize_whitespace = getattr(args, "normalize_whitespace", False)
         auto_match = getattr(args, "auto_match", False)
         fuzzy = getattr(args, "fuzzy", False)
+        fuzzy_workers = getattr(args, "fuzzy_workers", "auto")
         context_before = getattr(args, "context_before", None)
         context_after = getattr(args, "context_after", None)
         try:
@@ -4453,10 +4829,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 ignore_indent,
                 ignore_eol,
                 normalize_whitespace,
-                auto_match,
-                fuzzy,
-                context_before,
-                context_after,
+                auto_match=auto_match,
+                fuzzy=fuzzy,
+                context_before=context_before,
+                context_after=context_after,
+                fuzzy_workers=fuzzy_workers,
             )
         except SafeEditError as exc:
             setattr(exc, "_diagnostic_text", text)
@@ -4492,6 +4869,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "matchOptions": {
                 "autoMatch": auto_match,
                 "fuzzy": fuzzy,
+                "fuzzyWorkers": fuzzy_workers,
                 "ignoreIndent": ignore_indent,
                 "ignoreEol": ignore_eol,
                 "normalizeWhitespace": normalize_whitespace,
