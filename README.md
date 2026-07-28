@@ -310,7 +310,7 @@ python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-matc
 python safe_edit.py edit --file path/to/file --old "missing" --new "bar" --json
 ```
 
-错误类型包括：`match_not_found`、`match_ambiguous`、`match_count_mismatch`、`encoding_error`、`file_error`、`lock_error`、`validation_error`、`format_error`、`unknown`。
+错误类型包括：`match_not_found`、`match_ambiguous`、`match_count_mismatch`、`hash_mismatch`、`encoding_error`、`file_error`、`lock_error`、`validation_error`、`format_error`、`unknown`。
 
 ### Agent Recovery Protocol
 
@@ -349,6 +349,32 @@ python safe_edit.py edit --file path/to/file --old "missing" --new "bar" --json
 | `closestMatch` | 最接近匹配的位置、片段和相似度（0.0–1.0） |
 | `recommendedAction` | 推荐的恢复动作（`retry`、`re_read_file`、`ask_user`、`stop`）及其置信度 |
 | `retryStrategy` | 仅 `RETRYABLE` 时返回，包含推荐的重试参数 |
+
+### 过期哈希恢复
+
+当 `stat`、`inspect`、`edit` 或 `transaction` 的 `expectedSha256` 与目标文件当前内容不一致时，错误类型为 `hash_mismatch`，并直接携带可用于重试的字段，无需重新运行 `stat`：
+
+```json
+{
+  "ok": false,
+  "error": {"type": "hash_mismatch", "message": "SHA-256 mismatch: ..."},
+  "failureClass": "RETRYABLE",
+  "rootCause": "stale_expected_sha256",
+  "expectedSha256": "0000...",
+  "actualSha256": "e49c...",
+  "recommendedAction": {"type": "retry_with_actual_sha256", "confidence": 0.9},
+  "retryStrategy": {"expectedSha256": "e49c..."}
+}
+```
+
+`retryStrategy.expectedSha256` 就是文件当前的哈希，可直接作为下一次非删除请求的 `expectedSha256`。文件内容已经变化，重试前应重新核对编辑上下文。
+
+有两个安全例外：
+
+- `remove-file` 哈希失效时仍返回 `actualSha256`，但不会返回 `retryStrategy`；必须重新读取并确认变化后的文件，再决定是否删除。
+- `create` 目标已存在时返回现有文件的 `actualSha256`（若能安全计算），但不会自动建议改成 `edit`；必须先检查既有文件，避免把“创建新文件”升级成“修改已有文件”。
+
+此外，`stat`/`edit` 目标不存在时会返回 `recommendedAction: {"type": "create_file_if_intended"}`。
 
 ## 上下文消歧
 

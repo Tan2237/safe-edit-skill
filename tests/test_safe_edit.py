@@ -1273,6 +1273,136 @@ class SafeEditTests(unittest.TestCase):
 
         self.assertTrue(path.exists())
         self.assertIn("SHA-256 mismatch", payload["error"]["message"])
+        self.assertEqual(payload["error"]["type"], "hash_mismatch")
+        self.assertEqual(payload["expectedSha256"], "0" * 64)
+        self.assertEqual(
+            payload["actualSha256"],
+            hashlib.sha256(b"current content\n").hexdigest(),
+        )
+        self.assertEqual(payload["failureClass"], "RE_READ_REQUIRED")
+        self.assertEqual(
+            payload["recommendedAction"]["type"], "re_read_file"
+        )
+        self.assertNotIn("retryStrategy", payload)
+
+    def test_edit_sha256_mismatch_reports_retry_fields(self):
+        path = self.tmpdir / "edit-hash-mismatch.txt"
+        path.write_bytes(b"alpha\n")
+
+        result = self.run_tool(
+            "edit",
+            "--file", path,
+            "--old", "alpha",
+            "--new", "beta",
+            "--expected-sha256", "0" * 64,
+            "--json",
+            expect=2,
+        )
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(payload["error"]["type"], "hash_mismatch")
+        self.assertEqual(payload["rootCause"], "stale_expected_sha256")
+        self.assertEqual(
+            payload["actualSha256"], hashlib.sha256(b"alpha\n").hexdigest()
+        )
+        self.assertEqual(
+            payload["retryStrategy"],
+            {"expectedSha256": hashlib.sha256(b"alpha\n").hexdigest()},
+        )
+        self.assertEqual(path.read_bytes(), b"alpha\n")
+
+    def test_stat_missing_file_suggests_create(self):
+        path = self.tmpdir / "missing.txt"
+
+        result = self.run_tool(
+            "stat", "--file", path, "--json", expect=2,
+        )
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(payload["error"]["type"], "file_error")
+        self.assertEqual(payload["rootCause"], "target_not_found")
+        self.assertEqual(
+            payload["recommendedAction"]["type"], "create_file_if_intended"
+        )
+
+    def test_transaction_sha256_mismatch_reports_failed_file_and_retry_fields(self):
+        path = self.tmpdir / "transaction-hash-mismatch.txt"
+        path.write_bytes(b"alpha\n")
+        request = self.tmpdir / "hash-mismatch-transaction.json"
+        request.write_text(
+            json.dumps(
+                {
+                    "files": [
+                        {
+                            "file": str(path),
+                            "action": "edit",
+                            "expectedSha256": "0" * 64,
+                            "operations": [
+                                {
+                                    "op": "edit",
+                                    "old": "alpha",
+                                    "new": "beta",
+                                    "expected_count": 1,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_tool(
+            "transaction", "--request-file", request, "--json", expect=2,
+        )
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(payload["error"]["type"], "hash_mismatch")
+        self.assertEqual(payload["failedFile"]["index"], 1)
+        self.assertEqual(
+            payload["failedFile"]["file"], str(path.resolve(strict=False))
+        )
+        self.assertEqual(
+            payload["retryStrategy"]["expectedSha256"],
+            hashlib.sha256(b"alpha\n").hexdigest(),
+        )
+        self.assertEqual(path.read_bytes(), b"alpha\n")
+
+    def test_transaction_create_collision_reports_failed_file_without_edit_retry(self):
+        path = self.tmpdir / "transaction-create-collision.txt"
+        path.write_bytes(b"existing\n")
+        request = self.tmpdir / "create-collision-transaction.json"
+        request.write_text(
+            json.dumps(
+                {
+                    "files": [
+                        {
+                            "file": str(path),
+                            "action": "create",
+                            "text": "replacement\n",
+                            "encoding": "utf-8",
+                            "lineEnding": "lf",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_tool(
+            "transaction", "--request-file", request, "--json", expect=2,
+        )
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(payload["rootCause"], "target_already_exists")
+        self.assertEqual(payload["failedFile"]["index"], 1)
+        self.assertEqual(payload["failedFile"]["file"], str(path))
+        self.assertEqual(payload["failureClass"], "RE_READ_REQUIRED")
+        self.assertEqual(
+            payload["recommendedAction"]["type"], "re_read_file"
+        )
+        self.assertNotIn("retryStrategy", payload)
+        self.assertEqual(path.read_bytes(), b"existing\n")
 
     def test_remove_file_requires_workspace_root(self):
         path = self.tmpdir / "remove-no-root.txt"
@@ -4089,6 +4219,19 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertEqual(m.classify_error_type("unsupported encoding: foo"), "encoding_error")
         # "file not found" should match file_error
         self.assertEqual(m.classify_error_type("file not found: test.txt"), "file_error")
+        # stale-hash messages should match hash_mismatch
+        self.assertEqual(
+            m.classify_error_type("SHA-256 mismatch: expected aaa, actual bbb"),
+            "hash_mismatch",
+        )
+        self.assertEqual(
+            m.classify_error_type("target changed after transaction prevalidation: f"),
+            "hash_mismatch",
+        )
+        self.assertEqual(
+            m.classify_error_type("file changed while remove-file was verifying it"),
+            "hash_mismatch",
+        )
 
     def test_set_final_newline_invalid_mode(self):
         """Test set_final_newline raises SafeEditError for invalid mode."""
@@ -4577,7 +4720,25 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         payload = json.loads(result.stdout)
         self.assertEqual(payload["error"]["type"], "file_error")
         self.assertIn("file already exists", payload["error"]["message"])
+        self.assertEqual(payload["rootCause"], "target_already_exists")
+        self.assertEqual(
+            payload["actualSha256"],
+            hashlib.sha256(b"original").hexdigest(),
+        )
+        self.assertEqual(payload["failureClass"], "RE_READ_REQUIRED")
+        self.assertEqual(
+            payload["recommendedAction"]["type"], "re_read_file"
+        )
+        self.assertNotIn("retryStrategy", payload)
         self.assertEqual(path.read_text(encoding="utf-8"), "original")
+
+    def test_existing_file_hash_does_not_follow_symlinks(self):
+        m = self._import_safe_edit()
+        path = self.tmpdir / "possible-symlink.txt"
+        path.write_bytes(b"target\n")
+
+        with patch.object(Path, "is_symlink", return_value=True):
+            self.assertIsNone(m._existing_regular_file_sha256(path))
 
     def test_create_requires_existing_parent_and_explicit_format(self):
         missing_parent = self.tmpdir / "missing" / "new.txt"
@@ -5561,6 +5722,65 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
                 m.run(args)
 
         self.assertIn("target changed after transaction prevalidation", str(ctx.exception))
+        self.assertEqual(target.read_bytes(), b"external\n")
+
+    def test_transaction_commit_mismatch_preserves_hash_diagnostics(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "commit-mismatch.txt"
+        request = self.tmpdir / "commit-mismatch.json"
+        target.write_bytes(b"alpha\n")
+        request.write_text(
+            json.dumps(
+                {
+                    "files": [
+                        {
+                            "file": str(target),
+                            "action": "edit",
+                            "expectedSha256": hashlib.sha256(b"alpha\n").hexdigest(),
+                            "operations": [
+                                {
+                                    "op": "edit",
+                                    "old": "alpha",
+                                    "new": "beta",
+                                    "expected_count": 1,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = m.build_parser().parse_args(
+            ["transaction", "--request-file", str(request)]
+        )
+        real_read_target = m.read_target
+        reads = {"target": 0}
+
+        def mutate_before_commit(path, max_bytes):
+            if os.path.samefile(str(path), str(target)):
+                reads["target"] += 1
+                if reads["target"] == 2:
+                    target.write_bytes(b"external\n")
+            return real_read_target(path, max_bytes)
+
+        with patch.object(m, "read_target", side_effect=mutate_before_commit):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run(args)
+
+        payload = m.build_error_payload(ctx.exception, command="transaction")
+        self.assertEqual(payload["error"]["type"], "hash_mismatch")
+        self.assertEqual(payload["failedFile"]["index"], 1)
+        self.assertEqual(
+            payload["expectedSha256"], hashlib.sha256(b"alpha\n").hexdigest()
+        )
+        self.assertEqual(
+            payload["actualSha256"], hashlib.sha256(b"external\n").hexdigest()
+        )
+        self.assertEqual(
+            payload["retryStrategy"]["expectedSha256"],
+            payload["actualSha256"],
+        )
         self.assertEqual(target.read_bytes(), b"external\n")
 
     def test_transaction_request_base64_dry_run_does_not_write(self):

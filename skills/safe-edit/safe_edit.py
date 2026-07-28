@@ -119,6 +119,59 @@ def fail(message: str) -> None:
     raise SafeEditError(message)
 
 
+_DIAGNOSTIC_ATTRS = (
+    "_diagnostic_operation",
+    "_diagnostic_operation_index",
+    "_diagnostic_text",
+    "_diagnostic_file",
+    "_diagnostic_file_index",
+    "_diagnostic_command",
+    "_expected_sha256",
+    "_actual_sha256",
+    "_file_already_exists",
+    "_file_not_found",
+)
+
+_EXISTING_FILE_HASH_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _fail_preserving_diagnostics(message: str, cause: BaseException) -> None:
+    """Re-raise with a new message while keeping retry-oriented attributes."""
+    exc = SafeEditError(message)
+    for attr in _DIAGNOSTIC_ATTRS:
+        if hasattr(cause, attr):
+            setattr(exc, attr, getattr(cause, attr))
+    raise exc
+
+
+def _fail_sha256_mismatch(message: str, expected: str, actual: str) -> None:
+    exc = SafeEditError(message)
+    setattr(exc, "_expected_sha256", expected)
+    setattr(exc, "_actual_sha256", actual)
+    raise exc
+
+
+def _existing_regular_file_sha256(path: Path) -> Optional[str]:
+    """Best-effort SHA-256 of an existing regular file for error reporting."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        if path.stat().st_size > _EXISTING_FILE_HASH_MAX_BYTES:
+            return None
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception:
+        return None
+
+
+def _fail_file_already_exists(path: Path) -> None:
+    exc = SafeEditError(f"file already exists: {path}")
+    setattr(exc, "_file_already_exists", True)
+    existing = _existing_regular_file_sha256(path)
+    if existing is not None:
+        setattr(exc, "_actual_sha256", existing)
+    raise exc
+
+
 def classify_error_type(message: str) -> str:
     """Classify a SafeEditError message into a structured error type.
     
@@ -126,6 +179,7 @@ def classify_error_type(message: str) -> str:
     - "match_not_found": old text / regex pattern not found in file
     - "match_ambiguous": multiple matches when one expected
     - "match_count_mismatch": expected_count doesn't match actual
+    - "hash_mismatch": expectedSha256 no longer matches the target
     - "encoding_error": encoding/decoding failure
     - "file_error": file I/O or path issue
     - "validation_error": invalid arguments or constraint violation
@@ -135,6 +189,9 @@ def classify_error_type(message: str) -> str:
     """
     msg = message.lower()
     # Order matters: more specific checks first to avoid misclassification
+    if ("sha-256 mismatch" in msg or "changed after" in msg
+            or "changed while" in msg):
+        return "hash_mismatch"
     if "was not found" in msg or ("not found" in msg and "refusing" in msg):
         return "match_not_found"
     if "anchor pattern" in msg and "not found" in msg:
@@ -453,6 +510,13 @@ def build_error_payload(
     - lockAgeSeconds: age of the lock in seconds (may be absent)
     - failureClass: RETRYABLE
     - recommendedAction: {"type": "retry_after_lock_clears", "confidence": float}
+
+    For hash_mismatch errors, provides expectedSha256 plus, when known,
+    actualSha256 and a retry strategy for non-deleting operations. Deletion
+    mismatches require re-reading the changed file before retrying.
+
+    For create-on-existing-file errors, provides actualSha256 of a safe regular
+    file when available, but requires inspecting the collision before editing.
     """
     error_type = classify_error_type(str(exc))
     diagnostic_operation = getattr(exc, "_diagnostic_operation", None)
@@ -542,6 +606,73 @@ def build_error_payload(
         if lock_age is not None:
             error_obj["lockAgeSeconds"] = lock_age
         error_obj["recommendedAction"] = {"type": "retry_after_lock_clears", "confidence": 0.8}
+
+    # Structured recovery info for stale-hash errors
+    if error_type == "hash_mismatch":
+        is_remove = command == "remove-file"
+        error_obj["failureClass"] = (
+            "RE_READ_REQUIRED" if is_remove else "RETRYABLE"
+        )
+        expected_sha256 = getattr(exc, "_expected_sha256", None)
+        actual_sha256 = getattr(exc, "_actual_sha256", None)
+        if isinstance(expected_sha256, str) and expected_sha256:
+            error_obj["expectedSha256"] = expected_sha256
+        if isinstance(actual_sha256, str) and actual_sha256:
+            error_obj["rootCause"] = "stale_expected_sha256"
+            error_obj["failureReason"] = "stale_expected_sha256"
+            error_obj["error"]["reason"] = "stale_expected_sha256"
+            error_obj["actualSha256"] = actual_sha256
+            if is_remove:
+                error_obj["recommendedAction"] = {
+                    "type": "re_read_file",
+                    "confidence": 0.95,
+                }
+            else:
+                error_obj["recommendedAction"] = {
+                    "type": "retry_with_actual_sha256",
+                    "confidence": 0.9,
+                }
+                error_obj["retryStrategy"] = {
+                    "expectedSha256": actual_sha256
+                }
+        else:
+            error_obj["rootCause"] = "target_changed_during_operation"
+            error_obj["failureReason"] = "target_changed_during_operation"
+            error_obj["error"]["reason"] = "target_changed_during_operation"
+            error_obj["recommendedAction"] = {
+                "type": "re_read_file" if is_remove else "re_stat_and_retry",
+                "confidence": 0.9 if is_remove else 0.8,
+            }
+
+    # Structured recovery info when create finds an existing file. A create
+    # collision must never be converted automatically into authority to edit.
+    if error_type == "file_error" and getattr(exc, "_file_already_exists", False):
+        error_obj["rootCause"] = "target_already_exists"
+        error_obj["failureReason"] = "target_already_exists"
+        error_obj["error"]["reason"] = "target_already_exists"
+        error_obj["failureClass"] = "RE_READ_REQUIRED"
+        existing_sha256 = getattr(exc, "_actual_sha256", None)
+        if isinstance(existing_sha256, str) and existing_sha256:
+            error_obj["actualSha256"] = existing_sha256
+            error_obj["recommendedAction"] = {
+                "type": "re_read_file",
+                "confidence": 0.95,
+            }
+        else:
+            error_obj["recommendedAction"] = {
+                "type": "inspect_existing_path",
+                "confidence": 0.9,
+            }
+
+    # Hint when an edit or stat target does not exist
+    if error_type == "file_error" and getattr(exc, "_file_not_found", False):
+        error_obj["rootCause"] = "target_not_found"
+        error_obj["failureReason"] = "target_not_found"
+        error_obj["error"]["reason"] = "target_not_found"
+        error_obj["recommendedAction"] = {
+            "type": "create_file_if_intended",
+            "confidence": 0.6,
+        }
 
     error_obj.setdefault("failureReason", error_type)
     error_obj["error"].setdefault("reason", error_obj["failureReason"])
@@ -3634,7 +3765,9 @@ def fsync_directory(directory: Path) -> None:
 def resolve_target_path(path_value: str, follow_symlink: bool) -> Path:
     path = Path(path_value)
     if not path.exists():
-        fail(f"file not found: {path}")
+        exc = SafeEditError(f"file not found: {path}")
+        setattr(exc, "_file_not_found", True)
+        raise exc
     if path.is_symlink() and not follow_symlink:
         fail("refusing to edit a symlink without --follow-symlink")
     if follow_symlink:
@@ -3949,7 +4082,7 @@ def resolve_create_path(path_value: str) -> Path:
     """Validate a new-file target without creating parent directories."""
     path = Path(path_value)
     if os.path.lexists(path):
-        fail(f"file already exists: {path}")
+        _fail_file_already_exists(path)
     parent = path.parent
     if not parent.exists():
         fail(f"parent directory not found: {parent}")
@@ -3967,7 +4100,7 @@ def exclusive_create(path: Path, data: bytes) -> None:
             fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
             created = True
         except FileExistsError:
-            fail(f"file already exists: {path}")
+            _fail_file_already_exists(path)
         with os.fdopen(fd, "wb") as handle:
             fd = -1
             handle.write(data)
@@ -4454,19 +4587,28 @@ def run_transaction_payload(
 
     identities: Set[str] = set()
     lock_paths: List[Path] = []
-    for child in children:
-        if child.command == "create":
-            target = resolve_create_path(child.file).resolve(strict=False)
-        else:
-            target = resolve_target_path(
-                child.file, child.follow_symlink
-            ).resolve(strict=False)
-        identity = os.path.normcase(os.path.abspath(str(target)))
-        if identity in identities:
-            fail(f"transaction contains duplicate canonical target: {child.file}")
-        identities.add(identity)
-        child.file = str(target)
-        lock_paths.append(target)
+    for file_index, child in enumerate(children, start=1):
+        try:
+            if child.command == "create":
+                target = resolve_create_path(child.file).resolve(strict=False)
+            else:
+                target = resolve_target_path(
+                    child.file, child.follow_symlink
+                ).resolve(strict=False)
+            identity = os.path.normcase(os.path.abspath(str(target)))
+            if identity in identities:
+                fail(
+                    "transaction contains duplicate canonical target: "
+                    f"{child.file}"
+                )
+            identities.add(identity)
+            child.file = str(target)
+            lock_paths.append(target)
+        except SafeEditError as exc:
+            setattr(exc, "_diagnostic_file_index", file_index)
+            setattr(exc, "_diagnostic_file", child.file)
+            setattr(exc, "_diagnostic_command", "transaction")
+            raise
 
     previews: List[Dict[str, Any]] = []
     plans: List[Dict[str, Any]] = []
@@ -4509,7 +4651,9 @@ def run_transaction_payload(
     )
     with lock_context:
         try:
-            for child, plan in zip(children, plans):
+            for file_index, (child, plan) in enumerate(
+                zip(children, plans), start=1
+            ):
                 path = plan["path"]
                 output = plan["output"]
                 output_sha256 = hashlib.sha256(output).hexdigest()
@@ -4529,7 +4673,11 @@ def run_transaction_payload(
                     current = read_target(path, args.max_bytes)
                     current_sha256 = hashlib.sha256(current).hexdigest()
                     if current_sha256 != plan["originalSha256"]:
-                        fail(f"target changed after transaction prevalidation: {path}")
+                        _fail_sha256_mismatch(
+                            f"target changed after transaction prevalidation: {path}",
+                            plan["originalSha256"],
+                            current_sha256,
+                        )
                     if output == current and not child.force_write:
                         result["skipped"] = True
                     else:
@@ -4546,6 +4694,11 @@ def run_transaction_payload(
                 result["sha256"] = output_sha256
                 results.append(result)
         except Exception as exc:
+            if isinstance(exc, SafeEditError):
+                if not hasattr(exc, "_diagnostic_file_index"):
+                    setattr(exc, "_diagnostic_file_index", file_index)
+                if not hasattr(exc, "_diagnostic_file"):
+                    setattr(exc, "_diagnostic_file", child.file)
             rollback_errors: List[str] = []
             for plan in reversed(attempted):
                 path = plan["path"]
@@ -4563,12 +4716,15 @@ def run_transaction_payload(
                 except Exception as rollback_exc:
                     rollback_errors.append(f"{path}: {rollback_exc}")
             if rollback_errors:
-                fail(
+                _fail_preserving_diagnostics(
                     f"transaction failed ({exc}); rollback also failed: "
-                    + "; ".join(rollback_errors)
+                    + "; ".join(rollback_errors),
+                    exc,
                 )
             if isinstance(exc, SafeEditError):
-                fail(f"transaction rolled back: {exc}")
+                _fail_preserving_diagnostics(
+                    f"transaction rolled back: {exc}", exc
+                )
             fail(f"transaction rolled back after unexpected error: {exc}")
 
     return {
@@ -4794,9 +4950,11 @@ def run_remove_file(args: argparse.Namespace) -> Dict[str, Any]:
             fail("file changed while remove-file was verifying it")
         actual = hashlib.sha256(original).hexdigest()
         if actual != expected:
-            fail(
+            _fail_sha256_mismatch(
                 "SHA-256 mismatch: "
-                f"expected {expected}, actual {actual}; run stat again before removing"
+                f"expected {expected}, actual {actual}; run stat again before removing",
+                expected,
+                actual,
             )
 
         summary: Dict[str, Any] = {
@@ -4988,9 +5146,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 fail("--expected-sha256 must contain exactly 64 hexadecimal characters")
             actual = hashlib.sha256(original).hexdigest()
             if actual != expected:
-                fail(
+                _fail_sha256_mismatch(
                     "SHA-256 mismatch: "
-                    f"expected {expected}, actual {actual}; run stat again"
+                    f"expected {expected}, actual {actual}; run stat again",
+                    expected,
+                    actual,
                 )
         encoding, text = detect_and_decode(original, args.encoding)
         return inspect_target(path, original, encoding, text)
@@ -5002,9 +5162,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 fail("--expected-sha256 must contain exactly 64 hexadecimal characters")
             actual = hashlib.sha256(original).hexdigest()
             if actual != expected:
-                fail(
+                _fail_sha256_mismatch(
                     "SHA-256 mismatch: "
-                    f"expected {expected}, actual {actual}; run stat again"
+                    f"expected {expected}, actual {actual}; run stat again",
+                    expected,
+                    actual,
                 )
         encoding, text = detect_and_decode(original, args.encoding)
         capability = _cached_fs_capability(args, str(path))
@@ -5042,9 +5204,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 fail("--expected-sha256 must contain exactly 64 hexadecimal characters")
             actual = hashlib.sha256(original).hexdigest()
             if actual != expected:
-                fail(
+                _fail_sha256_mismatch(
                     "SHA-256 mismatch: "
-                    f"expected {expected}, actual {actual}; run stat again"
+                    f"expected {expected}, actual {actual}; run stat again",
+                    expected,
+                    actual,
                 )
         encoding, text = detect_and_decode(original, args.encoding)
         if "\x00" in text and not args.allow_nul:

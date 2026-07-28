@@ -180,6 +180,15 @@ uncertain. Do not re-run it after a confirmed successful write, when the shell/t
 rejects the command before process start, or when argument parsing fails before
 target access.
 
+For `stat`, `inspect`, `edit`, and `transaction`, a `hash_mismatch` error
+already carries the current hash: use its `actualSha256` (equivalently
+`retryStrategy.expectedSha256`) as the next `expectedSha256` instead of
+re-running stat, and re-validate the edit context because the file changed.
+Never apply this shortcut to `remove-file`: re-read and reconfirm the changed
+file before deletion. A `create` failure on an existing file may return the
+existing file's `actualSha256`, but it must not be converted automatically into
+an edit; inspect the existing file first.
+
 The selected editStrategy is locked for the lifetime of the file. Do NOT switch to another edit mechanism after a command failure. Continue using the cached editStrategy.
 
 - `editStrategy: "safe-edit"` → Use `safe_edit_transaction` when callable; otherwise ALL edits on this file MUST use `safe_edit.py`. Do not switch back to built-in Edit.

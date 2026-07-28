@@ -235,6 +235,55 @@ class SafeEditMcpTests(unittest.TestCase):
         self.assertEqual(payload["failureReason"], "content_not_found")
         self.assertEqual(target.read_bytes(), b"alpha\n")
 
+    def test_hash_mismatch_returns_retryable_actual_sha256(self):
+        target = self.root / "stale-hash.txt"
+        target.write_bytes(b"alpha\n")
+
+        response = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "safe_edit_transaction",
+                    "arguments": {
+                        "files": [
+                            {
+                                "file": str(target),
+                                "expectedSha256": "0" * 64,
+                                "operations": [
+                                    {
+                                        "op": "edit",
+                                        "old": "alpha",
+                                        "new": "beta",
+                                        "expected_count": 1,
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+        payload = response["result"]["structuredContent"]
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(payload["error"]["type"], "hash_mismatch")
+        self.assertEqual(payload["failureClass"], "RETRYABLE")
+        self.assertEqual(payload["expectedSha256"], "0" * 64)
+        self.assertEqual(
+            payload["actualSha256"], hashlib.sha256(b"alpha\n").hexdigest()
+        )
+        self.assertEqual(
+            payload["recommendedAction"]["type"], "retry_with_actual_sha256"
+        )
+        self.assertEqual(
+            payload["retryStrategy"]["expectedSha256"],
+            payload["actualSha256"],
+        )
+        self.assertEqual(payload["failedFile"]["index"], 1)
+        self.assertEqual(target.read_bytes(), b"alpha\n")
+
     def test_identical_edit_is_explicitly_skipped(self):
         target = self.root / "no-op.txt"
         target.write_bytes(b"same\n")
