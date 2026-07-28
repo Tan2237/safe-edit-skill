@@ -7,8 +7,8 @@ import argparse
 import base64
 import binascii
 import codecs
-
 from bisect import bisect_right
+from collections import Counter
 import difflib
 import errno
 import functools
@@ -87,7 +87,7 @@ def _read_lock_pid(lock_path: Path) -> Optional[int]:
 # Matches CRLF, CR, or LF - order matters: CRLF must be first to avoid partial matches
 _LINE_ENDING_RE = re.compile(r'(\r\n|\r|\n)')
 _WHITESPACE_RE = re.compile(r"\s+")
-_TRAILING_WHITESPACE_RE = re.compile(r"[ \t]+(?=\r\n|\r|\n|\Z)")
+_TRAILING_WHITESPACE_RE = re.compile(r"(?<![ \t])[ \t]+(?=\r\n|\r|\n|\Z)")
 _NON_CRLF_LINE_SEPARATOR_RE = re.compile(r"[\v\f\x1c-\x1e\x85\u2028\u2029]")
 
 
@@ -369,10 +369,8 @@ def analyze_match_failure(
 
     line_num, fragment = closest
 
-    # Calculate similarity at character level (not line level)
-    # This gives more accurate similarity for content with minor differences
-    matcher = difflib.SequenceMatcher(None, old, fragment)
-    similarity = matcher.ratio()
+    # Diagnose at character level after fuzzy boundary normalization.
+    similarity = _fuzzy_diagnostic_similarity(old, fragment)
 
     # Build closestMatch info
     result["closestMatch"] = {
@@ -483,105 +481,231 @@ def visualize_whitespace(text: str) -> str:
     )
 
 
+def _normalize_fuzzy_lines(value: str) -> List[str]:
+    """Normalize fuzzy input without changing meaningful inner whitespace."""
+    return [line.strip() for line in value.splitlines()]
+
+
+def _fuzzy_similarity(pattern: str, fragment: str) -> float:
+    """Compare fuzzy fragments after per-line boundary normalization."""
+    pattern_lines = _normalize_fuzzy_lines(pattern)
+    fragment_lines = _normalize_fuzzy_lines(fragment)
+    if not pattern_lines or not fragment_lines:
+        return 0.0
+    if len(pattern_lines) == 1 and len(fragment_lines) == 1:
+        return difflib.SequenceMatcher(
+            None, pattern_lines[0], fragment_lines[0]
+        ).ratio()
+    return difflib.SequenceMatcher(
+        None, tuple(pattern_lines), tuple(fragment_lines)
+    ).ratio()
+
+
+def _fuzzy_diagnostic_similarity(pattern: str, fragment: str) -> float:
+    """Return character similarity after fuzzy boundary normalization."""
+    normalized_pattern = "\n".join(_normalize_fuzzy_lines(pattern))
+    normalized_fragment = "\n".join(_normalize_fuzzy_lines(fragment))
+    if not normalized_pattern or not normalized_fragment:
+        return 0.0
+    return difflib.SequenceMatcher(
+        None, normalized_pattern, normalized_fragment
+    ).ratio()
+
+
+def _raw_line_fragment(
+    records: List[str],
+    lines: List[str],
+    start: int,
+    count: int,
+) -> str:
+    """Return a line window with original EOLs but no final separator."""
+    if count == 1:
+        return lines[start]
+    return "".join(records[start:start + count - 1]) + lines[start + count - 1]
+
+
+def _line_fragment_span(
+    text: str,
+    line_number: int,
+    fragment: str,
+) -> Optional[Tuple[int, int]]:
+    """Map a raw line fragment back to its exact source span."""
+    records = text.splitlines(keepends=True)
+    if line_number < 1 or line_number > len(records):
+        return None
+    start = sum(len(record) for record in records[:line_number - 1])
+    if text[start:start + len(fragment)] != fragment:
+        return None
+    return start, len(fragment)
+
+
+def _candidate_start_intervals(
+    text_lines: List[str],
+    pattern_line_set: Set[str],
+    pattern_len: int,
+    max_start: int,
+) -> Iterable[Tuple[int, int]]:
+    """Yield merged ranges of windows sharing a line with the pattern."""
+    current_start: Optional[int] = None
+    current_end = -1
+    for text_index, line in enumerate(text_lines):
+        if line not in pattern_line_set:
+            continue
+        first_start = text_index - pattern_len + 1
+        if first_start < 0:
+            first_start = 0
+        last_start = text_index
+        if last_start > max_start:
+            last_start = max_start
+        if first_start > last_start:
+            continue
+        if current_start is None:
+            current_start = first_start
+            current_end = last_start
+        elif first_start <= current_end + 1:
+            current_end = max(current_end, last_start)
+        else:
+            yield current_start, current_end
+            current_start = first_start
+            current_end = last_start
+    if current_start is not None:
+        yield current_start, current_end
+
+
 def find_closest_match(text: str, pattern: str, max_lines: int = 10) -> Optional[Tuple[int, str]]:
-    """Find the closest matching fragment in text for a pattern.
-    
-    Returns (line_number, fragment) or None if no reasonable match found.
-    Uses difflib to find the most similar substring.
+    """Find the closest line-aligned fragment in text for a pattern.
+
+    Fuzzy comparison ignores leading and trailing whitespace on every line,
+    line-ending style, and the presence of a final line ending. Returned
+    fragments retain the original text so callers can replace them safely.
     """
     if not pattern or not text:
         return None
-    
-    # Split pattern into lines for comparison
-    pattern_lines = pattern.splitlines()
-    if not pattern_lines:
+
+    pattern_raw_lines = pattern.splitlines()
+    if not pattern_raw_lines:
         return None
-    
-    text_lines = text.splitlines()
+
+    text_records = text.splitlines(keepends=True)
+    text_raw_lines = text.splitlines()
+    pattern_lines = [line.strip() for line in pattern_raw_lines]
+    text_lines = [line.strip() for line in text_raw_lines]
     pattern_len = len(pattern_lines)
-    
-    # For single-line patterns, do character-level comparison with each line
+
     if pattern_len == 1:
+        pattern_line = pattern_lines[0]
         best_score = 0.0
         best_line = 0
         best_fragment = ""
         score_cache: Dict[str, float] = {}
-        
-        for i, line in enumerate(text_lines):
-            # Check if pattern is substring of line
-            if pattern in line:
-                return (i + 1, line)
-            
-            # Check if line is substring of pattern
-            if line in pattern:
-                score = len(line) / len(pattern)
-                if score > best_score:
-                    best_score = score
-                    best_line = i
-                    best_fragment = line
-                continue
-            
-            # Repeated generated/config lines are common in large files.
-            # Cache their score so diagnostics do not rerun SequenceMatcher.
-            score = score_cache.get(line)
-            if score is None:
-                matcher = difflib.SequenceMatcher(None, pattern, line)
-                score = matcher.ratio()
-                if len(score_cache) < 4096:
-                    score_cache[line] = score
+        matcher = difflib.SequenceMatcher(None, pattern_line, "")
+
+        for index, (raw_line, line) in enumerate(zip(text_raw_lines, text_lines)):
+            if line == pattern_line or (pattern_line and pattern_line in line):
+                return (index + 1, raw_line)
+
+            if line and line in pattern_line:
+                score = len(line) / len(pattern_line) if pattern_line else 0.0
+            else:
+                score = score_cache.get(line, -1.0)
+                if score < 0.0:
+                    matcher.set_seq2(line)
+                    if (
+                        matcher.real_quick_ratio() <= best_score
+                        or matcher.quick_ratio() <= best_score
+                    ):
+                        score = 0.0
+                    else:
+                        score = matcher.ratio()
+                    if len(score_cache) < 4096:
+                        score_cache[line] = score
+
             if score > best_score:
                 best_score = score
-                best_line = i
-                best_fragment = line
-        
-        # Lower threshold for single-line patterns (30% instead of 50%)
+                best_line = index
+                best_fragment = raw_line
+
         if best_score >= 0.3:
             return (best_line + 1, best_fragment)
-        
         return None
-    
-    # A line-level SequenceMatcher can only score above zero when a
-    # candidate window shares at least one exact line with the pattern.
+
     max_start = len(text_lines) - pattern_len
     if max_start < 0:
         return None
 
-    pattern_line_set = set(pattern_lines)
-    candidate_starts = set()
-    for text_index, line in enumerate(text_lines):
-        if line not in pattern_line_set:
-            continue
-        first_start = max(0, text_index - pattern_len + 1)
-        last_start = min(text_index, max_start)
-        candidate_starts.update(range(first_start, last_start + 1))
-
-    best_score = 0.0
-    best_start = 0
     pattern_tuple = tuple(pattern_lines)
-    score_cache: Dict[Tuple[str, ...], float] = {}
+    pattern_counts = Counter(pattern_tuple)
+    best_matches = 0
+    best_start = 0
+    score_cache: Dict[Tuple[str, ...], int] = {}
 
-    for start in sorted(candidate_starts):
-        fragment = tuple(text_lines[start:start + pattern_len])
-        if fragment == pattern_tuple:
-            return (start + 1, "\n".join(fragment))
+    for interval_start, interval_end in _candidate_start_intervals(
+        text_lines, set(pattern_tuple), pattern_len, max_start
+    ):
+        window_counts = Counter(
+            text_lines[interval_start:interval_start + pattern_len]
+        )
+        overlap = sum(
+            min(count, pattern_counts.get(line, 0))
+            for line, count in window_counts.items()
+        )
 
-        score = score_cache.get(fragment)
-        if score is None:
-            score = difflib.SequenceMatcher(None, pattern_tuple, fragment).ratio()
-            if len(score_cache) < 4096:
-                score_cache[fragment] = score
-        if score > best_score:
-            best_score = score
-            best_start = start
+        for start in range(interval_start, interval_end + 1):
+            if overlap > best_matches:
+                fragment = tuple(text_lines[start:start + pattern_len])
+                if fragment == pattern_tuple:
+                    return (
+                        start + 1,
+                        _raw_line_fragment(
+                            text_records, text_raw_lines, start, pattern_len
+                        ),
+                    )
 
-    # Only return if we found something reasonably close (>= 50% similar)
-    if best_score >= 0.5:
-        fragment_lines = text_lines[best_start:best_start + pattern_len]
-        fragment_text = "\n".join(fragment_lines)
-        return (best_start + 1, fragment_text)  # 1-based line number
+                matched = score_cache.get(fragment)
+                if matched is None:
+                    line_matcher = difflib.SequenceMatcher(
+                        None, pattern_tuple, fragment
+                    )
+                    matched = sum(
+                        block.size for block in line_matcher.get_matching_blocks()
+                    )
+                    if len(score_cache) < 4096:
+                        score_cache[fragment] = matched
+                if matched > best_matches:
+                    best_matches = matched
+                    best_start = start
 
+            if start == interval_end:
+                continue
+
+            outgoing = text_lines[start]
+            incoming = text_lines[start + pattern_len]
+            if outgoing == incoming:
+                continue
+
+            outgoing_count = window_counts[outgoing]
+            outgoing_cap = pattern_counts.get(outgoing, 0)
+            if outgoing_cap and outgoing_count <= outgoing_cap:
+                overlap -= 1
+            if outgoing_count == 1:
+                del window_counts[outgoing]
+            else:
+                window_counts[outgoing] = outgoing_count - 1
+
+            incoming_count = window_counts.get(incoming, 0)
+            incoming_cap = pattern_counts.get(incoming, 0)
+            if incoming_cap and incoming_count < incoming_cap:
+                overlap += 1
+            window_counts[incoming] = incoming_count + 1
+
+    if best_matches * 2 >= pattern_len:
+        return (
+            best_start + 1,
+            _raw_line_fragment(
+                text_records, text_raw_lines, best_start, pattern_len
+            ),
+        )
     return None
-
 
 def extract_nearby_content(
     text: str,
@@ -604,15 +728,9 @@ def extract_nearby_content(
     line_num, fragment = result
     text_lines = text.splitlines()
     
-    # Calculate similarity score
+    # Report character similarity after fuzzy boundary normalization.
     pattern_lines = pattern.splitlines()
-    if len(pattern_lines) == 1:
-        matcher = difflib.SequenceMatcher(None, pattern, fragment)
-        similarity = matcher.ratio()
-    else:
-        fragment_lines = fragment.splitlines()
-        matcher = difflib.SequenceMatcher(None, pattern_lines, fragment_lines)
-        similarity = matcher.ratio()
+    similarity = _fuzzy_diagnostic_similarity(pattern, fragment)
     
     # Extract context around the match
     start = max(0, line_num - 1 - context_lines)
@@ -1109,6 +1227,14 @@ def convert_line_endings(text: str, style: str) -> str:
 
 
 def trim_trailing_whitespace(text: str) -> str:
+    if (
+        not text.endswith((" ", "\t"))
+        and " \n" not in text
+        and "\t\n" not in text
+        and " \r" not in text
+        and "\t\r" not in text
+    ):
+        return text
     return _TRAILING_WHITESPACE_RE.sub("", text)
 
 
@@ -1168,12 +1294,17 @@ def _compile_whitespace_literal(pattern: str) -> re.Pattern[str]:
     return re.compile("".join(pieces))
 
 
-def _find_whitespace_spans(text: str, pattern: str) -> List[Tuple[int, int]]:
+def _iter_whitespace_spans(
+    text: str,
+    pattern: str,
+) -> Iterable[Tuple[int, int]]:
     matcher = _compile_whitespace_literal(pattern)
-    return [
-        (match.start(), match.end() - match.start())
-        for match in matcher.finditer(text)
-    ]
+    for match in matcher.finditer(text):
+        yield match.start(), match.end() - match.start()
+
+
+def _find_whitespace_spans(text: str, pattern: str) -> List[Tuple[int, int]]:
+    return list(_iter_whitespace_spans(text, pattern))
 
 
 def normalize_for_match(text: str, ignore_indent: bool = False, ignore_eol: bool = False, normalize_whitespace: bool = False) -> str:
@@ -1463,20 +1594,27 @@ def apply_literal_edit_cascade(
         result = find_closest_match(text, old)
         if result is not None:
             line_num, fragment = result
-            pattern_lines = old.splitlines()
-            if len(pattern_lines) == 1:
-                matcher = difflib.SequenceMatcher(None, old, fragment)
-                similarity = matcher.ratio()
-            else:
-                fragment_lines = fragment.splitlines()
-                matcher = difflib.SequenceMatcher(None, pattern_lines, fragment_lines)
-                similarity = matcher.ratio()
-            
-            if similarity >= 0.6:
-                # Fuzzy match found — replace the closest match
+            similarity = _fuzzy_similarity(old, fragment)
+            span = _line_fragment_span(text, line_num, fragment)
+
+            if similarity >= 0.6 and span is not None:
                 new = normalize_user_newlines(str(operation["new"]), newline)
-                new_text = text.replace(fragment, new, 1)
-                return (new_text, 1, "fuzzy")
+                return _apply_edit_with_context(
+                    text,
+                    old,
+                    new,
+                    text,
+                    old,
+                    operation,
+                    "fuzzy",
+                    explain,
+                    True,
+                    True,
+                    False,
+                    context_before or "",
+                    context_after or "",
+                    positions_override=[span],
+                )
     
     # Nothing worked — raise the original error (with explanation if requested)
     if last_error is not None:
@@ -1748,49 +1886,56 @@ def _apply_edit_with_context(
     context_after: str,
     line_index: Optional[Any] = None,
     position_mapper: Optional[Any] = None,
-    positions_override: Optional[List[Tuple[int, int]]] = None,
+    positions_override: Optional[Iterable[Tuple[int, int]]] = None,
 ) -> Tuple[str, int, str]:
-    if positions_override is not None:
-        positions = positions_override
-    elif ignore_indent or ignore_eol or normalize_whitespace:
-        positions = []
-        search_start = 0
-        search_start_orig = 0
-        while True:
-            norm_pos = normalized_text.find(normalized_old, search_start)
-            if norm_pos < 0:
-                break
-            original_pos, original_len = find_original_position(
-                text,
-                normalized_text,
-                norm_pos,
-                normalized_old,
-                old,
-                ignore_indent,
-                ignore_eol,
-                normalize_whitespace,
-                start_search_pos=search_start_orig,
-                line_index=line_index,
-                position_mapper=position_mapper,
-            )
-            if original_pos >= 0:
-                positions.append((original_pos, original_len))
-                search_start_orig = original_pos + original_len
-            search_start = norm_pos + len(normalized_old)
-    else:
-        positions = []
+    def iter_positions() -> Iterable[Tuple[int, int]]:
+        if positions_override is not None:
+            yield from positions_override
+            return
+
+        if ignore_indent or ignore_eol or normalize_whitespace:
+            search_start = 0
+            search_start_orig = 0
+            while True:
+                norm_pos = normalized_text.find(normalized_old, search_start)
+                if norm_pos < 0:
+                    return
+                original_pos, original_len = find_original_position(
+                    text,
+                    normalized_text,
+                    norm_pos,
+                    normalized_old,
+                    old,
+                    ignore_indent,
+                    ignore_eol,
+                    normalize_whitespace,
+                    start_search_pos=search_start_orig,
+                    line_index=line_index,
+                    position_mapper=position_mapper,
+                )
+                search_start = norm_pos + len(normalized_old)
+                if original_pos >= 0:
+                    search_start_orig = original_pos + original_len
+                    yield original_pos, original_len
+            return
+
         start = 0
         while True:
             pos = text.find(old, start)
             if pos < 0:
-                break
-            positions.append((pos, len(old)))
+                return
             start = pos + len(old)
+            yield pos, len(old)
 
     old_line_count = max(1, old.count("\n") + 1)
     context_line_count = max(old_line_count, 2)
+    expected = operation.get("expected_count")
+    first_only = bool(operation.get("first", False))
+    first_span: Optional[Tuple[int, int]] = None
     filtered: List[Tuple[int, int]] = []
-    for pos, length in positions:
+    filtered_count = 0
+
+    for pos, length in iter_positions():
         if context_before:
             window = _context_before_window(text, pos, context_line_count)
             if context_before not in window:
@@ -1803,20 +1948,37 @@ def _apply_edit_with_context(
             )
             if context_after not in window:
                 continue
-        filtered.append((pos, length))
 
-    expected = operation.get("expected_count")
-    if not filtered and not bool(operation.get("no_op_ok", False)):
+        filtered_count += 1
+        if first_span is None:
+            first_span = (pos, length)
+        if first_only and expected is None:
+            return (
+                _replace_spans(text, [(pos, length)], new, ignore_indent),
+                1,
+                effective_strategy,
+            )
+        if not first_only:
+            filtered.append((pos, length))
+
+    if filtered_count == 0 and not bool(operation.get("no_op_ok", False)):
         if explain:
             explanation = explain_match_failure(old, text)
             fail(f"old text was not found (after context filtering); refusing a silent no-op\n\n{explanation}")
         fail("old text was not found (after context filtering); refusing a silent no-op")
-    if not filtered:
+    if filtered_count == 0:
         return (text, 0, effective_strategy)
-    if expected is not None and len(filtered) != int(expected):
-        fail(f"expected {expected} occurrence(s) after context filtering, found {len(filtered)}")
+    if expected is not None and filtered_count != int(expected):
+        fail(
+            f"expected {expected} occurrence(s) after context filtering, "
+            f"found {filtered_count}"
+        )
 
-    matches = filtered[:1] if bool(operation.get("first", False)) else filtered
+    if first_only:
+        assert first_span is not None
+        matches = [first_span]
+    else:
+        matches = filtered
     return (
         _replace_spans(text, matches, new, ignore_indent),
         len(matches),
@@ -1841,7 +2003,6 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
         normalize_whitespace,
     )
     if normalize_whitespace:
-        spans = _find_whitespace_spans(text, old)
         if context_before or context_after:
             return _apply_edit_with_context(
                 text,
@@ -1857,8 +2018,9 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
                 normalize_whitespace,
                 context_before or "",
                 context_after or "",
-                positions_override=spans,
+                positions_override=_iter_whitespace_spans(text, old),
             )
+        spans = _find_whitespace_spans(text, old)
         actual = len(spans)
         expected = operation.get("expected_count")
         if actual == 0 and not bool(operation.get("no_op_ok", False)):
@@ -2469,20 +2631,32 @@ def apply_insert(text: str, operation: Dict[str, Any], newline: str) -> Tuple[st
     return (join_records(records), changed, "line-based")
 
 
+def _render_line_block(
+    value: str,
+    newline: str,
+    final_separator: str,
+) -> Tuple[str, int]:
+    records = block_records(value, newline, final_separator)
+    return join_records(records), len(records)
+
+
 def apply_prepend(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int, str]:
-    records = split_records(text)
-    changed = _apply_line_operation_to_records(
-        records, "prepend", operation, newline
+    text_value = str(operation["text"])
+    final_separator = (
+        newline
+        if text
+        else (newline if text_value.endswith(("\n", "\r")) else "")
     )
-    return (join_records(records), changed, "line-based")
+    block, changed = _render_line_block(text_value, newline, final_separator)
+    return (block + text, changed, "line-based")
 
 
 def apply_append(text: str, operation: Dict[str, Any], newline: str) -> Tuple[str, int, str]:
-    records = split_records(text)
-    changed = _apply_line_operation_to_records(
-        records, "append", operation, newline
-    )
-    return (join_records(records), changed, "line-based")
+    text_value = str(operation["text"])
+    final_separator = newline if text_value.endswith(("\n", "\r")) else ""
+    block, changed = _render_line_block(text_value, newline, final_separator)
+    separator = newline if text and not text.endswith(("\n", "\r")) else ""
+    return (text + separator + block, changed, "line-based")
 
 
 def apply_delete_line(text: str, operation: Dict[str, Any]) -> Tuple[str, int, str]:
@@ -2598,6 +2772,10 @@ def apply_operations(
         can_buffer = (
             op_name in _LINE_BUFFER_OPERATIONS
             and not operation.get("anchor_pattern")
+            and not (
+                op_name in {"prepend", "append"}
+                and str(operation.get("text", "")) != ""
+            )
         )
         if can_buffer:
             changed = _apply_line_operation_to_records(

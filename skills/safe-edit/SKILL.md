@@ -397,7 +397,7 @@ Most failures are whitespace differences. Use `--explain-match-failure` before a
 | Option | Effect | When to use |
 |--------|--------|-------------|
 | `--auto-match` | Auto-try: exact → ignore-eol → ignore-indent → normalize-whitespace | **Default for multiline** |
-| `--fuzzy` | Fuzzy matching (≥0.6 similarity) | AI-generated approximate text |
+| `--fuzzy` | Fuzzy matching (≥0.6); ignores per-line boundary whitespace, EOL style, and final EOL | AI-generated approximate text |
 | `--normalize-whitespace` | Collapse whitespace | **JSON/YAML/Markdown** |
 | `--context-before/after` | Disambiguate matches | Multiple occurrences |
 

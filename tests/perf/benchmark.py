@@ -166,6 +166,22 @@ def add_size_cases(
         )
     )
 
+    append_operations = [{"op": "append", "text": "tail"}]
+    append_separator = "" if text.endswith(("\r", "\n")) else "\r\n"
+    expected_append = text + append_separator + "tail"
+    results.append(
+        measure(
+            "core.append",
+            lambda: se.apply_operations(text, append_operations, "\r\n"),
+            validate=lambda value: (
+                None
+                if value[0] == expected_append and value[1][0]["changed"] == 1
+                else (_ for _ in ()).throw(AssertionError(value[1]))
+            ),
+            **common,
+        )
+    )
+
     regex_text = repeat_to_size("value=123456 other=text\n", size)
     regex_matches = regex_text.count("value=123456")
     regex_operation = {
@@ -296,6 +312,22 @@ def add_size_cases(
             **common,
         )
     )
+    repeated_match_lines = repeat_to_size("same\n", size)
+    results.append(
+        measure(
+            "core.closest-match-repeated-window",
+            lambda: se.find_closest_match(
+                repeated_match_lines,
+                "changed\nsame\nsame",
+            ),
+            validate=lambda value: (
+                None
+                if value == (1, "same\nsame\nsame")
+                else (_ for _ in ()).throw(AssertionError(value))
+            ),
+            **common,
+        )
+    )
     results.append(
         measure(
             "core.closest-match-multiline-miss",
@@ -330,6 +362,25 @@ def main() -> int:
         for value in args.sizes_mib.split(",")
     ]
     results: List[Dict[str, Any]] = []
+
+    interior_whitespace_text = (
+        "left" + (" " * 65536) + "right\ntrim me  \n"
+    )
+    results.append(
+        measure(
+            "core.trim-long-interior-whitespace",
+            lambda: se.trim_trailing_whitespace(interior_whitespace_text),
+            input_bytes=len(interior_whitespace_text),
+            iterations=args.iterations,
+            warmups=args.warmups,
+            validate=lambda value: (
+                None
+                if value.endswith("right\ntrim me\n")
+                else (_ for _ in ()).throw(AssertionError(value[-32:]))
+            ),
+            trace_memory=args.trace_memory,
+        )
+    )
 
     context_text = "scope-A\nneedle\n" * args.context_matches
     context_operation = {"old": "needle", "new": "changed", "first": True}

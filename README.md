@@ -272,6 +272,8 @@ python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-matc
 python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --fuzzy --expected-count 1
 ```
 
+模糊比较会忽略每行开头和结尾的空白、CRLF/LF/CR 差异，以及文件末尾是否有换行；行内空白仍然有意义，不会被折叠。
+
 **关键安全约束**：自动容错在输出中报告使用的匹配级别（`matchStrategy` 字段），不会静默降级。
 
 ## 结构化 JSON 输出
@@ -684,7 +686,7 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 | `-i, --interactive` | 交互确认，y/n/a/q/? |
 | `--explain-match-failure` | 匹配失败时显示诊断 |
 | `--auto-match` | 自动容错匹配（exact → ignore-eol → ignore-indent → normalize-whitespace） |
-| `--fuzzy` | 启用模糊匹配（需配合 `--auto-match`，相似度 ≥ 0.6） |
+| `--fuzzy` | 启用模糊匹配（需配合 `--auto-match`，相似度 ≥ 0.6；忽略逐行首尾空白、行尾格式和最终换行） |
 | `--context-before T` | 匹配位置前面必须包含的文本 |
 | `--context-after T` | 匹配位置后面必须包含的文本 |
 | `--diff-input TEXT` | SEARCH/REPLACE 格式输入 |

@@ -3102,6 +3102,62 @@ class SafeEditTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["operations"][0]["matchStrategy"], "fuzzy")
 
+    def test_fuzzy_ignores_line_boundary_whitespace_and_eol(self):
+        path = self.tmpdir / "fuzzy_boundary_whitespace_crlf.txt"
+        path.write_bytes(
+            b"def calculate(price, qty):   \r\n"
+            b"\tvalue = price * qty\t\r\n"
+            b"  return value   \r\n"
+        )
+
+        result = self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "def calculate(cost, qty):\nvalue = price * qty\nreturn value",
+            "--new",
+            "def compute(price, qty):\nvalue = price * qty\nreturn value",
+            "--auto-match",
+            "--fuzzy",
+            "--expected-count",
+            "1",
+            "--json",
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["operations"][0]["matchStrategy"], "fuzzy")
+        self.assertEqual(
+            path.read_bytes(),
+            b"def compute(price, qty):\r\n"
+            b"value = price * qty\r\n"
+            b"return value\r\n",
+        )
+
+    def test_fuzzy_normalization_preserves_original_fragment(self):
+        m = self._import_safe_edit()
+        self.assertEqual(
+            m._normalize_fuzzy_lines("  alpha  \r\n\tbeta\t\r\n"),
+            ["alpha", "beta"],
+        )
+        self.assertEqual(
+            m._normalize_fuzzy_lines("alpha\nbeta"),
+            m._normalize_fuzzy_lines("alpha\r\nbeta\r\n"),
+        )
+        self.assertNotEqual(
+            m._normalize_fuzzy_lines("alpha  beta"),
+            m._normalize_fuzzy_lines("alpha beta"),
+        )
+
+        result = m.find_closest_match(
+            "  alpha  \r\n\tbeta \r\n gamma\t\r\n",
+            "alpha\nbeta\ngamma",
+        )
+        self.assertEqual(
+            result,
+            (1, "  alpha  \r\n\tbeta \r\n gamma\t"),
+        )
+
     # =========================================================================
     # Context disambiguation + expected-count
     # =========================================================================
@@ -3881,6 +3937,49 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
             m.set_final_newline("payload\r\n\r\n\n\r", "strip", "\n"),
             "payload",
         )
+
+    def test_trim_long_internal_whitespace_is_linear(self):
+        m = self._import_safe_edit()
+        text = "left" + (" " * 40000) + "right\ntrim me  \n"
+        started = time.perf_counter()
+        result = m.trim_trailing_whitespace(text)
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(
+            result,
+            "left" + (" " * 40000) + "right\ntrim me\n",
+        )
+        self.assertLess(elapsed, 1.0)
+
+    def test_append_and_prepend_bypass_full_line_split(self):
+        m = self._import_safe_edit()
+        operations = [
+            {"op": "append", "text": "tail"},
+            {"op": "prepend", "text": "head"},
+        ]
+        with patch.object(
+            m,
+            "_split_keepends_records",
+            side_effect=AssertionError("full text should not be split"),
+        ):
+            result, summaries = m.apply_operations("base", operations, "\n")
+
+        self.assertEqual(result, "head\nbase\ntail")
+        self.assertEqual([item["changed"] for item in summaries], [1, 1])
+
+    def test_closest_match_caches_repeated_windows(self):
+        m = self._import_safe_edit()
+        text = "same\n" * 100
+        pattern = "changed\nsame\nsame"
+        with patch.object(
+            m.difflib,
+            "SequenceMatcher",
+            wraps=m.difflib.SequenceMatcher,
+        ) as matcher_mock:
+            result = m.find_closest_match(text, pattern)
+
+        self.assertEqual(result, (1, "same\nsame\nsame"))
+        self.assertEqual(matcher_mock.call_count, 1)
 
     def test_json_match_failure_reuses_loaded_text(self):
         m = self._import_safe_edit()
@@ -5490,6 +5589,29 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
             )
         self.assertEqual(changed, 1)
         self.assertIn("changed", result)
+        self.assertEqual(window_mock.call_count, 1)
+
+    def test_context_first_scans_all_when_expected_count_is_set(self):
+        m = self._import_safe_edit()
+        text = "scope-A\nneedle\n" * 200
+        operation = {
+            "old": "needle",
+            "new": "changed",
+            "first": True,
+            "expected_count": 200,
+        }
+        with patch.object(
+            m, "_context_before_window", wraps=m._context_before_window
+        ) as window_mock:
+            result, changed, _strategy = m.apply_literal_edit(
+                text,
+                operation,
+                "\n",
+                context_before="scope-A",
+            )
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(result.count("changed"), 1)
         self.assertEqual(window_mock.call_count, 200)
 
     def test_normalize_whitespace_context_uses_direct_spans(self):
