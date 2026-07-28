@@ -35,6 +35,9 @@ class SafeEditMcpTests(unittest.TestCase):
             prefix="safe-edit-mcp-test-"
         )
         self.root = Path(self.tempdir.name)
+        server.execute_tool.__globals__[
+            "_PENDING_TRANSACTIONS"
+        ].clear()
 
     def tearDown(self):
         self.tempdir.cleanup()
@@ -94,6 +97,177 @@ class SafeEditMcpTests(unittest.TestCase):
         )
         self.assertEqual(result["transport"], "mcp-structured")
 
+    def test_dry_run_can_be_confirmed_without_resending_payload(self):
+        target = self.root / "confirmable.txt"
+        target.write_bytes(b"before\n")
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        preview = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "dryRun": True,
+                "files": [
+                    {
+                        "file": str(target),
+                        "expectedSha256": expected,
+                        "operations": [
+                            {
+                                "op": "edit",
+                                "old": "before",
+                                "new": "after",
+                                "expected_count": 1,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(target.read_bytes(), b"before\n")
+        self.assertTrue(preview["transactionId"].startswith("tx_"))
+        self.assertEqual(preview["files"][0]["diffMode"], "compact")
+        self.assertIn("-before", preview["files"][0]["diff"])
+        planned_sha = hashlib.sha256(b"after\n").hexdigest()
+        self.assertEqual(
+            preview["files"][0]["resultSha256"], planned_sha
+        )
+
+        applied = server.execute_tool(
+            "safe_edit_transaction",
+            {"transactionId": preview["transactionId"]},
+        )
+        self.assertTrue(applied["confirmed"])
+        self.assertTrue(applied["written"])
+        self.assertEqual(applied["files"][0]["sha256"], planned_sha)
+        self.assertEqual(target.read_bytes(), b"after\n")
+
+        with self.assertRaisesRegex(
+            ToolInputError, "unknown or expired transactionId"
+        ):
+            server.execute_tool(
+                "safe_edit_transaction",
+                {"transactionId": preview["transactionId"]},
+            )
+
+    def test_transaction_auto_matches_detected_crlf(self):
+        target = self.root / "auto-eol.txt"
+        target.write_bytes(b"alpha\r\nbeta\r\n")
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        result = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "files": [
+                    {
+                        "file": str(target),
+                        "expectedSha256": expected,
+                        "operations": [
+                            {
+                                "op": "edit",
+                                "old": "alpha\nbeta",
+                                "new": "ALPHA\nBETA",
+                                "expected_count": 1,
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        operation = result["files"][0]["operations"][0]
+        self.assertEqual(operation["matchStrategy"], "ignore-eol")
+        self.assertTrue(operation["autoEolMatch"])
+        self.assertEqual(target.read_bytes(), b"ALPHA\r\nBETA\r\n")
+
+    def test_transaction_failure_identifies_operation_and_target(self):
+        target = self.root / "diagnostic.txt"
+        target.write_bytes(b"alpha\n")
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        response = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "safe_edit_transaction",
+                    "arguments": {
+                        "dryRun": True,
+                        "files": [
+                            {
+                                "file": str(target),
+                                "expectedSha256": expected,
+                                "operations": [
+                                    {
+                                        "op": "edit",
+                                        "old": "alpha",
+                                        "new": "beta",
+                                        "expected_count": 1,
+                                    },
+                                    {
+                                        "op": "edit",
+                                        "old": "missing target",
+                                        "new": "replacement",
+                                        "expected_count": 1,
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+        payload = response["result"]["structuredContent"]
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(payload["failedFile"]["index"], 1)
+        self.assertEqual(payload["operationIndex"], 2)
+        self.assertEqual(
+            payload["failedOperation"]["targetFragment"],
+            "missing target",
+        )
+        self.assertEqual(payload["failureReason"], "content_not_found")
+        self.assertEqual(target.read_bytes(), b"alpha\n")
+
+    def test_identical_edit_is_explicitly_skipped(self):
+        target = self.root / "no-op.txt"
+        target.write_bytes(b"same\n")
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        result = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "files": [
+                    {
+                        "file": str(target),
+                        "expectedSha256": expected,
+                        "operations": [
+                            {
+                                "op": "edit",
+                                "old": "same",
+                                "new": "same",
+                                "expected_count": 1,
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        operation = result["files"][0]["operations"][0]
+        self.assertTrue(operation["skipped"])
+        self.assertEqual(operation["reason"], "old_equals_new")
+        self.assertFalse(result["written"])
+        self.assertEqual(result["files"][0]["sha256"], expected)
+
     def test_transaction_exposes_fuzzy_worker_options(self):
         response = server.handle_message(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
@@ -105,6 +279,8 @@ class SafeEditMcpTests(unittest.TestCase):
         )
         properties = transaction["inputSchema"]["properties"]
         self.assertIn("autoMatch", properties)
+        self.assertIn("autoEolMatch", properties)
+        self.assertIn("transactionId", properties)
         self.assertIn("fuzzy", properties)
         self.assertIn("fuzzyWorkers", properties)
 
@@ -214,6 +390,9 @@ class SafeEditMcpTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertEqual(result["transport"], "mcp-structured")
         self.assertGreater(result["files"][0]["sizeBytes"], 512 * 1024)
+        self.assertEqual(result["files"][0]["diffMode"], "compact")
+        self.assertTrue(result["files"][0]["diffTruncated"])
+        self.assertLess(len(result["files"][0]["diff"]), 13_000)
 
     def test_hot_path_reuses_parser_and_skips_json_decode(self):
         target = self.root / "hot-path.txt"
@@ -312,7 +491,7 @@ class SafeEditMcpTests(unittest.TestCase):
             encoding="utf-8",
             check=True,
         )
-        self.assertEqual(completed.stdout.strip(), "1.1.0")
+        self.assertEqual(completed.stdout.strip(), "1.2.0")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,9 @@
 - `stat-many` 在一个进程内检查多个文件，并按父目录复用文件系统能力探测。
 - `preflight` 在写入前报告 Python、stdin、Base64、临时目录、锁和目标目录能力。
 - `transaction` 接收结构化多文件请求，先全量预演，再按稳定顺序加锁写入；失败时回滚已完成的写入。
+- 结构化事务会按检测到的文件行尾自动兼容 LF/CRLF 多行目标；无需为纯 EOL 差异开启 `autoMatch`。
+- MCP dry-run 默认返回有上限的精简 diff 和一次性 `transactionId`，确认时无需重传大 payload。
+- 成功写入会返回新 `sha256`，可直接作为下一轮 `expectedSha256`；`old == new` 操作会明确跳过。
 - Codex 插件及跨客户端安装器提供常驻 MCP 工具，直接接收结构化正文，避免 Base64、Windows argv 限制和重复启动 Python。
 - `create` 受控新建任务成果文件：拒绝覆盖、要求父目录已存在，并强制显式选择编码和行尾。
 - `convert` 显式转换编码、行尾、最终换行，或清理尾随空白；普通编辑默认仍保留原格式。
@@ -86,7 +89,8 @@ codex plugin add safe-edit-skill@safe-edit
 - `safe_edit_preflight`：检查 Python、临时目录、锁和目标目录能力。
 - `safe_edit_stat`：一次检查一个或多个文件，返回 `editStrategy` 与 SHA-256。
 - `safe_edit_transaction`：直接接收 `old`、`new`、`text` 和 `operations`，
-  完成多文件预演、加锁写入和失败回滚。
+  完成多文件预演、加锁写入和失败回滚；dry-run 返回的一次性
+  `transactionId` 可在 10 分钟内直接确认。
 
 推荐一次批量 `stat`，随后一次批量 transaction。MCP 服务是常驻进程，
 只导入一次编辑内核并只构建一次参数解析器；普通热路径不启动子进程（大型 fuzzy 查找除外），
@@ -106,9 +110,25 @@ codex plugin add safe-edit-skill@safe-edit
       ]
     }
   ],
-  "dryRun": false
+  "dryRun": true
 }
 ```
+
+dry-run 成功时会为每个文件返回精简 `diff`、`resultSha256`，并在
+顶层返回一次性事务 ID。正式执行只需：
+
+```json
+{"transactionId": "tx_FROM_DRY_RUN"}
+```
+
+确认 ID 只可消费一次、默认 10 分钟过期；目标文件仍会用原
+`expectedSha256` 再校验。也可以继续用 `dryRun: false` 直接提交完整请求。
+成功结果中每个文件的 `sha256` 是落盘后的新 guard，后续迭代无需重新
+`safe_edit_stat`。
+
+结构化事务默认启用 `autoEolMatch`：例如 CRLF 文件可直接接受 LF 多行
+`old`，但不会同时放宽缩进或其它空白；如需严格 EOL 匹配可显式设为
+`false`。
 
 CLI 保留为未加载插件时的兼容回退。
 
@@ -303,6 +323,14 @@ python safe_edit.py edit --file path/to/file --old "missing" --new "bar" --json
     "type": "match_not_found",
     "message": "old text was not found"
   },
+  "failedFile": {"index": 1, "file": "src/a.py"},
+  "failedOperation": {
+    "index": 7,
+    "op": "edit",
+    "targetFragment": "expected source fragment"
+  },
+  "operationIndex": 7,
+  "failureReason": "indentation_difference",
   "failureClass": "RETRYABLE",
   "rootCause": "indentation_difference",
   "closestMatch": {"line": 42, "similarity": 0.91},
@@ -313,6 +341,9 @@ python safe_edit.py edit --file path/to/file --old "missing" --new "bar" --json
 
 | 字段 | 说明 |
 |------|------|
+| `failedFile` | 事务内失败文件的 1-based 序号和路径 |
+| `failedOperation` | 失败操作的 1-based 序号、操作类型和有上限的目标片段 |
+| `failureReason` | 面向调用方的直接失败原因；匹配错误时等同于 `rootCause` |
 | `failureClass` | `RETRYABLE`（可自动重试）、`RE_READ_REQUIRED`（需重新读取文件）、`USER_INPUT`（需用户修正）、`FATAL`（不可恢复） |
 | `rootCause` | 根因分类：`indentation_difference`、`line_ending_difference`、`whitespace_difference`、`content_not_found`、`multiple_matches`、`similar_content_exists` |
 | `closestMatch` | 最接近匹配的位置、片段和相似度（0.0–1.0） |
@@ -638,9 +669,15 @@ python safe_edit.py transaction --request-stdin --json
 
 事务会在持锁后预演全部文件，并复用预演生成的最终字节作为提交计划；提交前仅重新
 读取目标以拦截忽略协作锁的并发写入，不会重复解码、匹配和计算编辑。进程内写入失败
-时会恢复原字节、删除本事务已创建的文件。返回的 `atomicity` 为
-`prevalidated-with-rollback`；
-这不是跨文件系统或断电级原子提交。
+时会恢复原字节、删除本事务已创建的文件。结构化 MCP 的 dry-run 会把原请求短期缓存在
+常驻进程中，返回 `transactionId`；确认调用无需再次传输或解析大 payload，
+但仍会重新预校验并执行 SHA 并发保护。dry-run 未显式设置 `diff` 时返回最多
+80 行、12,000 字符的精简 diff；显式 `diff: true` 仍返回完整 diff。
+
+每个预演文件返回计划值 `resultSha256`；每个成功落盘或无字节变化的文件返回
+当前 `sha256`。字面编辑中 `old` 与 `new` 完全相同时，操作结果为
+`skipped: true`、`reason: old_equals_new`。返回的 `atomicity` 为
+`prevalidated-with-rollback`；这不是跨文件系统或断电级原子提交。
 
 ## 编码注意事项
 
@@ -688,6 +725,7 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 | `-i, --interactive` | 交互确认，y/n/a/q/? |
 | `--explain-match-failure` | 匹配失败时显示诊断 |
 | `--auto-match` | 自动容错匹配（exact → ignore-eol → ignore-indent → normalize-whitespace） |
+| `--auto-eol-match` / `--no-auto-eol-match` | 开启或关闭基于目标文件行尾的多行兼容匹配；transaction 默认开启 |
 | `--fuzzy` | 启用模糊匹配（需配合 `--auto-match`，相似度 ≥ 0.6；忽略逐行首尾空白、行尾格式和最终换行） |
 | `--fuzzy-workers auto\|N` | fuzzy 进程上限；默认 `auto`，`1` 强制串行，`N` 为 2–8 |
 | `--context-before T` | 匹配位置前面必须包含的文本 |

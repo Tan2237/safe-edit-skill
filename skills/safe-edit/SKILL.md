@@ -65,12 +65,17 @@ They are part of the allowed safe-edit protocol.
 2. Call `safe_edit_stat` once with all related existing files.
 3. Call `safe_edit_transaction` once with raw `old`, `new`, `text`, and
    `operations` values plus the returned SHA-256 guards.
-4. Use `dryRun: true` in the same structured tool for risky previews.
+4. For risky changes, use `dryRun: true`; after success, call the tool again
+   with only `{"transactionId":"RETURNED_ID"}`. Do not resend the payload.
+5. Cache each successful file result's `sha256` as the guard for its next edit.
+   Do not re-run stat after a confirmed successful write.
 
 The server is long-lived: it imports the editing core and builds its parser only
-once. Batch related files so filesystem probes, request validation, and lock
-coordination are shared. Do not JSON-stringify, Base64-encode, or create payload
-files for these tool calls.
+once. It holds dry-run payloads behind single-use transaction IDs for 10 minutes.
+Batch related files so filesystem probes, request validation, and lock coordination
+are shared. Do not JSON-stringify, Base64-encode, or create payload files for these
+tool calls. Dry-runs include compact diffs by default; set per-file `diff: true`
+only when a full diff is needed.
 
 The CLI sections below are the fallback when the structured tools are not
 available.
@@ -129,7 +134,7 @@ A new file cannot be inspected first. Create it only when it is a requested task
 python "SAFE_EDIT_SCRIPT" create --file F --to-encoding utf-8 --to-line-ending lf --text-base64 B64
 ```
 
-The target must not exist and its parent directory must already exist. `create` never overwrites and never creates parent directories. After creation, run `stat` before any later edit.
+The target must not exist and its parent directory must already exist. `create` never overwrites and never creates parent directories. After creation, use the successful result's `sha256` for any later edit.
 
 For one new file, the structured request may be exactly
 `{"file":"new.txt","text":"...","encoding":"utf-8","lineEnding":"lf"}`;
@@ -158,14 +163,22 @@ For one new file, the structured request may be exactly
 ```
 
 Pass this object directly to `safe_edit_transaction` when it is callable. The
-structured path avoids shell parsing, Base64 expansion, Windows argv limits,
-and per-call Python startup. Otherwise use `transaction --request-stdin` only
-with a native stdin field; fall back to an existing request file, then URL-safe
-UTF-8 Base64. Both paths lock targets in stable order, prevalidate every file,
-and roll back completed writes on failure. Neither claims crash-atomicity
-across multiple files.
+structured path automatically reconciles multiline target EOLs with the detected
+file line ending. For a risky request, send it once with `dryRun: true`, then
+confirm with only the returned `transactionId`. The structured path avoids shell
+parsing, Base64 expansion, Windows argv limits, and per-call Python startup.
+Otherwise use `transaction --request-stdin` only with a native stdin field; fall
+back to an existing request file, then URL-safe UTF-8 Base64. Both paths lock
+targets in stable order, prevalidate every file, and roll back completed writes
+on failure. Neither claims crash-atomicity across multiple files.
 
-The stat result is authoritative for the lifetime of the file. Re-run it only when the file is recreated, a failed `safe_edit.py` invocation may have reached the write phase, or the execution outcome is uncertain. Do not re-run it when the shell/tool rejects the command before process start, or when argument parsing fails before target access.
+The latest trusted hash is authoritative for the lifetime of the file. Initially it
+comes from stat; after a successful transaction, replace it with that file result's
+`sha256`. Re-run stat only when the file is recreated without a returned hash, a failed
+write-phase invocation may have changed state, or the execution outcome is
+uncertain. Do not re-run it after a confirmed successful write, when the shell/tool
+rejects the command before process start, or when argument parsing fails before
+target access.
 
 The selected editStrategy is locked for the lifetime of the file. Do NOT switch to another edit mechanism after a command failure. Continue using the cached editStrategy.
 
@@ -354,15 +367,17 @@ regex                       ← HIGHEST EDIT RISK
 
 6. **Use URL-safe Base64 only for CLI fallback** — unpadded URL-safe Base64 avoids quotes, whitespace, `+`, and `/`, but expands payloads and remains subject to argv limits. Never Base64-encode data for the structured tools.
 
-7. **Use `--auto-match` for multiline edits** — auto-tries: exact → ignore-eol → ignore-indent → normalize-whitespace.
+7. **Use transaction EOL matching first** — structured and CLI transactions automatically tolerate only LF/CRLF/CR differences in multiline `old` values. Use `--auto-match` only when indentation or broader whitespace relaxation is also required.
 
 8. **Use `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
 
-9. **Use transactions for related files** — obtain hashes with one `safe_edit_stat` call (or CLI `stat-many` fallback), require `expectedSha256` on every edit request, and include controlled creates in the same transaction. Treat `atomicity: prevalidated-with-rollback` as process-level rollback, not crash-atomicity.
+9. **Use transactions for related files** — obtain initial hashes with one `safe_edit_stat` call (or CLI `stat-many` fallback), require `expectedSha256` on every edit request, and include controlled creates in the same transaction. Use returned `sha256` values for later transactions. Treat `atomicity: prevalidated-with-rollback` as process-level rollback, not crash-atomicity.
 
-10. **Re-read and validate after edits** — successful execution confirms only the payload received by the safe-edit core. Re-read or compile/test to verify intent.
+10. **Treat explicit no-ops as skipped** — `old == new` returns `skipped: true` with `reason: old_equals_new`; do not retry it.
 
-11. **Protect the hot path** — prefer one batched stat and one batched transaction. Do not split related files into repeated tool calls, rebuild the parser, spawn helper processes, or serialize an already-structured request again.
+11. **Re-read and validate after edits** — successful execution confirms only the payload received by the safe-edit core. Re-read or compile/test to verify intent.
+
+12. **Protect the hot path** — prefer one batched stat and one batched transaction. For previews, confirm the returned transaction ID instead of resending the payload. Do not split related files into repeated tool calls, rebuild the parser, spawn helper processes, or serialize an already-structured request again.
 
 ---
 
@@ -396,7 +411,8 @@ Most failures are whitespace differences. Use `--explain-match-failure` before a
 
 | Option | Effect | When to use |
 |--------|--------|-------------|
-| `--auto-match` | Auto-try: exact → ignore-eol → ignore-indent → normalize-whitespace | **Default for multiline** |
+| transaction `autoEolMatch` | Match multiline targets using the detected file EOL only | **Default for transactions** |
+| `--auto-match` | Auto-try: exact → ignore-eol → ignore-indent → normalize-whitespace | Indentation/whitespace drift |
 | `--fuzzy` | Fuzzy matching (≥0.6); ignores per-line boundary whitespace, EOL style, and final EOL | AI-generated approximate text |
 | `--fuzzy-workers auto\|N` | Conditional low-priority fuzzy processes; `1` forces serial, `N` is 2–8 | Large CPU-heavy fuzzy searches |
 | `--normalize-whitespace` | Collapse whitespace | **JSON/YAML/Markdown** |

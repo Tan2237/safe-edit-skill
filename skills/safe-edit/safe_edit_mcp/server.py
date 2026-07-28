@@ -3,6 +3,7 @@
 
 import copy
 import json
+import secrets
 import sys
 import time
 from typing import Any, Dict, List, Optional
@@ -21,6 +22,9 @@ SUPPORTED_PROTOCOL_VERSIONS = (
     "2025-03-26",
     "2024-11-05",
 )
+PENDING_TRANSACTION_TTL_SECONDS = 10 * 60
+MAX_PENDING_TRANSACTIONS = 32
+_PENDING_TRANSACTIONS: Dict[str, Dict[str, Any]] = {}
 
 
 class ToolInputError(Exception):
@@ -53,6 +57,46 @@ def _require_files(arguments: Dict[str, Any]) -> List[Any]:
     if not isinstance(files, list) or not files:
         raise ToolInputError("files must be a non-empty array")
     return files
+
+
+def _prune_pending_transactions(now: Optional[float] = None) -> None:
+    current = time.monotonic() if now is None else now
+    expired = [
+        transaction_id
+        for transaction_id, item in _PENDING_TRANSACTIONS.items()
+        if item["expiresAt"] <= current
+    ]
+    for transaction_id in expired:
+        _PENDING_TRANSACTIONS.pop(transaction_id, None)
+
+
+def _remember_pending_transaction(arguments: Dict[str, Any]) -> str:
+    now = time.monotonic()
+    _prune_pending_transactions(now)
+    while len(_PENDING_TRANSACTIONS) >= MAX_PENDING_TRANSACTIONS:
+        oldest = min(
+            _PENDING_TRANSACTIONS,
+            key=lambda key: _PENDING_TRANSACTIONS[key]["expiresAt"],
+        )
+        _PENDING_TRANSACTIONS.pop(oldest, None)
+    transaction_id = "tx_" + secrets.token_urlsafe(24)
+    cached_arguments = copy.deepcopy(arguments)
+    cached_arguments["dryRun"] = False
+    _PENDING_TRANSACTIONS[transaction_id] = {
+        "expiresAt": now + PENDING_TRANSACTION_TTL_SECONDS,
+        "arguments": cached_arguments,
+    }
+    return transaction_id
+
+
+def _consume_pending_transaction(transaction_id: str) -> Dict[str, Any]:
+    _prune_pending_transactions()
+    pending = _PENDING_TRANSACTIONS.pop(transaction_id, None)
+    if pending is None:
+        raise ToolInputError(
+            "unknown or expired transactionId; run dryRun again"
+        )
+    return pending["arguments"]
 
 
 def _set_positive_int(
@@ -92,13 +136,12 @@ def _configure_common(args: Any, arguments: Dict[str, Any]) -> None:
 def _configure_match_options(
     args: Any, arguments: Dict[str, Any]
 ) -> None:
-    for source, target in (
-        ("autoMatch", "auto_match"),
-        ("fuzzy", "fuzzy"),
+    for source, target, default in (
+        ("autoMatch", "auto_match", False),
+        ("autoEolMatch", "auto_eol_match", True),
+        ("fuzzy", "fuzzy", False),
     ):
-        if source not in arguments:
-            continue
-        value = arguments[source]
+        value = arguments.get(source, default)
         if not isinstance(value, bool):
             raise ToolInputError(f"{source} must be a boolean")
         setattr(args, target, value)
@@ -146,6 +189,21 @@ def execute_tool(name: str, raw_arguments: Any) -> Dict[str, Any]:
             payload["encoding"] = encoding
         summary = core.run_stat_many_payload(args, payload)
     elif name == "safe_edit_transaction":
+        confirmation_id = arguments.get("transactionId")
+        if confirmation_id is not None:
+            if (
+                not isinstance(confirmation_id, str)
+                or not confirmation_id
+            ):
+                raise ToolInputError(
+                    "transactionId must be a non-empty string"
+                )
+            if set(arguments) != {"transactionId"}:
+                raise ToolInputError(
+                    "confirm with transactionId only; do not resend files or options"
+                )
+            arguments = _consume_pending_transaction(confirmation_id)
+
         args = _fresh_args("transaction")
         _configure_common(args, arguments)
         _configure_match_options(args, arguments)
@@ -156,6 +214,15 @@ def execute_tool(name: str, raw_arguments: Any) -> Dict[str, Any]:
         summary = core.run_transaction_payload(
             args, {"files": _require_files(arguments)}
         )
+        if dry_run:
+            transaction_id = _remember_pending_transaction(arguments)
+            summary["transactionId"] = transaction_id
+            summary["transactionExpiresInSeconds"] = (
+                PENDING_TRANSACTION_TTL_SECONDS
+            )
+        elif confirmation_id is not None:
+            summary["transactionId"] = confirmation_id
+            summary["confirmed"] = True
     else:
         raise ToolInputError(f"unknown tool: {name}")
 
@@ -181,10 +248,15 @@ def _summary_text(summary: Dict[str, Any]) -> str:
             f"files={summary.get('fileCount')} elapsedMs={elapsed}"
         )
     mode = "dry-run" if summary.get("dryRun") else "apply"
+    transaction_id = summary.get("transactionId")
+    transaction_note = (
+        f" transactionId={transaction_id}" if transaction_id else ""
+    )
     return (
         f"safe-edit transaction {mode} completed: "
         f"files={summary.get('fileCount')} "
-        f"written={summary.get('written')} elapsedMs={elapsed}"
+        f"written={summary.get('written')}{transaction_note} "
+        f"elapsedMs={elapsed}"
     )
 
 
@@ -197,16 +269,21 @@ def _tool_result(summary: Dict[str, Any]) -> Dict[str, Any]:
 
 def _tool_failure(error: Exception, command: str) -> Dict[str, Any]:
     if isinstance(error, core.SafeEditError):
-        error_type = core.classify_error_type(str(error))
+        payload = core.build_error_payload(error, command=command)
     else:
-        error_type = "validation_error"
-    payload = {
-        "ok": False,
-        "command": command,
-        "transport": "mcp-structured",
-        "error": {"type": error_type, "message": str(error)},
-        "written": False,
-    }
+        payload = {
+            "ok": False,
+            "command": command,
+            "error": {
+                "type": "validation_error",
+                "message": str(error),
+                "reason": "validation_error",
+            },
+            "failureReason": "validation_error",
+            "written": False,
+        }
+    payload["transport"] = "mcp-structured"
+    payload["written"] = False
     return {
         "content": [{"type": "text", "text": f"safe-edit: {error}"}],
         "structuredContent": payload,
@@ -276,7 +353,12 @@ TRANSACTION_ITEM_SCHEMA = {
         "forceWrite": {"type": "boolean"},
         "allowNul": {"type": "boolean"},
         "followSymlink": {"type": "boolean"},
-        "diff": {"type": "boolean"},
+        "diff": {
+            "type": "boolean",
+            "description": (
+                "Request a full diff. Omit during dryRun for a compact diff."
+            ),
+        },
     },
     "required": ["file"],
     "additionalProperties": False,
@@ -343,7 +425,8 @@ TOOLS = [
             "Apply raw structured text edits and controlled creates without "
             "shell quoting or Base64. Existing files require SHA-256 values "
             "from safe_edit_stat. All files are prevalidated and writes roll "
-            "back if a later write fails."
+            "back if a later write fails. A successful dryRun returns a "
+            "transactionId that can be confirmed without resending the payload."
         ),
         "inputSchema": {
             "type": "object",
@@ -352,10 +435,30 @@ TOOLS = [
                     "type": "array",
                     "minItems": 1,
                     "items": TRANSACTION_ITEM_SCHEMA,
+                    "description": (
+                        "Payload for preview or direct apply. Omit when "
+                        "confirming a cached dry-run transaction."
+                    ),
+                },
+                "transactionId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": (
+                        "Returned by dryRun. Call again with only this field "
+                        "to apply the cached, SHA-guarded request."
+                    ),
                 },
                 "dryRun": {"type": "boolean", "default": False},
                 "maxBytes": {"type": "integer", "minimum": 1},
                 "autoMatch": {"type": "boolean", "default": False},
+                "autoEolMatch": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "Match multiline targets against the detected file "
+                        "line ending without relaxing other whitespace."
+                    ),
+                },
                 "fuzzy": {"type": "boolean", "default": False},
                 "fuzzyWorkers": {
                     "oneOf": [
@@ -377,7 +480,10 @@ TOOLS = [
                     "exclusiveMinimum": 0,
                 },
             },
-            "required": ["files"],
+            "oneOf": [
+                {"required": ["files"]},
+                {"required": ["transactionId"]},
+            ],
             "additionalProperties": False,
         },
         "annotations": {
@@ -438,7 +544,9 @@ def handle_message(message: Any) -> Optional[Dict[str, Any]]:
                 "instructions": (
                     "Call safe_edit_stat before modifying existing files, "
                     "then pass its SHA-256 values to one batched "
-                    "safe_edit_transaction. Use dryRun for risky changes."
+                    "safe_edit_transaction. Use dryRun for risky changes, "
+                    "then confirm with only the returned transactionId. "
+                    "Reuse each successful file result's sha256 as the next guard."
                 ),
             },
         )

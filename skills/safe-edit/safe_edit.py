@@ -91,6 +91,9 @@ _LINE_ENDING_RE = re.compile(r'(\r\n|\r|\n)')
 _WHITESPACE_RE = re.compile(r"\s+")
 _TRAILING_WHITESPACE_RE = re.compile(r"(?<![ \t])[ \t]+(?=\r\n|\r|\n|\Z)")
 _NON_CRLF_LINE_SEPARATOR_RE = re.compile(r"[\v\f\x1c-\x1e\x85\u2028\u2029]")
+_COMPACT_DIFF_MAX_LINES = 80
+_COMPACT_DIFF_MAX_CHARS = 12_000
+_DIAGNOSTIC_FRAGMENT_MAX_CHARS = 1_000
 
 
 @dataclass(frozen=True)
@@ -402,7 +405,31 @@ def analyze_match_failure(
     return result
 
 
-def emit_json_error(
+def _diagnostic_target_fragment(
+    operation: Optional[Dict[str, Any]],
+) -> Tuple[str, bool]:
+    """Return a bounded user-supplied target fragment for error reporting."""
+    if not isinstance(operation, dict):
+        return ("", False)
+    op_name = str(
+        operation.get("op") or operation.get("command") or ""
+    ).replace("_", "-")
+    keys = ("old",) if op_name == "edit" else ("pattern", "anchor_pattern")
+    for key in keys:
+        value = operation.get(key)
+        if value is None:
+            continue
+        fragment = str(value)
+        if len(fragment) <= _DIAGNOSTIC_FRAGMENT_MAX_CHARS:
+            return (fragment, False)
+        return (
+            fragment[:_DIAGNOSTIC_FRAGMENT_MAX_CHARS],
+            True,
+        )
+    return ("", False)
+
+
+def build_error_payload(
     exc: SafeEditError,
     file_path: str = "",
     command: str = "",
@@ -410,8 +437,8 @@ def emit_json_error(
     old: str = "",
     text: str = "",
     lock_info: Optional[Dict[str, Any]] = None,
-) -> None:
-    """Emit a structured JSON error object to stdout for Agent consumption.
+) -> Dict[str, Any]:
+    """Build a structured error object for CLI and MCP callers.
 
     When old and text are provided for match errors, provides:
     - failureClass: RETRYABLE / RE_READ_REQUIRED / USER_INPUT / FATAL
@@ -428,6 +455,21 @@ def emit_json_error(
     - recommendedAction: {"type": "retry_after_lock_clears", "confidence": float}
     """
     error_type = classify_error_type(str(exc))
+    diagnostic_operation = getattr(exc, "_diagnostic_operation", None)
+    diagnostic_text = getattr(exc, "_diagnostic_text", None)
+    diagnostic_file = getattr(exc, "_diagnostic_file", None)
+    diagnostic_command = getattr(exc, "_diagnostic_command", None)
+    if diagnostic_file:
+        file_path = str(diagnostic_file)
+    if diagnostic_command:
+        command = str(diagnostic_command)
+    if not old and isinstance(diagnostic_operation, dict):
+        old, _target_truncated = _diagnostic_target_fragment(
+            diagnostic_operation
+        )
+    if not text and isinstance(diagnostic_text, str):
+        text = diagnostic_text
+
     error_obj: Dict[str, Any] = {
         "ok": False,
         "error": {
@@ -443,12 +485,43 @@ def emit_json_error(
         "skipped": False,
     }
 
+    operation_index = getattr(exc, "_diagnostic_operation_index", None)
+    target_fragment, target_truncated = _diagnostic_target_fragment(
+        diagnostic_operation
+    )
+    if operation_index is not None or isinstance(diagnostic_operation, dict):
+        failed_operation: Dict[str, Any] = {
+            "index": operation_index,
+            "op": str(
+                (diagnostic_operation or {}).get("op")
+                or (diagnostic_operation or {}).get("command")
+                or ""
+            ).replace("_", "-"),
+            "targetFragment": target_fragment,
+        }
+        if target_truncated:
+            failed_operation["targetTruncated"] = True
+        error_obj["failedOperation"] = failed_operation
+        if operation_index is not None:
+            error_obj["operationIndex"] = operation_index
+        if target_fragment:
+            error_obj["targetFragment"] = target_fragment
+
+    file_index = getattr(exc, "_diagnostic_file_index", None)
+    if file_index is not None:
+        error_obj["failedFile"] = {
+            "index": file_index,
+            "file": file_path,
+        }
+
     # Structured recovery info for match-related errors
     if error_type in ("match_not_found", "match_ambiguous", "match_count_mismatch"):
         if old and text:
             analysis = analyze_match_failure(old, text, error_type)
             error_obj["failureClass"] = analysis["failureClass"]
             error_obj["rootCause"] = analysis["rootCause"]
+            error_obj["failureReason"] = analysis["rootCause"]
+            error_obj["error"]["reason"] = analysis["rootCause"]
             if analysis["closestMatch"]:
                 error_obj["closestMatch"] = analysis["closestMatch"]
             if analysis["recommendedAction"]:
@@ -470,6 +543,29 @@ def emit_json_error(
             error_obj["lockAgeSeconds"] = lock_age
         error_obj["recommendedAction"] = {"type": "retry_after_lock_clears", "confidence": 0.8}
 
+    error_obj.setdefault("failureReason", error_type)
+    error_obj["error"].setdefault("reason", error_obj["failureReason"])
+    return error_obj
+
+
+def emit_json_error(
+    exc: SafeEditError,
+    file_path: str = "",
+    command: str = "",
+    *,
+    old: str = "",
+    text: str = "",
+    lock_info: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Emit the shared structured error payload as JSON."""
+    error_obj = build_error_payload(
+        exc,
+        file_path=file_path,
+        command=command,
+        old=old,
+        text=text,
+        lock_info=lock_info,
+    )
     print(json.dumps(error_obj, ensure_ascii=False, sort_keys=True))
 
 
@@ -3110,6 +3206,23 @@ def apply_operation(text: str, operation: Dict[str, Any], newline: str, explain:
     return (new_text, changed, op, match_strategy)
 
 
+def _operation_needs_eol_compat(
+    operation: Dict[str, Any],
+    newline: str,
+) -> bool:
+    """Return whether a literal target uses a different newline style."""
+    op_name = str(
+        operation.get("op") or operation.get("command") or ""
+    ).replace("_", "-")
+    if op_name != "edit":
+        return False
+    old = operation.get("old")
+    if old is None:
+        return False
+    styles = set(_LINE_ENDING_RE.findall(str(old)))
+    return bool(styles) and styles != {newline}
+
+
 def apply_operations(
     text: str,
     operations: List[Dict[str, Any]],
@@ -3123,8 +3236,9 @@ def apply_operations(
     context_before: Optional[str] = None,
     context_after: Optional[str] = None,
     fuzzy_workers: Any = 1,
+    auto_eol_match: bool = False,
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    """Apply an operation list while reusing line records between line edits."""
+    """Apply operations with indexed diagnostics and reusable line records."""
     buffer = _OperationBuffer(text)
     results: List[Dict[str, Any]] = []
 
@@ -3132,51 +3246,89 @@ def apply_operations(
         op_name = str(
             operation.get("op") or operation.get("command") or ""
         ).replace("_", "-")
-        can_buffer = (
-            op_name in _LINE_BUFFER_OPERATIONS
-            and not operation.get("anchor_pattern")
-            and not (
-                op_name in {"prepend", "append"}
-                and str(operation.get("text", "")) != ""
-            )
-        )
-        if can_buffer:
-            changed = _apply_line_operation_to_records(
-                buffer.as_records(),
-                op_name,
-                operation,
-                newline,
-                keepends=True,
-            )
-            op = op_name
-            match_strategy = "line-based"
-        else:
-            op_ctx_before = operation.get("context_before", context_before)
-            op_ctx_after = operation.get("context_after", context_after)
-            updated, changed, op, match_strategy = apply_operation(
-                buffer.as_text(),
-                operation,
-                newline,
-                explain,
-                ignore_indent,
-                ignore_eol,
-                normalize_whitespace,
-                auto_match=auto_match,
-                fuzzy=fuzzy,
-                context_before=op_ctx_before,
-                context_after=op_ctx_after,
-                fuzzy_workers=fuzzy_workers,
-            )
-            buffer.set_text(updated)
 
-        results.append(
-            {
-                "index": index,
-                "op": op,
-                "changed": changed,
-                "matchStrategy": match_strategy,
-            }
-        )
+        if (
+            op_name == "edit"
+            and "old" in operation
+            and "new" in operation
+            and str(operation["old"]) != ""
+            and str(operation["old"]) == str(operation["new"])
+        ):
+            results.append(
+                {
+                    "index": index,
+                    "op": op_name,
+                    "changed": 0,
+                    "matchStrategy": "no-op",
+                    "skipped": True,
+                    "reason": "old_equals_new",
+                }
+            )
+            continue
+
+        operation_ignore_eol = ignore_eol
+        auto_eol_applied = False
+        if (
+            auto_eol_match
+            and not auto_match
+            and not ignore_eol
+            and _operation_needs_eol_compat(operation, newline)
+        ):
+            operation_ignore_eol = True
+            auto_eol_applied = True
+
+        try:
+            can_buffer = (
+                op_name in _LINE_BUFFER_OPERATIONS
+                and not operation.get("anchor_pattern")
+                and not (
+                    op_name in {"prepend", "append"}
+                    and str(operation.get("text", "")) != ""
+                )
+            )
+            if can_buffer:
+                changed = _apply_line_operation_to_records(
+                    buffer.as_records(),
+                    op_name,
+                    operation,
+                    newline,
+                    keepends=True,
+                )
+                op = op_name
+                match_strategy = "line-based"
+            else:
+                op_ctx_before = operation.get("context_before", context_before)
+                op_ctx_after = operation.get("context_after", context_after)
+                updated, changed, op, match_strategy = apply_operation(
+                    buffer.as_text(),
+                    operation,
+                    newline,
+                    explain,
+                    ignore_indent,
+                    operation_ignore_eol,
+                    normalize_whitespace,
+                    auto_match=auto_match,
+                    fuzzy=fuzzy,
+                    context_before=op_ctx_before,
+                    context_after=op_ctx_after,
+                    fuzzy_workers=fuzzy_workers,
+                )
+                buffer.set_text(updated)
+        except SafeEditError as exc:
+            setattr(exc, "_diagnostic_operation_index", index)
+            setattr(exc, "_diagnostic_operation", operation)
+            setattr(exc, "_completed_operations", list(results))
+            raise
+
+        operation_result = {
+            "index": index,
+            "op": op,
+            "changed": changed,
+            "matchStrategy": match_strategy,
+        }
+        if auto_eol_applied:
+            operation_result["autoEolMatch"] = True
+        results.append(operation_result)
 
     return buffer.as_text(), results
 
@@ -3273,6 +3425,58 @@ def generate_diff(path: Path, before: str, after: str, context: int) -> str:
         lineterm="",
     )
     return "\n".join(diff)
+
+
+def generate_compact_diff(
+    path: Path,
+    before: str,
+    after: str,
+    context: int,
+) -> Tuple[str, bool]:
+    """Generate a bounded unified diff suitable for default dry-run output."""
+    diff = difflib.unified_diff(
+        before.splitlines(),
+        after.splitlines(),
+        fromfile=f"{path} (before)",
+        tofile=f"{path} (after)",
+        n=min(context, 2),
+        lineterm="",
+    )
+    lines: List[str] = []
+    char_count = 0
+    truncated = False
+    for line in diff:
+        next_size = char_count + len(line) + (1 if lines else 0)
+        if (
+            len(lines) >= _COMPACT_DIFF_MAX_LINES
+            or next_size > _COMPACT_DIFF_MAX_CHARS
+        ):
+            remaining = max(0, _COMPACT_DIFF_MAX_CHARS - char_count)
+            if remaining > 0:
+                lines.append(line[:remaining])
+            truncated = True
+            break
+        lines.append(line)
+        char_count = next_size
+    if truncated:
+        lines.append("... [compact diff truncated]")
+    return ("\n".join(lines), truncated)
+
+
+def build_diff_preview(
+    path: Path,
+    before: str,
+    after: str,
+    args: argparse.Namespace,
+) -> Tuple[str, Optional[str], bool]:
+    if not args.diff:
+        return ("", None, False)
+    if bool(getattr(args, "_compact_diff", False)):
+        diff_text, truncated = generate_compact_diff(
+            path, before, after, args.context
+        )
+        return (diff_text, "compact", truncated)
+    return (generate_diff(path, before, after, args.context), "full", False)
 
 
 class FileLockSet:
@@ -4111,7 +4315,17 @@ def request_item_args(
     child.trim_trailing_whitespace = bool(item.get("trimTrailingWhitespace", False))
     child.force_write = bool(item.get("forceWrite", False))
     child.allow_nul = bool(item.get("allowNul", False))
-    child.diff = bool(item.get("diff", False))
+    explicit_diff = item.get("diff")
+    child.diff = (
+        bool(parent.dry_run)
+        if explicit_diff is None
+        else bool(explicit_diff)
+    )
+    child._compact_diff = explicit_diff is None and bool(parent.dry_run)
+    parent_auto_eol = getattr(parent, "auto_eol_match", None)
+    child.auto_eol_match = (
+        True if parent_auto_eol is None else bool(parent_auto_eol)
+    )
 
     if action == "create":
         text_value = item.get("text")
@@ -4261,8 +4475,14 @@ def run_transaction_payload(
 
     # Expected hashes make planning safe outside the lock. Commit still
     # revalidates every existing file while all cooperative locks are held.
-    for child in children:
-        preview = run(child)
+    for file_index, child in enumerate(children, start=1):
+        try:
+            preview = run(child)
+        except SafeEditError as exc:
+            setattr(exc, "_diagnostic_file_index", file_index)
+            setattr(exc, "_diagnostic_file", child.file)
+            setattr(exc, "_diagnostic_command", "transaction")
+            raise
         plan = getattr(child, "_transaction_plan", None)
         if not isinstance(plan, dict):
             fail(f"transaction failed to prepare file: {child.file}")
@@ -4292,6 +4512,7 @@ def run_transaction_payload(
             for child, plan in zip(children, plans):
                 path = plan["path"]
                 output = plan["output"]
+                output_sha256 = hashlib.sha256(output).hexdigest()
                 result = dict(plan["summary"])
                 result["dryRun"] = False
 
@@ -4322,6 +4543,7 @@ def run_transaction_payload(
                         result["backup"] = backup
                         result["written"] = True
                     plan["output"] = b""
+                result["sha256"] = output_sha256
                 results.append(result)
         except Exception as exc:
             rollback_errors: List[str] = []
@@ -4458,6 +4680,19 @@ def build_parser() -> argparse.ArgumentParser:
                         help="treat consecutive whitespace as equivalent when matching")
     parser.add_argument("--auto-match", action="store_true",
                         help="automatically try progressively relaxed matching: exact → ignore-eol → ignore-indent → normalize-whitespace")
+    parser.add_argument(
+        "--auto-eol-match",
+        dest="auto_eol_match",
+        action="store_true",
+        default=None,
+        help="automatically match multiline targets using the detected file EOL",
+    )
+    parser.add_argument(
+        "--no-auto-eol-match",
+        dest="auto_eol_match",
+        action="store_false",
+        help="disable transaction-default EOL-compatible matching",
+    )
     parser.add_argument("--fuzzy", action="store_true",
                         help="enable fuzzy matching as last resort (requires --auto-match, similarity >= 0.6)")
     parser.add_argument(
@@ -4638,7 +4873,10 @@ def run_create(args: argparse.Namespace) -> Dict[str, Any]:
     if len(output) > args.max_bytes:
         fail(f"output is {len(output)} bytes, exceeding --max-bytes {args.max_bytes}")
     output_line_ending, output_line_counts, output_mixed = detect_line_ending(new_text)
-    diff_text = generate_diff(path, "", new_text, args.context) if args.diff else ""
+    result_sha256 = hashlib.sha256(output).hexdigest()
+    diff_text, diff_mode, diff_truncated = build_diff_preview(
+        path, "", new_text, args
+    )
 
     summary: Dict[str, Any] = {
         "ok": True,
@@ -4676,6 +4914,7 @@ def run_create(args: argparse.Namespace) -> Dict[str, Any]:
         "created": False,
         "skipped": False,
         "sizeBytes": len(output),
+        "resultSha256": result_sha256,
         "wouldChangeBytes": True,
         "wouldCreate": True,
     }
@@ -4683,6 +4922,8 @@ def run_create(args: argparse.Namespace) -> Dict[str, Any]:
         summary["warnings"] = warnings
     if args.diff:
         summary["diff"] = diff_text
+        summary["diffMode"] = diff_mode
+        summary["diffTruncated"] = diff_truncated
 
     if getattr(args, "_capture_transaction_plan", False):
         args._transaction_plan = {
@@ -4712,6 +4953,7 @@ def run_create(args: argparse.Namespace) -> Dict[str, Any]:
             fail("post-write verification failed: bytes on disk do not match intended output")
         summary["written"] = True
         summary["created"] = True
+        summary["sha256"] = result_sha256
     return summary
 
 
@@ -4816,6 +5058,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         ignore_eol = getattr(args, "ignore_eol", False)
         normalize_whitespace = getattr(args, "normalize_whitespace", False)
         auto_match = getattr(args, "auto_match", False)
+        auto_eol_match = bool(getattr(args, "auto_eol_match", False))
         fuzzy = getattr(args, "fuzzy", False)
         fuzzy_workers = getattr(args, "fuzzy_workers", "auto")
         context_before = getattr(args, "context_before", None)
@@ -4834,18 +5077,36 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 context_before=context_before,
                 context_after=context_after,
                 fuzzy_workers=fuzzy_workers,
+                auto_eol_match=auto_eol_match,
             )
         except SafeEditError as exc:
             setattr(exc, "_diagnostic_text", text)
-            if len(operations) == 1:
+            setattr(exc, "_diagnostic_file", str(path))
+            setattr(exc, "_diagnostic_command", args.command)
+            if (
+                len(operations) == 1
+                and not hasattr(exc, "_diagnostic_operation")
+            ):
                 setattr(exc, "_diagnostic_operation", operations[0])
+                setattr(exc, "_diagnostic_operation_index", 1)
             raise
+
+        for operation_result in operation_results:
+            if operation_result.get("reason") == "old_equals_new":
+                warnings.append(
+                    "operation "
+                    f"{operation_result['index']} skipped: old and new are identical"
+                )
 
         new_text = apply_post_transforms(new_text, args, newline)
         output_encoding = encoding_for_output(args.to_encoding, encoding)
         output = encode_text(new_text, output_encoding)
+        original_sha256 = hashlib.sha256(original).hexdigest()
+        result_sha256 = hashlib.sha256(output).hexdigest()
         output_line_ending, output_line_counts, output_mixed_line_endings = detect_line_ending(new_text)
-        diff_text = generate_diff(path, text, new_text, args.context) if args.diff else ""
+        diff_text, diff_mode, diff_truncated = build_diff_preview(
+            path, text, new_text, args
+        )
         summary: Dict[str, Any] = {
             "ok": True,
             "file": str(path),
@@ -4868,6 +5129,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             },
             "matchOptions": {
                 "autoMatch": auto_match,
+                "autoEolMatch": auto_eol_match,
                 "fuzzy": fuzzy,
                 "fuzzyWorkers": fuzzy_workers,
                 "ignoreIndent": ignore_indent,
@@ -4878,18 +5140,22 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "backup": None,
             "written": False,
             "skipped": False,
+            "originalSha256": original_sha256,
+            "resultSha256": result_sha256,
             "wouldChangeBytes": output != original,
         }
         if warnings:
             summary["warnings"] = warnings
         if args.diff:
             summary["diff"] = diff_text
+            summary["diffMode"] = diff_mode
+            summary["diffTruncated"] = diff_truncated
 
         if getattr(args, "_capture_transaction_plan", False):
             args._transaction_plan = {
                 "action": "edit",
                 "path": path,
-                "originalSha256": args.expected_sha256.lower(),
+                "originalSha256": original_sha256,
                 "output": output,
                 "summary": summary,
             }
@@ -4913,6 +5179,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     fail("post-write verification failed: bytes on disk do not match intended output")
                 summary["backup"] = backup
                 summary["written"] = True
+            summary["sha256"] = result_sha256
         return summary
 
 
