@@ -1,10 +1,12 @@
 import hashlib
 import importlib.util
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,6 +29,16 @@ def _load_server():
 
 server = _load_server()
 ToolInputError = server.execute_tool.__globals__["ToolInputError"]
+ToolExecutionError = server.execute_tool.__globals__["ToolExecutionError"]
+implementation = sys.modules[server.execute_tool.__module__]
+
+
+def _initialize_params(protocol_version="2025-11-25"):
+    return {
+        "protocolVersion": protocol_version,
+        "capabilities": {},
+        "clientInfo": {"name": "safe-edit-test", "version": "1.0"},
+    }
 
 
 class SafeEditMcpTests(unittest.TestCase):
@@ -38,6 +50,9 @@ class SafeEditMcpTests(unittest.TestCase):
         server.execute_tool.__globals__[
             "_PENDING_TRANSACTIONS"
         ].clear()
+        fs_cache = getattr(server.core, "_FS_CAPABILITY_CACHE", None)
+        if fs_cache is not None:
+            fs_cache.clear()
 
     def tearDown(self):
         self.tempdir.cleanup()
@@ -144,7 +159,7 @@ class SafeEditMcpTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"after\n")
 
         with self.assertRaisesRegex(
-            ToolInputError, "unknown or expired transactionId"
+            ToolExecutionError, "unknown or expired transactionId"
         ):
             server.execute_tool(
                 "safe_edit_transaction",
@@ -332,6 +347,148 @@ class SafeEditMcpTests(unittest.TestCase):
         self.assertIn("transactionId", properties)
         self.assertIn("fuzzy", properties)
         self.assertIn("fuzzyWorkers", properties)
+        self.assertEqual(
+            properties["lockTimeout"]["maximum"],
+            implementation.MAX_LOCK_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(properties["lockTimeout"]["minimum"], 0)
+        self.assertEqual(properties["lockStaleSeconds"]["minimum"], 0)
+        self.assertTrue(transaction["annotations"]["destructiveHint"])
+
+        stat_tool = next(
+            tool
+            for tool in response["result"]["tools"]
+            if tool["name"] == "safe_edit_stat"
+        )
+        stat_properties = stat_tool["inputSchema"]["properties"]
+        self.assertEqual(stat_properties["lockTimeout"]["minimum"], 0)
+        self.assertEqual(
+            stat_properties["lockStaleSeconds"]["minimum"], 0
+        )
+
+    def test_resource_limits_match_runtime_and_tool_schemas(self):
+        response = server.handle_message(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        )
+        tools = {
+            tool["name"]: tool for tool in response["result"]["tools"]
+        }
+        stat_schema = tools["safe_edit_stat"]["inputSchema"]
+        transaction_schema = tools["safe_edit_transaction"]["inputSchema"]
+        stat_files = stat_schema["properties"]["files"]
+        transaction_files = transaction_schema["properties"]["files"]
+
+        self.assertEqual(stat_files["maxItems"], implementation.MAX_FILES)
+        self.assertEqual(
+            transaction_files["maxItems"], implementation.MAX_FILES
+        )
+        self.assertEqual(
+            stat_schema["properties"]["maxBytes"]["maximum"],
+            implementation.MAX_FILE_BYTES,
+        )
+        self.assertEqual(
+            transaction_schema["properties"]["maxBytes"]["maximum"],
+            implementation.MAX_FILE_BYTES,
+        )
+        stat_item_max = stat_files["items"]["oneOf"][1]["properties"][
+            "maxBytes"
+        ]["maximum"]
+        self.assertEqual(stat_item_max, implementation.MAX_FILE_BYTES)
+        operation_schema = transaction_files["items"]["properties"][
+            "operations"
+        ]
+        self.assertEqual(
+            operation_schema["maxItems"],
+            implementation.MAX_OPERATIONS_PER_FILE,
+        )
+        self.assertEqual(
+            transaction_schema["oneOf"][1],
+            {"required": ["transactionId"], "maxProperties": 1},
+        )
+
+        implementation._validate_stat_arguments(
+            {
+                "files": ["unused"] * implementation.MAX_FILES,
+                "maxBytes": implementation.MAX_FILE_BYTES,
+            }
+        )
+        with self.assertRaisesRegex(ToolInputError, "at most 128 items"):
+            implementation._validate_stat_arguments(
+                {"files": ["unused"] * (implementation.MAX_FILES + 1)}
+            )
+        with self.assertRaisesRegex(ToolInputError, "maxBytes must be at most"):
+            implementation._validate_stat_arguments(
+                {
+                    "files": ["unused"],
+                    "maxBytes": implementation.MAX_FILE_BYTES + 1,
+                }
+            )
+        with self.assertRaisesRegex(ToolInputError, "maxBytes must be at most"):
+            implementation._validate_stat_arguments(
+                {
+                    "files": [
+                        {
+                            "file": "unused",
+                            "maxBytes": implementation.MAX_FILE_BYTES + 1,
+                        }
+                    ]
+                }
+            )
+
+        def edit_item(index, operation_count):
+            return {
+                "file": f"unused-{index}",
+                "expectedSha256": "0" * 64,
+                "operations": [
+                    {"op": "append"} for _ in range(operation_count)
+                ],
+            }
+
+        implementation._validate_transaction_arguments(
+            {
+                "files": [
+                    edit_item(0, implementation.MAX_OPERATIONS_PER_FILE)
+                ],
+                "maxBytes": implementation.MAX_FILE_BYTES,
+            }
+        )
+        with self.assertRaisesRegex(ToolInputError, "at most 256 items"):
+            implementation._validate_transaction_arguments(
+                {
+                    "files": [
+                        edit_item(
+                            0, implementation.MAX_OPERATIONS_PER_FILE + 1
+                        )
+                    ]
+                }
+            )
+        aggregate = [
+            edit_item(index, implementation.MAX_OPERATIONS_PER_FILE)
+            for index in range(
+                implementation.MAX_TOTAL_OPERATIONS
+                // implementation.MAX_OPERATIONS_PER_FILE
+            )
+        ]
+        implementation._validate_transaction_arguments({"files": aggregate})
+        with self.assertRaisesRegex(
+            ToolInputError, "at most 1024 operations"
+        ):
+            implementation._validate_transaction_arguments(
+                {"files": aggregate + [edit_item(99, 1)]}
+            )
+        with self.assertRaisesRegex(ToolInputError, "at most 128 items"):
+            implementation._validate_transaction_arguments(
+                {
+                    "files": [
+                        edit_item(index, 1)
+                        for index in range(implementation.MAX_FILES + 1)
+                    ]
+                }
+            )
+        with self.assertRaisesRegex(ToolInputError, "transactionId only"):
+            implementation._validate_transaction_arguments(
+                {"transactionId": "tx_example", "dryRun": False}
+            )
 
     def test_transaction_validates_fuzzy_worker_options(self):
         for value in (0, 9, True, 2.5, "2"):
@@ -362,6 +519,228 @@ class SafeEditMcpTests(unittest.TestCase):
                             name: 1,
                         },
                     )
+
+    def test_tool_content_validation_returns_error_results(self):
+        valid_create = {
+            "file": str(self.root / "new.txt"),
+            "action": "create",
+            "text": "content\n",
+            "encoding": "utf-8",
+            "lineEnding": "lf",
+        }
+        invalid_calls = (
+            (
+                "safe_edit_preflight",
+                {"file": "example.txt", "unknown": True},
+            ),
+            (
+                "safe_edit_stat",
+                {
+                    "files": [
+                        {
+                            "file": "example.txt",
+                            "followSymlink": "false",
+                        }
+                    ]
+                },
+            ),
+            (
+                "safe_edit_stat",
+                {"files": [{"file": "example.txt", "unknown": 1}]},
+            ),
+            (
+                "safe_edit_transaction",
+                {
+                    "files": [
+                        {**valid_create, "followSymlink": "false"}
+                    ]
+                },
+            ),
+            (
+                "safe_edit_transaction",
+                {"files": [{**valid_create, "unknown": 1}]},
+            ),
+            (
+                "safe_edit_transaction",
+                {
+                    "files": [
+                        {
+                            "file": "edit.txt",
+                            "operations": [{"op": "append", "text": "x"}],
+                            "expectedSha256": "0" * 63,
+                        }
+                    ]
+                },
+            ),
+            (
+                "safe_edit_transaction",
+                {
+                    "files": [
+                        {
+                            "file": "edit.txt",
+                            "operations": ["not-an-object"],
+                            "expectedSha256": "0" * 64,
+                        }
+                    ]
+                },
+            ),
+            (
+                "safe_edit_transaction",
+                {
+                    "files": [
+                        {
+                            "file": "new.txt",
+                            "action": "create",
+                            "text": "content",
+                        }
+                    ]
+                },
+            ),
+            (
+                "safe_edit_transaction",
+                {"files": [valid_create], "unknown": True},
+            ),
+        )
+
+        for request_id, (name, arguments) in enumerate(
+            invalid_calls, start=100
+        ):
+            with self.subTest(name=name, arguments=arguments):
+                response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "tools/call",
+                        "params": {"name": name, "arguments": arguments},
+                    }
+                )
+                self.assertNotIn("error", response)
+                result = response["result"]
+                self.assertTrue(result["isError"])
+                payload = result["structuredContent"]
+                self.assertEqual(payload["failureReason"], "validation_error")
+                self.assertFalse(payload["written"])
+                self.assertEqual(
+                    json.loads(result["content"][0]["text"]), payload
+                )
+
+    def test_false_transaction_flags_are_not_truthiness_coerced(self):
+        item = {
+            "file": str(self.root / "new.txt"),
+            "action": "create",
+            "text": "content\n",
+            "encoding": "utf-8",
+            "lineEnding": "lf",
+            "followSymlink": False,
+            "forceWrite": False,
+            "allowNul": False,
+            "trimTrailingWhitespace": False,
+            "diff": False,
+        }
+        implementation._validate_transaction_arguments({"files": [item]})
+        args = implementation._fresh_args("transaction")
+        implementation._configure_match_options(args, {})
+        child = server.core.request_item_args(args, item, True)
+
+        self.assertFalse(child.follow_symlink)
+        self.assertFalse(child.force_write)
+        self.assertFalse(child.allow_nul)
+        self.assertFalse(child.trim_trailing_whitespace)
+        self.assertFalse(child.diff)
+
+    def test_transaction_rejects_non_finite_and_excessive_lock_numbers(self):
+        invalid_values = (
+            -1,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            1e999,
+            10 ** 1000,
+        )
+        for name in ("lockTimeout", "lockStaleSeconds"):
+            for value in invalid_values:
+                with self.subTest(name=name, value=value), self.assertRaisesRegex(
+                    ToolInputError, "finite non-negative number"
+                ):
+                    server.execute_tool(
+                        "safe_edit_stat",
+                        {"files": ["unused"], name: value},
+                    )
+
+        with self.assertRaisesRegex(ToolInputError, "must be at most"):
+            server.execute_tool(
+                "safe_edit_stat",
+                {
+                    "files": ["unused"],
+                    "lockTimeout": (
+                        implementation.MAX_LOCK_TIMEOUT_SECONDS + 1
+                    ),
+                },
+            )
+
+        target = self.root / "zero-lock-options.txt"
+        target.write_bytes(b"content\n")
+        result = server.execute_tool(
+            "safe_edit_stat",
+            {
+                "files": [str(target)],
+                "lockTimeout": 0,
+                "lockStaleSeconds": 0,
+            },
+        )
+        self.assertTrue(result["ok"])
+
+    def test_stdio_rejects_invalid_wire_json_and_continues(self):
+        ping = b'{"jsonrpc":"2.0","id":7,"method":"ping"}\n'
+        long_integer = (
+            b'{"jsonrpc":"2.0","id":'
+            + b"9" * (implementation.MAX_JSON_INTEGER_DIGITS + 1)
+            + b',"method":"ping"}\n'
+        )
+        deep_nesting = (
+            b"[" * 2000 + b"0" + b"]" * 2000 + b"\n"
+        )
+        invalid_packets = (
+            b'{"jsonrpc":"2.0","id":NaN,"method":"ping"}\n',
+            b'{"jsonrpc":"2.0","id":Infinity,"method":"ping"}\n',
+            b'{"jsonrpc":"2.0","id":-Infinity,"method":"ping"}\n',
+            b'{"jsonrpc":"2.0","id":1e999,"method":"ping"}\n',
+            long_integer,
+            deep_nesting,
+            b"\xff\n",
+        )
+
+        for packet in invalid_packets:
+            with self.subTest(packet=packet[:80]):
+                source = io.BytesIO(packet + ping)
+                target = io.BytesIO()
+                implementation.serve(source, target)
+                responses = [
+                    json.loads(line)
+                    for line in target.getvalue().splitlines()
+                ]
+                self.assertEqual(len(responses), 2)
+                self.assertEqual(responses[0]["error"]["code"], -32700)
+                self.assertIsNone(responses[0]["id"])
+                self.assertEqual(responses[1], {
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "result": {},
+                })
+
+    def test_wire_json_nesting_boundary_is_explicit(self):
+        at_limit = (
+            b"[" * implementation.MAX_JSON_NESTING
+            + b"0"
+            + b"]" * implementation.MAX_JSON_NESTING
+        )
+        too_deep = b"[" + at_limit + b"]"
+
+        self.assertIsInstance(
+            implementation._decode_wire_message(at_limit), list
+        )
+        with self.assertRaisesRegex(ValueError, "nesting is too deep"):
+            implementation._decode_wire_message(too_deep)
 
     def test_transaction_runs_fuzzy_workers(self):
         target = self.root / "fuzzy-workers.txt"
@@ -465,13 +844,545 @@ class SafeEditMcpTests(unittest.TestCase):
         self.assertEqual(first["files"][0]["sha256"], second["files"][0]["sha256"])
         self.assertEqual(loads_mock.call_count, 0)
 
+    def test_confirmed_dry_run_commits_prepared_plan_without_repreparing(self):
+        target = self.root / "prepared-confirm.txt"
+        target.write_bytes(b"before\n")
+        expected = hashlib.sha256(b"before\n").hexdigest()
+        arguments = {
+            "dryRun": True,
+            "files": [
+                {
+                    "file": str(target),
+                    "expectedSha256": expected,
+                    "operations": [
+                        {
+                            "op": "edit",
+                            "old": "before",
+                            "new": "after",
+                            "expected_count": 1,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch.object(
+            server.core,
+            "prepare_transaction",
+            wraps=server.core.prepare_transaction,
+        ) as prepare_mock, patch.object(
+            server.core,
+            "commit_prepared_transaction",
+            wraps=server.core.commit_prepared_transaction,
+        ) as commit_mock:
+            preview = server.execute_tool(
+                "safe_edit_transaction", arguments
+            )
+            self.assertEqual(prepare_mock.call_count, 1)
+            pending = implementation._PENDING_TRANSACTIONS[
+                preview["transactionId"]
+            ]
+            prepared = pending["prepared"]
+            self.assertIsInstance(prepared, server.core.PreparedTransaction)
+            self.assertIsNone(pending["argumentsJson"])
+            self.assertGreaterEqual(
+                prepared.retained_bytes, prepared.output_bytes
+            )
+
+            with patch.object(
+                server.core,
+                "prepare_transaction",
+                side_effect=AssertionError("confirmation must not reprepare"),
+            ):
+                applied = server.execute_tool(
+                    "safe_edit_transaction",
+                    {"transactionId": preview["transactionId"]},
+                )
+
+        self.assertEqual(commit_mock.call_count, 1)
+        self.assertTrue(applied["confirmed"])
+        self.assertTrue(applied["written"])
+        self.assertEqual(target.read_bytes(), b"after\n")
+
+    def test_pending_dry_run_does_not_deepcopy_payload(self):
+        target = self.root / "no-deepcopy.txt"
+        target.write_bytes(b"before\n")
+        expected = hashlib.sha256(b"before\n").hexdigest()
+
+        with patch(
+            "copy.deepcopy",
+            side_effect=AssertionError("pending payload must not be deep-copied"),
+        ):
+            preview = server.execute_tool(
+                "safe_edit_transaction",
+                {
+                    "dryRun": True,
+                    "files": [
+                        {
+                            "file": str(target),
+                            "expectedSha256": expected,
+                            "operations": [
+                                {
+                                    "op": "edit",
+                                    "old": "before",
+                                    "new": "after",
+                                    "expected_count": 1,
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+
+        self.assertIn(
+            preview["transactionId"], implementation._PENDING_TRANSACTIONS
+        )
+
+    def test_pending_snapshot_is_detached_from_caller_mutation(self):
+        arguments = {
+            "dryRun": True,
+            "files": [
+                {
+                    "file": "example.txt",
+                    "operations": [{"op": "append", "text": "original"}],
+                }
+            ],
+        }
+
+        transaction_id = implementation._remember_pending_transaction(
+            arguments
+        )
+        arguments["files"][0]["operations"][0]["text"] = "mutated"
+        arguments["files"].append({"file": "injected.txt"})
+        pending = implementation._consume_pending_transaction(transaction_id)
+        snapshot = json.loads(pending["argumentsJson"])
+
+        self.assertFalse(snapshot["dryRun"])
+        self.assertEqual(len(snapshot["files"]), 1)
+        self.assertEqual(
+            snapshot["files"][0]["operations"][0]["text"],
+            "original",
+        )
+
+    def test_pending_json_rejects_nan_and_preserves_lone_surrogates(self):
+        surrogate = chr(0xD800)
+        encoded = implementation._encode_pending_arguments(
+            {"dryRun": True, "files": [], "label": surrogate}
+        )
+        self.assertEqual(json.loads(encoded)["label"], surrogate)
+
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ToolInputError, "cannot be cached"
+            ):
+                implementation._encode_pending_arguments(
+                    {"dryRun": True, "files": [], "value": value}
+                )
+
+    def test_pending_prepared_plan_uses_real_retained_byte_admission(self):
+        target = self.root / "prepared-size.txt"
+        target.write_bytes(b"before\n" + (b"x" * (64 * 1024)))
+        expected = hashlib.sha256(target.read_bytes()).hexdigest()
+        arguments = {
+            "dryRun": True,
+            "files": [
+                {
+                    "file": str(target),
+                    "expectedSha256": expected,
+                    "operations": [
+                        {
+                            "op": "edit",
+                            "old": "before",
+                            "new": "after",
+                            "expected_count": 1,
+                        }
+                    ],
+                }
+            ],
+        }
+        preview = server.execute_tool("safe_edit_transaction", arguments)
+        prepared = implementation._PENDING_TRANSACTIONS[
+            preview["transactionId"]
+        ]["prepared"]
+
+        self.assertIsInstance(prepared, server.core.PreparedTransaction)
+        self.assertGreaterEqual(prepared.retained_bytes, prepared.output_bytes)
+
+        oversized = prepared._replace(
+            output_bytes=(
+                implementation.MAX_PENDING_PREPARED_OUTPUT_BYTES + 1
+            ),
+            retained_bytes=max(
+                prepared.retained_bytes,
+                implementation.MAX_PENDING_PREPARED_OUTPUT_BYTES + 1,
+            ),
+        )
+        inconsistent = prepared._replace(
+            retained_bytes=prepared.output_bytes - 1
+        )
+        for case, candidate in (
+            ("output-limit", oversized),
+            ("inconsistent-size", inconsistent),
+        ):
+            with self.subTest(case=case):
+                transaction_id = implementation._remember_pending_transaction(
+                    arguments, candidate
+                )
+                pending = implementation._PENDING_TRANSACTIONS[transaction_id]
+                self.assertIsNone(pending["prepared"])
+                self.assertIsInstance(pending["argumentsJson"], bytes)
+
+        admission_limit = (
+            prepared.retained_bytes
+            + implementation.PENDING_TRANSACTION_OVERHEAD_BYTES
+            - 1
+        )
+        with patch.object(
+            implementation,
+            "MAX_PENDING_TRANSACTION_BYTES",
+            admission_limit,
+        ):
+            transaction_id = implementation._remember_pending_transaction(
+                arguments, prepared
+            )
+        pending = implementation._PENDING_TRANSACTIONS[transaction_id]
+        self.assertIsNone(pending["prepared"])
+        self.assertIsInstance(pending["argumentsJson"], bytes)
+
+    def test_pending_single_item_limit_preserves_existing_tokens(self):
+        existing_id = implementation._remember_pending_transaction(
+            {"dryRun": True, "files": [{"file": "existing.txt"}]}
+        )
+
+        with patch.object(
+            implementation, "MAX_PENDING_TRANSACTION_BYTES", 512
+        ), self.assertRaisesRegex(ToolExecutionError, "cache limit"):
+            implementation._remember_pending_transaction(
+                {
+                    "dryRun": True,
+                    "files": [{"file": "new.txt", "text": "x" * 4096}],
+                }
+            )
+
+        self.assertIn(existing_id, implementation._PENDING_TRANSACTIONS)
+
+    def test_pending_ttl_expires_at_exact_boundary(self):
+        now = 1234.5
+        with patch.object(
+            implementation.time, "monotonic", return_value=now
+        ):
+            transaction_id = implementation._remember_pending_transaction(
+                {"dryRun": True, "files": [{"file": "example.txt"}]}
+            )
+        expires_at = implementation._PENDING_TRANSACTIONS[transaction_id][
+            "expiresAt"
+        ]
+
+        implementation._prune_pending_transactions(expires_at - 0.001)
+        self.assertIn(transaction_id, implementation._PENDING_TRANSACTIONS)
+        implementation._prune_pending_transactions(expires_at)
+        self.assertNotIn(transaction_id, implementation._PENDING_TRANSACTIONS)
+
+    def test_stale_confirmation_is_business_error_and_consumes_token(self):
+        target = self.root / "stale-confirmation.txt"
+        target.write_bytes(b"before\n")
+        expected = hashlib.sha256(b"before\n").hexdigest()
+        preview = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "dryRun": True,
+                "files": [
+                    {
+                        "file": str(target),
+                        "expectedSha256": expected,
+                        "operations": [
+                            {
+                                "op": "edit",
+                                "old": "before",
+                                "new": "after",
+                                "expected_count": 1,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        transaction_id = preview["transactionId"]
+        target.write_bytes(b"changed externally\n")
+
+        response = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "tools/call",
+                "params": {
+                    "name": "safe_edit_transaction",
+                    "arguments": {"transactionId": transaction_id},
+                },
+            }
+        )
+
+        self.assertNotIn("error", response)
+        self.assertTrue(response["result"]["isError"])
+        payload = response["result"]["structuredContent"]
+        self.assertEqual(payload["error"]["type"], "hash_mismatch")
+        self.assertNotIn(transaction_id, implementation._PENDING_TRANSACTIONS)
+        retry = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": {
+                    "name": "safe_edit_transaction",
+                    "arguments": {"transactionId": transaction_id},
+                },
+            }
+        )
+        self.assertNotIn("error", retry)
+        self.assertTrue(retry["result"]["isError"])
+        retry_payload = retry["result"]["structuredContent"]
+        self.assertEqual(retry_payload["failureReason"], "execution_error")
+        self.assertIn("unknown or expired", retry_payload["error"]["message"])
+        self.assertFalse(retry_payload["written"])
+
+    def test_symlink_target_change_rejects_confirmation(self):
+        first = self.root / "symlink-first.txt"
+        second = self.root / "symlink-second.txt"
+        link = self.root / "symlink-target.txt"
+        first.write_bytes(b"before\n")
+        second.write_bytes(b"before\n")
+        transaction_target = link
+        follow_symlink = True
+        confirmation_context = nullcontext()
+        try:
+            link.symlink_to(first)
+        except (NotImplementedError, OSError):
+            transaction_target = first
+            follow_symlink = False
+            confirmation_context = patch.object(
+                server.core,
+                "resolve_target_path",
+                return_value=second,
+            )
+
+        expected = hashlib.sha256(b"before\n").hexdigest()
+        preview = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "dryRun": True,
+                "files": [
+                    {
+                        "file": str(transaction_target),
+                        "followSymlink": follow_symlink,
+                        "expectedSha256": expected,
+                        "operations": [
+                            {
+                                "op": "edit",
+                                "old": "before",
+                                "new": "after",
+                                "expected_count": 1,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        transaction_id = preview["transactionId"]
+        if link.is_symlink():
+            link.unlink()
+            link.symlink_to(second)
+
+        with confirmation_context:
+            response = server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 43,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "safe_edit_transaction",
+                        "arguments": {"transactionId": transaction_id},
+                    },
+                }
+            )
+
+        self.assertTrue(response["result"]["isError"])
+        payload = response["result"]["structuredContent"]
+        self.assertIn("canonical path changed", payload["error"]["message"])
+        self.assertNotIn(transaction_id, implementation._PENDING_TRANSACTIONS)
+        self.assertEqual(first.read_bytes(), b"before\n")
+        self.assertEqual(second.read_bytes(), b"before\n")
+
+    def test_pending_transactions_enforce_aggregate_byte_budget(self):
+        target = self.root / "pending-budget.txt"
+        target.write_bytes(b"before\n")
+        expected = hashlib.sha256(b"before\n").hexdigest()
+        arguments = {
+            "dryRun": True,
+            "files": [
+                {
+                    "file": str(target),
+                    "expectedSha256": expected,
+                    "operations": [
+                        {
+                            "op": "edit",
+                            "old": "before",
+                            "new": "after",
+                            "expected_count": 1,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        sample = server.execute_tool("safe_edit_transaction", arguments)
+        sample_size = implementation._PENDING_TRANSACTIONS[
+            sample["transactionId"]
+        ]["sizeBytes"]
+        implementation._PENDING_TRANSACTIONS.clear()
+        total_limit = max(1, sample_size * 2 - 1)
+
+        with patch.object(
+            implementation, "MAX_PENDING_TOTAL_BYTES", total_limit
+        ), patch.object(implementation, "MAX_PENDING_TRANSACTIONS", 32):
+            first_id = server.execute_tool(
+                "safe_edit_transaction", arguments
+            )["transactionId"]
+            with self.assertRaisesRegex(
+                ToolExecutionError, "cache is full"
+            ):
+                server.execute_tool("safe_edit_transaction", arguments)
+
+        self.assertLessEqual(
+            sum(
+                item["sizeBytes"]
+                for item in implementation._PENDING_TRANSACTIONS.values()
+            ),
+            total_limit,
+        )
+        self.assertIn(first_id, implementation._PENDING_TRANSACTIONS)
+        confirmed = server.execute_tool(
+            "safe_edit_transaction", {"transactionId": first_id}
+        )
+        self.assertTrue(confirmed["confirmed"])
+        self.assertEqual(target.read_bytes(), b"after\n")
+
+    def test_pending_count_limit_preserves_existing_token(self):
+        first_id = implementation._remember_pending_transaction(
+            {"dryRun": True, "files": [{"file": "existing.txt"}]}
+        )
+        with patch.object(
+            implementation, "MAX_PENDING_TRANSACTIONS", 1
+        ), self.assertRaisesRegex(ToolExecutionError, "cache is full"):
+            implementation._remember_pending_transaction(
+                {"dryRun": True, "files": [{"file": "new.txt"}]}
+            )
+
+        self.assertIn(first_id, implementation._PENDING_TRANSACTIONS)
+
+    def test_stdio_writer_avoids_concatenating_large_packet_and_newline(self):
+        class RecordingStream:
+            def __init__(self):
+                self.writes = []
+                self.flushes = 0
+
+            def write(self, value):
+                self.writes.append(value)
+
+            def flush(self):
+                self.flushes += 1
+
+        stream = RecordingStream()
+        implementation._write_message(
+            stream,
+            {"jsonrpc": "2.0", "id": 1, "result": {"text": "x" * 4096}},
+        )
+
+        self.assertEqual(len(stream.writes), 2)
+        self.assertEqual(stream.writes[1], b"\n")
+        self.assertEqual(stream.flushes, 1)
+        self.assertEqual(json.loads(stream.writes[0])["id"], 1)
+
+    def test_stdio_reader_checks_whitespace_without_strip_copy(self):
+        class NoStripBytes(bytes):
+            def strip(self, *args, **kwargs):
+                raise AssertionError("serve must not copy packets with strip()")
+
+        class Source:
+            def __init__(self):
+                self.lines = [
+                    NoStripBytes(
+                        b'{"jsonrpc":"2.0","id":7,"method":"ping"}\n'
+                    ),
+                    b"",
+                ]
+
+            def readline(self, _limit):
+                return self.lines.pop(0)
+
+        class Target:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, value):
+                self.writes.append(value)
+
+            def flush(self):
+                pass
+
+        target = Target()
+        implementation.serve(Source(), target)
+        response = json.loads(b"".join(target.writes))
+        self.assertEqual(response["id"], 7)
+        self.assertEqual(response["result"], {})
+
+    def test_filesystem_capability_cache_survives_fresh_mcp_args(self):
+        target = self.root / "cached-capability.txt"
+        target.write_bytes(b"content\n")
+
+        with patch.object(
+            server.core,
+            "check_fs_capability",
+            wraps=server.core.check_fs_capability,
+        ) as capability_mock:
+            server.execute_tool("safe_edit_stat", {"files": [str(target)]})
+            server.execute_tool("safe_edit_stat", {"files": [str(target)]})
+
+        self.assertEqual(capability_mock.call_count, 1)
+
+    def test_repository_version_entry_does_not_import_editing_core(self):
+        code = (
+            "import runpy,sys\n"
+            f"sys.argv = [{str(SERVER_PATH)!r}, '--version']\n"
+            "try:\n"
+            f"    runpy.run_path({str(SERVER_PATH)!r}, run_name='__main__')\n"
+            "except SystemExit as exc:\n"
+            "    print('exit=' + str(exc.code))\n"
+            "print('core-loaded=' + str('safe_edit' in sys.modules))\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=10,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("1.2.0", completed.stdout)
+        self.assertIn("exit=0", completed.stdout)
+        self.assertIn("core-loaded=False", completed.stdout)
+
     def test_stdio_initialize_and_tool_discovery(self):
         messages = [
             {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "initialize",
-                "params": {"protocolVersion": "2025-11-25"},
+                "params": _initialize_params(),
+            },
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
             },
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
             {"jsonrpc": "2.0", "id": 3, "method": "ping"},
@@ -502,7 +1413,7 @@ class SafeEditMcpTests(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "initialize",
-                "params": {"protocolVersion": "2024-11-05"},
+                "params": _initialize_params("2024-11-05"),
             }
         )
         unsupported = server.handle_message(
@@ -510,7 +1421,15 @@ class SafeEditMcpTests(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "initialize",
-                "params": {"protocolVersion": "2099-01-01"},
+                "params": _initialize_params("2099-01-01"),
+            }
+        )
+        retired = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "initialize",
+                "params": _initialize_params("2025-03-26"),
             }
         )
 
@@ -520,6 +1439,53 @@ class SafeEditMcpTests(unittest.TestCase):
         self.assertEqual(
             unsupported["result"]["protocolVersion"], "2025-11-25"
         )
+        self.assertEqual(
+            retired["result"]["protocolVersion"], "2025-11-25"
+        )
+        self.assertNotIn(
+            "2025-03-26", implementation.SUPPORTED_PROTOCOL_VERSIONS
+        )
+
+    def test_initialize_requires_protocol_capabilities_and_client_info(self):
+        invalid_params = (
+            {},
+            {
+                "protocolVersion": "",
+                "capabilities": {},
+                "clientInfo": {"name": "client", "version": "1.0"},
+            },
+            {
+                "protocolVersion": "2025-11-25",
+                "capabilities": [],
+                "clientInfo": {"name": "client", "version": "1.0"},
+            },
+            {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": [],
+            },
+            {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "", "version": "1.0"},
+            },
+            {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "client", "version": 1},
+            },
+        )
+        for params in invalid_params:
+            with self.subTest(params=params):
+                response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 4,
+                        "method": "initialize",
+                        "params": params,
+                    }
+                )
+                self.assertEqual(response["error"]["code"], -32602)
 
     def test_non_object_params_return_json_rpc_error(self):
         response = server.handle_message(
@@ -532,6 +1498,276 @@ class SafeEditMcpTests(unittest.TestCase):
         )
         self.assertEqual(response["error"]["code"], -32602)
 
+    def test_json_rpc_rejects_invalid_envelopes_and_ids(self):
+        invalid_messages = (
+            {"id": 1, "method": "ping"},
+            {"jsonrpc": "1.0", "id": 1, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 1, "method": 7},
+            {"method": "ping"},
+            {"jsonrpc": "1.0", "method": "ping"},
+            {"jsonrpc": "2.0", "method": 7},
+            {"jsonrpc": "2.0", "id": True, "method": "ping"},
+            {"jsonrpc": "2.0", "id": None, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 1.5, "method": "ping"},
+        )
+        for message in invalid_messages:
+            with self.subTest(message=message):
+                response = server.handle_message(message)
+                self.assertEqual(response["error"]["code"], -32600)
+                self.assertIsNone(response["id"])
+
+    def test_notifications_never_execute_request_methods_or_respond(self):
+        notifications = (
+            {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": "safe_edit_preflight",
+                    "arguments": {},
+                },
+            },
+            {"jsonrpc": "2.0", "method": "ping"},
+            {"jsonrpc": "2.0", "method": "tools/call", "params": []},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "method": "unknown/notification"},
+        )
+        with patch.object(implementation, "execute_tool") as execute_mock:
+            for message in notifications:
+                with self.subTest(message=message):
+                    self.assertIsNone(server.handle_message(message))
+        execute_mock.assert_not_called()
+
+    def test_unknown_tool_and_malformed_calls_are_invalid_params(self):
+        calls = (
+            {
+                "name": "does_not_exist",
+                "arguments": {},
+            },
+            {"name": 7, "arguments": {}},
+            {"name": "safe_edit_stat", "arguments": []},
+            {"name": "safe_edit_stat", "arguments": None},
+            {"name": "safe_edit_stat", "arguments": "files"},
+        )
+        for params in calls:
+            with self.subTest(params=params):
+                response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "request-id",
+                        "method": "tools/call",
+                        "params": params,
+                    }
+                )
+                self.assertEqual(response["error"]["code"], -32602)
+                self.assertEqual(response["id"], "request-id")
+
+    def test_safe_edit_error_preserves_core_write_state_in_tool_result(self):
+        error = implementation.core.SafeEditError("commit failed")
+        core_payload = {
+            "ok": False,
+            "command": "transaction",
+            "error": {
+                "type": "rollback_error",
+                "message": "commit failed",
+                "reason": "rollback_error",
+            },
+            "failureReason": "rollback_error",
+            "written": True,
+            "rolledBack": False,
+            "partialWrite": True,
+            "rollbackConflict": True,
+        }
+        with patch.object(
+            implementation, "execute_tool", side_effect=error
+        ), patch.object(
+            implementation.core,
+            "build_error_payload",
+            return_value=core_payload,
+        ) as build_payload:
+            response = server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 8,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "safe_edit_transaction",
+                        "arguments": {},
+                    },
+                }
+            )
+
+        self.assertNotIn("error", response)
+        result = response["result"]
+        self.assertTrue(result["isError"])
+        payload = result["structuredContent"]
+        self.assertEqual(
+            json.loads(result["content"][0]["text"]), payload
+        )
+        self.assertTrue(payload["written"])
+        self.assertFalse(payload["rolledBack"])
+        self.assertTrue(payload["partialWrite"])
+        self.assertTrue(payload["rollbackConflict"])
+        self.assertEqual(payload["transport"], "mcp-structured")
+        build_payload.assert_called_once_with(
+            error, command="safe_edit_transaction"
+        )
+
+    def test_validation_tool_failure_remains_non_written_error(self):
+        result = implementation._tool_failure(
+            ValueError("invalid input"), "safe_edit_stat"
+        )
+
+        self.assertTrue(result["isError"])
+        payload = result["structuredContent"]
+        self.assertEqual(
+            json.loads(result["content"][0]["text"]), payload
+        )
+        self.assertFalse(payload["written"])
+        self.assertEqual(payload["failureReason"], "validation_error")
+        self.assertEqual(payload["transport"], "mcp-structured")
+
+    def test_large_tool_failure_uses_bounded_compatibility_text(self):
+        marker = "failure-marker-"
+        error = ToolExecutionError(
+            marker + "x" * implementation.MAX_COMPAT_TEXT_BYTES
+        )
+        result = implementation._tool_failure(error, "safe_edit_transaction")
+        compatibility = json.loads(result["content"][0]["text"])
+
+        self.assertTrue(result["isError"])
+        self.assertTrue(compatibility["truncated"])
+        self.assertEqual(
+            compatibility["compatibilityTextLimitBytes"],
+            implementation.MAX_COMPAT_TEXT_BYTES,
+        )
+        self.assertNotIn(marker, result["content"][0]["text"])
+        self.assertIn(marker, result["structuredContent"]["error"]["message"])
+        self.assertLess(len(result["content"][0]["text"]), 1024)
+
+    def test_unexpected_tool_exception_is_internal_error(self):
+        with patch.object(
+            implementation,
+            "execute_tool",
+            side_effect=RuntimeError("sensitive detail"),
+        ):
+            response = server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "safe_edit_preflight",
+                        "arguments": {},
+                    },
+                }
+            )
+
+        self.assertEqual(response["error"]["code"], -32603)
+        self.assertEqual(response["error"]["message"], "Internal error")
+        self.assertNotIn("result", response)
+
+    def test_valid_request_execution_state_error_is_tool_result(self):
+        with patch.object(
+            implementation,
+            "execute_tool",
+            side_effect=ToolExecutionError("pending cache is full"),
+        ):
+            response = server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "safe_edit_transaction",
+                        "arguments": {
+                            "files": [
+                                {
+                                    "file": "new.txt",
+                                    "text": "content",
+                                    "encoding": "utf-8",
+                                    "lineEnding": "lf",
+                                }
+                            ]
+                        },
+                    },
+                }
+            )
+
+        self.assertNotIn("error", response)
+        self.assertTrue(response["result"]["isError"])
+        payload = response["result"]["structuredContent"]
+        self.assertEqual(payload["failureReason"], "execution_error")
+        self.assertFalse(payload["written"])
+
+    def test_success_content_text_contains_structured_json(self):
+        summary = {
+            "ok": True,
+            "command": "preflight",
+            "dryRun": True,
+            "written": False,
+            "message": "兼容",
+        }
+        with patch.object(
+            implementation, "execute_tool", return_value=summary
+        ):
+            response = server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 11,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "safe_edit_preflight",
+                        "arguments": {},
+                    },
+                }
+            )
+
+        result = response["result"]
+        self.assertEqual(
+            json.loads(result["content"][0]["text"]),
+            result["structuredContent"],
+        )
+
+    def test_large_structured_result_uses_bounded_compatibility_text(self):
+        marker = "large-diff-marker-"
+        summary = {
+            "ok": True,
+            "command": "transaction",
+            "fileCount": 1,
+            "written": False,
+            "files": [
+                {
+                    "file": "large.txt",
+                    "diff": marker
+                    + ("x" * implementation.MAX_COMPAT_TEXT_BYTES),
+                }
+            ],
+        }
+
+        with patch.object(
+            implementation,
+            "_json_bytes",
+            wraps=implementation._json_bytes,
+        ) as json_bytes:
+            result = implementation._tool_result(summary)
+        compatibility = json.loads(result["content"][0]["text"])
+
+        self.assertFalse(
+            any(call.args and call.args[0] is summary for call in json_bytes.call_args_list)
+        )
+        self.assertIs(result["structuredContent"], summary)
+        self.assertTrue(compatibility["truncated"])
+        self.assertEqual(compatibility["ok"], True)
+        self.assertEqual(compatibility["command"], "transaction")
+        self.assertEqual(compatibility["fileCount"], 1)
+        self.assertEqual(compatibility["written"], False)
+        self.assertEqual(
+            compatibility["compatibilityTextLimitBytes"],
+            implementation.MAX_COMPAT_TEXT_BYTES,
+        )
+        self.assertNotIn(marker, result["content"][0]["text"])
+        self.assertLess(len(result["content"][0]["text"]), 1024)
+
     def test_repository_launcher_reports_package_version(self):
         completed = subprocess.run(
             [sys.executable, str(SERVER_PATH), "--version"],
@@ -541,6 +1777,66 @@ class SafeEditMcpTests(unittest.TestCase):
             check=True,
         )
         self.assertEqual(completed.stdout.strip(), "1.2.0")
+
+    def test_benchmark_validates_every_timed_result(self):
+        benchmark_path = REPO_ROOT / "tests" / "perf" / "benchmark.py"
+        spec = importlib.util.spec_from_file_location(
+            "safe_edit_benchmark_test", benchmark_path
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        benchmark = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(benchmark)
+        outputs = iter([1, 2, 3])
+        validated = []
+
+        result = benchmark.measure(
+            "validation-test",
+            lambda: next(outputs),
+            input_bytes=0,
+            iterations=3,
+            warmups=0,
+            validate=validated.append,
+            trace_memory=False,
+        )
+
+        self.assertEqual(validated, [1, 2, 3])
+        self.assertEqual(result["iterations"], 3)
+
+    def test_benchmark_confirm_does_not_reprepare_across_iterations(self):
+        benchmark = REPO_ROOT / "tests" / "perf" / "benchmark.py"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(benchmark),
+                "--sizes-mib",
+                "0.004",
+                "--iterations",
+                "2",
+                "--warmups",
+                "1",
+                "--context-matches",
+                "10",
+                "--batch-operations",
+                "4",
+                "--json",
+            ],
+            cwd=self.root,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=60,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        confirm = next(
+            item
+            for item in payload["results"]
+            if item["name"] == "core.transaction-confirm-revalidate"
+        )
+        self.assertEqual(confirm["iterations"], 2)
+        self.assertFalse(confirm["replanned"])
 
 
 if __name__ == "__main__":

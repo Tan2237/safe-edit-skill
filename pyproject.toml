@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=77.0.3", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,14 +8,14 @@ version = "1.2.0"
 description = "Format-preserving safe text edits through CLI and persistent MCP tools"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
   { name = "Tan2237", email = "tanyu2237@outlook.com" }
 ]
 keywords = ["mcp", "safe-edit", "encoding", "atomic-write"]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent"
 ]
 dependencies = []
@@ -26,7 +26,7 @@ Repository = "https://github.com/Tan2237/safe-edit-skill"
 
 [project.scripts]
 safe-edit = "safe_edit_mcp.cli:main"
-safe-edit-mcp = "safe_edit_mcp.server:main"
+safe-edit-mcp = "safe_edit_mcp.cli:mcp_main"
 
 [tool.setuptools]
 package-dir = { "" = "skills/safe-edit" }

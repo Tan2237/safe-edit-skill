@@ -6,18 +6,18 @@
 
 ## 特性
 
-- 单文件 Python 标准库实现，Windows/Linux/macOS 通用。
+- 单文件 Python 标准库实现，Windows/Linux/macOS 通用；native binding 按需解析并在进程内复用，handle、buffer 和错误状态仍按调用创建。
 - `inspect` 只检查不写入，可输出编码、BOM、行尾统计、文件大小、行数、NUL 字符和权限位。
 - `stat` 简洁摘要，包含编码、BOM、行尾统计、文件大小、行数，以及推荐的编辑策略（`editStrategy`）。
-- `stat-many` 在一个进程内检查多个文件，并按父目录复用文件系统能力探测。
+- `stat-many` 在一个进程内检查多个文件，并用随机临时名探测能力；同父目录结果短期合并，temp/lock 标志共用一次 probe；结果只是 best-effort 观测。
 - `preflight` 在写入前报告 Python、stdin、Base64、临时目录、锁和目标目录能力。
-- `transaction` 接收结构化多文件请求，先全量预演，再按稳定顺序加锁写入；失败时回滚已完成的写入。
+- `transaction` 接收结构化多文件请求，先生成不可变 prepared plan，再按稳定顺序加锁并统一重验路径、身份与哈希后写入；失败时执行冲突安全的尽力回滚。
 - 结构化事务会按检测到的文件行尾自动兼容 LF/CRLF 多行目标；无需为纯 EOL 差异开启 `autoMatch`。
-- MCP dry-run 默认返回有上限的精简 diff 和一次性 `transactionId`，确认时无需重传大 payload。
+- MCP dry-run 默认返回有上限的精简 diff；只有预演结果成功进入有界缓存时才签发有效期最长 10 分钟的一次性 `transactionId`，确认时无需重传大 payload。
 - 成功写入会返回新 `sha256`，可直接作为下一轮 `expectedSha256`；`old == new` 操作会明确跳过。
 - Codex 插件及跨客户端安装器提供常驻 MCP 工具，直接接收结构化正文，避免 Base64、Windows argv 限制和重复启动 Python。
 - `create` 受控新建任务成果文件：拒绝覆盖、要求父目录已存在，并强制显式选择编码和行尾。
-- `convert` 显式转换编码、行尾、最终换行，或清理尾随空白；普通编辑默认仍保留原格式。
+- `convert` 显式转换编码、行尾、最终换行，或清理尾随空白；ASCII space/tab 优先走分阶段短运行快路，复杂或残留模式回退 regex；普通编辑仍保留原格式。
 - 自动检测并保留 `utf-8`、`utf-8-bom`、`gbk`、UTF-16 BOM，以及清晰 NUL 模式下的无 BOM UTF-16。
 - 支持手动指定 `shift-jis`、`big5`、`latin-1`、`utf-16-le`、`utf-16-be`。
 - 自动检测并保留 CRLF、LF、CR 行尾风格。
@@ -30,7 +30,8 @@
 - **上下文消歧**：`--context-before` / `--context-after` 辅助多匹配消歧。
 - **SEARCH/REPLACE 输入格式**：`--diff-input`、`--diff-input-file`、`--diff-input-stdin`、`--diff-input-base64` 支持 Agent 友好的 diff 格式输入。
 - 支持备份目录/后缀自定义，以及 stale lock 自动清理。
-- 同目录临时文件写入、原子替换、写后字节校验，并带有协作锁以降低并发写入风险。
+- 同目录临时文件写入、原子替换；create/直接单文件写入后以 1 MiB 分块严格比对全部字节和 EOF；诊断 SHA 仅在稳定性复验通过时返回，分块且最多读取 50 MiB；协作锁用于降低并发写入风险。
+- v2 锁在整个编辑生命周期持有 kernel stripe；legacy marker 继续使用旧 namespace 以兼容 v1，但混跑时仍保留旧协议固有的窄竞态窗口。
 - 如果变换后的字节和原文件完全一致，默认跳过写入，避免无意义的 mtime 和 Git 状态变化。
 - `--explain-match-failure` 匹配失败时显示详细诊断，可视化空白差异。
 - `--anchor-pattern` 锚点定位替换，配合 `--offset-start/end` 实现相对行号定位。
@@ -89,12 +90,14 @@ codex plugin add safe-edit-skill@safe-edit
 - `safe_edit_preflight`：检查 Python、临时目录、锁和目标目录能力。
 - `safe_edit_stat`：一次检查一个或多个文件，返回 `editStrategy` 与 SHA-256。
 - `safe_edit_transaction`：直接接收 `old`、`new`、`text` 和 `operations`，
-  完成多文件预演、加锁写入和失败回滚；dry-run 返回的一次性
-  `transactionId` 可在 10 分钟内直接确认。
+  dry-run 先生成不可变 prepared plan；只有结果成功进入有界缓存时才返回一次性
+  `transactionId`，有效期最长 10 分钟。
 
 推荐一次批量 `stat`，随后一次批量 transaction。MCP 服务是常驻进程，
 只导入一次编辑内核并只构建一次参数解析器；普通热路径不启动子进程（大型 fuzzy 查找除外），
 不会把已结构化请求再次 JSON 解码，也不会产生 Base64 的约 33% 体积膨胀。
+大型、相互独立的 exact batch 只有在能严格证明与有序逐操作语义等价时才会合并为
+单次扫描；无法完成证明时会自动回退到常规逐操作路径。
 
 结构化 transaction 示例：
 
@@ -114,21 +117,35 @@ codex plugin add safe-edit-skill@safe-edit
 }
 ```
 
-dry-run 成功时会为每个文件返回精简 `diff`、`resultSha256`，并在
-顶层返回一次性事务 ID。正式执行只需：
+dry-run 会先生成不可变 prepared plan，并为每个文件返回精简 `diff` 与
+`resultSha256`。只有计划成功进入有界缓存时，顶层才会返回一次性事务 ID；
+缓存已满时会拒绝新的 dry-run admission，不会逐出尚未过期的已签发 token。
+正式执行只需：
 
 ```json
 {"transactionId": "tx_FROM_DRY_RUN"}
 ```
 
-确认 ID 只可消费一次、默认 10 分钟过期；目标文件仍会用原
-`expectedSha256` 再校验。也可以继续用 `dryRun: false` 直接提交完整请求。
+确认 ID 只可消费一次、有效期最长 10 分钟。确认时先取得协作锁，再统一重验
+canonical path、parent/target identity 与原始哈希。缓存的是 prepared plan 时，
+确认不会重跑解码、匹配或编辑计算；若计划超过 MCP prepared 保留阈值，则缓存
+有界 JSON 请求，确认时会重新 prepare。也可以用 `dryRun: false` 直接提交完整请求。
 成功结果中每个文件的 `sha256` 是落盘后的新 guard，后续迭代无需重新
 `safe_edit_stat`。
 
 结构化事务默认启用 `autoEolMatch`：例如 CRLF 文件可直接接受 LF 多行
 `old`，但不会同时放宽缩进或其它空白；如需严格 EOL 匹配可显式设为
 `false`。
+
+MCP 单次请求的 `maxBytes` 上限为 128 MiB；每次最多 128 个文件、每个文件
+最多 256 个操作、合计最多 1,024 个操作，JSON 最大嵌套深度为 128。服务端
+以 `2025-11-25` 为当前稳定协议版本，同时兼容 `2025-06-18` 和
+`2024-11-05`；不宣称支持 `2025-03-26` 的 batch 过渡版本。
+
+对于已经识别的工具，字段、类型、SHA-256、限额或执行状态错误会作为正常
+`tools/call` 响应返回，并设置 `result.isError: true`。无效 JSON-RPC envelope、
+无效 request id、未知工具名或非对象 `params`/`arguments` 属于协议层错误，
+返回对应 JSON-RPC error；二者不应混为一类。
 
 CLI 保留为未加载插件时的兼容回退。
 
@@ -693,17 +710,54 @@ python safe_edit.py transaction --request-stdin --json
 `expectedSha256`；新文件仍拒绝覆盖并要求显式 `encoding` 和
 `lineEnding`。
 
-事务会在持锁后预演全部文件，并复用预演生成的最终字节作为提交计划；提交前仅重新
-读取目标以拦截忽略协作锁的并发写入，不会重复解码、匹配和计算编辑。进程内写入失败
-时会恢复原字节、删除本事务已创建的文件。结构化 MCP 的 dry-run 会把原请求短期缓存在
-常驻进程中，返回 `transactionId`；确认调用无需再次传输或解析大 payload，
-但仍会重新预校验并执行 SHA 并发保护。dry-run 未显式设置 `diff` 时返回最多
-80 行、12,000 字符的精简 diff；显式 `diff: true` 仍返回完整 diff。
+事务先生成不可变 prepared plan；提交阶段取得协作锁后统一重验 canonical path、
+parent/target identity 和输入哈希，再直接写入计划字节，不重跑解码、匹配或编辑计算。
+结构化 MCP 优先缓存该计划；超过 prepared 保留阈值时才缓存有界 JSON 请求并在
+确认时重新 prepare。dry-run 未显式设置 `diff` 时返回最多 80 行、12,000 字符的
+精简 diff；显式 `diff: true` 仍返回完整 diff。
+
+每个输出先在已 pin 的父目录内写入随机隐藏 sibling stage，完成全部字节写入、文件
+`fsync` 和内容复验后才进入发布步骤。编辑已有文件时，事务先用 no-replace 操作把
+当前 basename claim 到随机 quarantine，复验 identity、SHA-256、mode、size 和
+mtime，再用 no-replace 操作把完整 stage 安装为目标 basename；创建文件只会安装
+已经完整复验的 stage。所有编辑的原始 quarantine 会保留到全部 planned mutation
+完成 post-install 复验，且全部 pinned 父目录通过最终 validation sweep。两个
+no-replace 步骤之间，目标 basename 可能短暂不存在。
+
+rollback 同样先把事务输出 no-replace claim 到新的 quarantine，验证它仍是本事务
+写入的 generation，才 no-replace 恢复原始 generation 或删除本事务创建的文件；
+它不会覆盖已经出现的未知或外部目标。Linux 需要 `renameat2(RENAME_NOREPLACE)`，
+macOS 需要 `renameatx_np(RENAME_EXCL)`，Windows 使用不允许覆盖的
+`MoveFileExW`。平台或文件系统缺少所需 primitive 时会安全失败，而不会退回到
+可能覆盖其它 generation 的实现。
+
+对每个将要写入的文件，内存 journal entry（不是持久化 WAL）会在该文件首次 staging
+syscall 前创建。它预分配随机 stage 和 rollback-quarantine basename；编辑操作还会
+预分配 original-quarantine basename。每个可能改变文件或目录状态的 syscall 前，
+journal 先进入对应的 `ATTEMPT_*` phase。调用结果不明、捕获到进程内 control-flow
+exception 或后续复验失败时，恢复逻辑会重新探测相关端点，按 marker 盘点 stage、
+target 和 quarantine，并按相反顺序回滚已确认写入。只有观测到的 generation 经
+identity、SHA-256、mode、size 和 mtime 证明归属后，恢复逻辑才会尝试清理或恢复；
+下述同权限竞态边界仍适用。
+
+全部 planned mutation 完成 post-install 复验，且全部 pinned 父目录通过最终
+validation sweep 后，原始 quarantine 才进入 `ATTEMPT_FINALIZE` 清理并同步父目录。
+提交成功时的清理或目录同步问题会出现在 `cleanupWarnings`。如果 finalization 中断，
+已删除、被替换或状态不明的原始 generation 不会被误报为已回滚；状态字段和
+`rollbackErrors` 会按实际盘点结果报告 partial/uncertain outcome。
+
+如果 publish、盘点、rollback 或 finalization 的结果无法证明，safe-edit 会优先保留
+stage/quarantine，不会有意删除未经验证或 unknown 的对象。错误结果中凡涉及 recovery
+artifact 的 `rollbackErrors` 条目都使用固定 label：`artifact basename=...; pinned
+parent identity=(device=..., inode=..., file_type=...); best-effort path=...`。恢复以 pinned
+parent 和 basename 为准；path 仅供定位，父目录被重新绑定后可能已过时。`written`、
+`rolledBack`、`partialWrite` 和 `rollbackConflict` 用于判断真实结果。
 
 每个预演文件返回计划值 `resultSha256`；每个成功落盘或无字节变化的文件返回
 当前 `sha256`。字面编辑中 `old` 与 `new` 完全相同时，操作结果为
 `skipped: true`、`reason: old_equals_new`。返回的 `atomicity` 为
-`prevalidated-with-rollback`；这不是跨文件系统或断电级原子提交。
+`prevalidated-with-rollback`，`crashAtomic` 为 `false`；事务不保证进程崩溃、
+断电、跨文件系统或跨文件的全局原子提交。
 
 ## 编码注意事项
 
@@ -722,7 +776,7 @@ python -m py_compile skills/safe-edit/safe_edit.py
 python -m unittest discover -s tests -v
 ```
 
-GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
+GitHub Actions 在 Windows、Linux、macOS 上分别运行 Python 3.9 与最新 Python，共 6 个组合；每个组合都会执行源码编译、完整测试、安装包、installed import、CLI preflight 和 stdio MCP initialize handshake，性能 smoke 仅在 3 个最新 Python 组合运行。
 
 ## 常用选项
 
@@ -789,9 +843,14 @@ GitHub Actions 会在 Windows、Linux、macOS 上运行同一套测试。
 ## 边界
 
 - 不适合二进制文件和复杂结构化文件格式。
-- 原子替换通常会生成新的文件对象；不保证保留硬链接关系。
+- 事务的 no-replace publish 与 generation 复验会在普通并发写者修改目标 basename 时安全冲突，并保留无法证明归属的外部对象；协作锁只保证遵守同一锁协议的参与者互斥。
+- POSIX 没有可移植的 unlink-by-inode CAS。随机内部 `.txn` 名称的清理不承诺抵御拥有相同目录写权限的 deliberate name hijack；不确定时选择保留 artifact 并报告恢复信息。
+- 无法阻止通过已经打开的可写文件描述符修改 generation，也无法阻止经其它 hardlink 路径修改同一 inode；原子替换通常会生成新文件对象，不保证保留硬链接关系。
+- 直接单文件 `edit`/`batch` 的 atomic replace 依赖协作锁，并不是严格的 basename CAS。需要最强并发检查与冲突安全回滚时应使用 `transaction` / `safe_edit_transaction`。
 - 仅尽力保留普通权限位，不完整保留 ACL、扩展属性或创建时间。
-- 多文件事务提供全量预演和进程内失败回滚，但不保证进程崩溃、断电或跨文件系统时的全局原子性。
+- 多文件事务使用冲突安全的 best-effort rollback，并通过状态字段报告部分写入；`crashAtomic` 为 `false`，不保证进程崩溃、断电或跨文件系统时的全局原子性。
+- v2 进程以全生命周期 kernel stripe 保证新版之间互斥；legacy marker 保留旧 namespace，但与 v1 混跑仍有旧协议无法消除的窄竞态窗口。
+- Windows 锁依赖用户私有 TEMP 目录的 ACL；弱 ACL 或共享 TEMP 是已知安全边界。
 - Windows 上无法像 Unix 一样 fsync 目录，因此断电级别保证受平台限制。
 
 ## 许可证

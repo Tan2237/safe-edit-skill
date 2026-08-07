@@ -65,17 +65,33 @@ They are part of the allowed safe-edit protocol.
 2. Call `safe_edit_stat` once with all related existing files.
 3. Call `safe_edit_transaction` once with raw `old`, `new`, `text`, and
    `operations` values plus the returned SHA-256 guards.
-4. For risky changes, use `dryRun: true`; after success, call the tool again
-   with only `{"transactionId":"RETURNED_ID"}`. Do not resend the payload.
+4. For risky changes, use `dryRun: true`. A single-use `transactionId` is
+   returned only after successful admission to the bounded cache; when present,
+   confirm with only `{"transactionId":"RETURNED_ID"}`. Do not resend the payload.
 5. Cache each successful file result's `sha256` as the guard for its next edit.
    Do not re-run stat after a confirmed successful write.
 
 The server is long-lived: it imports the editing core and builds its parser only
-once. It holds dry-run payloads behind single-use transaction IDs for 10 minutes.
-Batch related files so filesystem probes, request validation, and lock coordination
-are shared. Do not JSON-stringify, Base64-encode, or create payload files for these
-tool calls. Dry-runs include compact diffs by default; set per-file `diff: true`
-only when a full diff is needed.
+once. Successfully admitted dry-runs receive single-use transaction IDs valid for
+up to 10 minutes. Admission is bounded: a full cache rejects a new dry-run rather
+than evicting any unexpired issued token. The cache normally retains an immutable
+prepared plan; requests above the MCP prepared-retention threshold use bounded JSON
+fallback storage and are prepared again at confirmation. Batch related files so
+random per-parent short-lived best-effort capability observations, request validation, and lock coordination are shared. Do not
+JSON-stringify, Base64-encode, or create payload files for these tool calls.
+Dry-runs include compact diffs by default; set per-file `diff: true` only when a
+full diff is needed. Large batches of independent exact replacements use a single
+scan only when equivalence to ordered per-operation semantics is strictly proven;
+otherwise they automatically fall back to the ordinary path. ASCII space/tab trim uses staged short-run passes, with regex for long or residual patterns.
+
+The MCP boundary is explicit: `maxBytes` is at most 128 MiB; a call may contain
+at most 128 files, 256 operations per file, 1,024 operations total, and 128 JSON
+nesting levels. The current stable protocol is `2025-11-25`; the server also
+supports `2025-06-18` and `2024-11-05`, but does not claim the transitional
+`2025-03-26` batch protocol. Invalid fields, types, hashes, limits, or execution
+state for a recognized tool return a normal `tools/call` result with
+`isError: true`. Malformed JSON-RPC envelopes, invalid request IDs, unknown tool
+names, and non-object `params` or `arguments` return JSON-RPC errors instead.
 
 The CLI sections below are the fallback when the structured tools are not
 available.
@@ -111,7 +127,7 @@ python "SAFE_EDIT_SCRIPT" stat --file F --json
 ```
 
 For two or more related existing files on the CLI fallback, use one request so
-Python startup and filesystem capability probes are shared:
+Python startup and random per-parent capability observations are shared; one temp probe supplies temp/lock flags:
 
 ```json
 {"files":["src/a.py",{"file":"src/b.py","encoding":"utf-8"}]}
@@ -164,13 +180,78 @@ For one new file, the structured request may be exactly
 
 Pass this object directly to `safe_edit_transaction` when it is callable. The
 structured path automatically reconciles multiline target EOLs with the detected
-file line ending. For a risky request, send it once with `dryRun: true`, then
-confirm with only the returned `transactionId`. The structured path avoids shell
-parsing, Base64 expansion, Windows argv limits, and per-call Python startup.
-Otherwise use `transaction --request-stdin` only with a native stdin field; fall
-back to an existing request file, then URL-safe UTF-8 Base64. Both paths lock
-targets in stable order, prevalidate every file, and roll back completed writes
-on failure. Neither claims crash-atomicity across multiple files.
+file line ending. For a risky request, send it once with `dryRun: true`; confirm
+with only the returned `transactionId` when bounded-cache admission succeeds. The
+structured path avoids shell parsing, Base64 expansion, Windows argv limits, and
+per-call Python startup; native binding metadata is loaded lazily and cached per process, while handles, buffers, and error state remain per-call. Otherwise use `transaction --request-stdin` only with a
+native stdin field; fall back to an existing request file, then URL-safe UTF-8
+Base64.
+
+Both paths build an immutable prepared plan before commit. Confirmation acquires
+cooperative locks in stable order, then jointly revalidates canonical paths,
+parent/target identities, and input hashes. A retained prepared plan does not
+repeat decoding or matching; bounded JSON fallback is prepared again.
+
+Each output is first written to a random hidden sibling stage under its pinned
+parent, completely written, file-fsynced, and verified. An edit then no-replace
+claims the current basename into a random quarantine, verifies identity, SHA-256,
+mode, size, and mtime, and no-replace installs the complete stage. A create only
+installs a complete verified stage. Original quarantines remain until all
+planned mutations complete post-install verification and every pinned parent
+passes the final validation sweep. The target basename can therefore be briefly
+absent between the two no-replace operations.
+
+Rollback no-replace claims the transaction output into another quarantine,
+verifies that generation, and only then no-replace restores the original or
+removes an owned create. It never overwrites an unknown or external target. This
+requires Linux `renameat2(RENAME_NOREPLACE)`, macOS
+`renameatx_np(RENAME_EXCL)`, or non-replacing Windows `MoveFileExW`, plus
+filesystem support. Missing primitives fail closed instead of falling back to an
+unsafe replacement.
+
+For each file that will mutate, an in-memory journal entry (not a persistent WAL)
+is created before the first staging syscall for that file. It preallocates random
+stage and rollback-quarantine basenames, plus an original-quarantine basename for
+an edit. Before each syscall that may change file or directory state, the journal
+advances to the corresponding `ATTEMPT_*` phase. If the call outcome is ambiguous,
+a preserved in-process control-flow exception occurs, or later verification
+fails, recovery probes the relevant endpoints, reconciles stage, target, and
+quarantine against recorded markers, and rolls proven mutations back in reverse
+order. Cleanup or restore is attempted only after identity, SHA-256, mode, size,
+and mtime prove ownership of the observed generation; the same-permission race
+boundaries below still apply.
+
+Original quarantines enter `ATTEMPT_FINALIZE` only after all planned mutations
+complete post-install verification and every pinned parent passes the final
+validation sweep. Cleanup or directory-sync problems on an otherwise successful
+commit appear in `cleanupWarnings`. If finalization is interrupted, an absent,
+replaced, or unknown original generation is not reported as rolled back; the
+status fields and `rollbackErrors` report the observed partial or uncertain
+outcome.
+
+When publish, inspection, rollback, or finalization state cannot be proven,
+recovery retains stage and quarantine artifacts and does not intentionally delete
+unverified or unknown objects. A `rollbackErrors` item that names a recovery
+artifact uses the fixed label `artifact basename=...; pinned parent
+identity=(device=..., inode=..., file_type=...); best-effort path=...`. Recovery
+uses the pinned parent plus basename; the path is only a locator and can be stale
+after parent rebinding. Inspect `written`, `rolledBack`, `partialWrite`,
+`rollbackConflict`, and `rollbackErrors` for the real result. `crashAtomic` is
+`false`: no multi-file commit is guaranteed across process crashes, power loss,
+or filesystems.
+
+No-replace publication and generation verification safely conflict with ordinary
+concurrent target-basename writers. They do not promise isolation from deliberate
+same-permission hijacking of random internal transaction names, mutation through
+an already-open writable descriptor, or mutation through another hardlink. POSIX
+has no portable unlink-by-inode CAS, so uncertain internal-name cleanup must retain
+and report the artifact. Direct single-file atomic replacement uses cooperative
+locking, not strict basename CAS; use `transaction` / `safe_edit_transaction` for
+the strongest concurrency checks and conflict-safe rollback.
+
+Protocol 2 retains kernel stripes for the whole edit lifetime and keeps legacy
+markers in the protocol-1 namespace. New participants are mutually exclusive, but
+mixed protocol-1 operation retains the old protocol's narrow race window.
 
 The latest trusted hash is authoritative for the lifetime of the file. Initially it
 comes from stat; after a successful transaction, replace it with that file result's
@@ -185,7 +266,7 @@ already carries the current hash: use its `actualSha256` (equivalently
 `retryStrategy.expectedSha256`) as the next `expectedSha256` instead of
 re-running stat, and re-validate the edit context because the file changed.
 Never apply this shortcut to `remove-file`: re-read and reconfirm the changed
-file before deletion. A `create` failure on an existing file may return the
+file before deletion. A `create` failure on an existing file may stream at most 50 MiB in bounded chunks to return the
 existing file's `actualSha256`, but it must not be converted automatically into
 an edit; inspect the existing file first.
 
@@ -380,13 +461,13 @@ regex                       ← HIGHEST EDIT RISK
 
 8. **Use `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
 
-9. **Use transactions for related files** — obtain initial hashes with one `safe_edit_stat` call (or CLI `stat-many` fallback), require `expectedSha256` on every edit request, and include controlled creates in the same transaction. Use returned `sha256` values for later transactions. Treat `atomicity: prevalidated-with-rollback` as process-level rollback, not crash-atomicity.
+9. **Use transactions for related files** — obtain initial hashes with one `safe_edit_stat` call (or CLI `stat-many` fallback), require `expectedSha256` on every edit request, and include controlled creates in the same transaction. Use returned `sha256` values for later transactions. Treat `atomicity: prevalidated-with-rollback` as conflict-safe best-effort rollback, require `crashAtomic: false`, inspect every rollback status field and recovery artifact, and never assume crash-atomicity.
 
 10. **Treat explicit no-ops as skipped** — `old == new` returns `skipped: true` with `reason: old_equals_new`; do not retry it.
 
-11. **Re-read and validate after edits** — successful execution confirms only the payload received by the safe-edit core. Re-read or compile/test to verify intent.
+11. **Re-read and validate after edits** — direct create/edit uses strict 1 MiB-chunk byte/EOF comparison; success still confirms only the payload received by the safe-edit core. Re-read or compile/test to verify intent.
 
-12. **Protect the hot path** — prefer one batched stat and one batched transaction. For previews, confirm the returned transaction ID instead of resending the payload. Do not split related files into repeated tool calls, rebuild the parser, spawn helper processes, or serialize an already-structured request again.
+12. **Protect the hot path** — prefer one batched stat and one batched transaction. For previews, confirm the returned transaction ID when successful cache admission issues one instead of resending the payload. Do not split related files into repeated tool calls, rebuild the parser, spawn helper processes, or serialize an already-structured request again.
 
 ---
 
@@ -468,6 +549,9 @@ python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-file diff.txt
 ## Windows Payload Transport
 
 PowerShell and the Windows native argv layer can rewrite quotes before Python receives them. MSYS2/Git Bash can additionally convert leading `/` and `//` as paths. `safe_edit.py` cannot reconstruct the caller's original intent after that transformation.
+
+Windows kernel locking assumes that `TEMP` is protected by a user-private ACL.
+Treat a weakly protected or shared `TEMP` directory as a known locking boundary.
 
 Use this order:
 

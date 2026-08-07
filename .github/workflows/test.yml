@@ -9,7 +9,7 @@ env:
 
 jobs:
   safe-edit:
-    name: safe-edit (${{ matrix.os }})
+    name: safe-edit (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -18,11 +18,29 @@ jobs:
           - ubuntu-latest
           - windows-latest
           - macos-latest
+        python-version:
+          - "3.9"
+          - "3.x"
 
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: ${{ matrix.python-version }}
       - run: python -m py_compile skills/safe-edit/safe_edit.py
       - run: python -m unittest discover -s tests -v
+      - name: Install package
+        run: python -m pip install .
+      - name: Installed package import smoke
+        run: python -c "import safe_edit; from safe_edit_mcp import server; print(safe_edit.__file__, server.SERVER_VERSION)"
+      - name: safe-edit console smoke
+        run: |
+          safe-edit --version
+          safe-edit preflight --json
+      - name: safe-edit-mcp stdio initialize smoke
+        run: >-
+          python -c "import json, subprocess; request = {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2025-11-25', 'capabilities': {}, 'clientInfo': {'name': 'ci', 'version': '1.0'}}}; completed = subprocess.run(['safe-edit-mcp'], input=json.dumps(request) + '\n', text=True, encoding='utf-8', capture_output=True, check=True, timeout=15); response = json.loads(completed.stdout); assert response['result']['serverInfo']['name'] == 'safe-edit'; assert response['result']['protocolVersion'] == '2025-11-25'"
+      - name: Performance smoke
+        if: ${{ matrix.python-version == '3.x' }}
+        timeout-minutes: 2
+        run: python tests/perf/benchmark.py --sizes-mib 0.02 --iterations 1 --warmups 0 --context-matches 20 --batch-operations 8 --json

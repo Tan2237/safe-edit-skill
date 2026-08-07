@@ -9,7 +9,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import tracemalloc
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -20,21 +22,34 @@ SCRIPT = REPO_ROOT / "skills" / "safe-edit" / "safe_edit.py"
 
 
 def _get_tmp_dir():
-    """Get the best available temporary directory (matches safe_edit.py logic)."""
+    """Get the best available temporary directory (matches safe_edit.py)."""
     if os.name != "nt":
+        fd = None
+        probe = None
         try:
-            test_path = "/tmp/.safe-edit-probe"
-            fd = os.open(test_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            fd, probe = tempfile.mkstemp(
+                prefix=".safe-edit-probe-", dir="/tmp"
+            )
             os.close(fd)
-            os.unlink(test_path)
+            fd = None
             return "/tmp"
         except OSError:
             pass
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if probe is not None:
+                try:
+                    os.unlink(probe)
+                except OSError:
+                    pass
     return tempfile.gettempdir()
 
-
 def _get_lock_dir():
-    """Get or create the lock directory (matches safe_edit.py logic)."""
+    """Return the legacy marker namespace shared with protocol 1."""
     lock_dir = Path(_get_tmp_dir()) / "safe-edit" / "locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
     return lock_dir
@@ -3954,6 +3969,780 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         finally:
             sys.path.pop(0)
 
+    def _transaction_args(self, m, *, no_lock=True):
+        values = ["transaction", "--json"]
+        if no_lock:
+            values.append("--no-lock")
+        return m.build_parser().parse_args(values)
+
+    def _windows_handle_identity_case(self, expected_kind, include_full=True):
+        import ctypes
+
+        m = self._import_safe_edit()
+        legacy = m.PreparedPathIdentity(
+            device=0x12345678,
+            inode=(0x12345678 << 32) | 0x90ABCDEF,
+            file_type=m.stat.S_IFDIR,
+        )
+        full_bytes = bytes(range(16))
+        full = m.PreparedPathIdentity(
+            device=0x1234567890ABCDEF,
+            inode=int.from_bytes(full_bytes, "little"),
+            file_type=m.stat.S_IFDIR,
+        )
+
+        class FakeFunction:
+            def __init__(self, implementation):
+                self.implementation = implementation
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                return self.implementation(*args)
+
+        def legacy_call(_handle, output):
+            information = output._obj
+            information.file_attributes = 0x00000010
+            information.volume_serial_number = legacy.device
+            information.file_index_high = legacy.inode >> 32
+            information.file_index_low = legacy.inode & 0xFFFFFFFF
+            return 1
+
+        def full_call(_handle, _kind, output, _size):
+            information = output._obj
+            information.volume_serial_number = full.device
+            for index, value in enumerate(full_bytes):
+                information.file_id.identifier[index] = value
+            return 1
+
+        class FakeKernel32:
+            pass
+
+        kernel32 = FakeKernel32()
+        kernel32.CreateFileW = FakeFunction(lambda *_args: 7)
+        kernel32.CloseHandle = FakeFunction(lambda *_args: 1)
+        kernel32.GetFileInformationByHandle = FakeFunction(legacy_call)
+        if include_full:
+            kernel32.GetFileInformationByHandleEx = FakeFunction(full_call)
+        expected = full if expected_kind == "full" else legacy
+        m._load_directory_native_bindings.cache_clear()
+        try:
+            with patch.object(
+                ctypes, "WinDLL", return_value=kernel32, create=True
+            ):
+                actual = m._windows_directory_handle_identity(7, expected)
+        finally:
+            m._load_directory_native_bindings.cache_clear()
+        return actual, legacy, full
+
+    def test_windows_handle_identity_prefers_full_runtime_candidate(self):
+        actual, _legacy, full = self._windows_handle_identity_case("full")
+        self.assertEqual(actual, full)
+
+    def test_windows_handle_identity_retains_legacy_runtime_candidate(self):
+        actual, legacy, _full = self._windows_handle_identity_case("legacy")
+        self.assertEqual(actual, legacy)
+
+    def test_windows_handle_identity_uses_legacy_without_optional_ex(self):
+        actual, legacy, _full = self._windows_handle_identity_case("legacy", include_full=False)
+        self.assertEqual(actual, legacy)
+
+    def test_process_native_bindings_are_lazy_cached_and_configured(self):
+        import ctypes
+
+        m = self._import_safe_edit()
+
+        class FakeFunction:
+            def __init__(self):
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *_args):
+                return 0
+
+        class FakeKernel32:
+            pass
+
+        kernel32 = FakeKernel32()
+        kernel32.OpenProcess = FakeFunction()
+        kernel32.CloseHandle = FakeFunction()
+        m._load_process_native_bindings.cache_clear()
+        try:
+            with patch.object(
+                ctypes, "WinDLL", return_value=kernel32, create=True
+            ) as win_dll:
+                first = m._load_process_native_bindings()
+                second = m._load_process_native_bindings()
+                self.assertIs(first, second)
+                self.assertEqual(win_dll.call_count, 1)
+                self.assertEqual(len(first.open_process.argtypes), 3)
+                self.assertEqual(len(first.close_handle.argtypes), 1)
+                self.assertIsNotNone(first.open_process.restype)
+                self.assertIsNotNone(first.close_handle.restype)
+                m._load_process_native_bindings.cache_clear()
+                third = m._load_process_native_bindings()
+                self.assertIsNot(first, third)
+                self.assertEqual(win_dll.call_count, 2)
+        finally:
+            m._load_process_native_bindings.cache_clear()
+
+    def test_process_liveness_does_not_load_windows_bindings_on_posix(self):
+        import ctypes
+
+        m = self._import_safe_edit()
+        m._load_process_native_bindings.cache_clear()
+        try:
+            with patch.object(ctypes, "WinDLL", create=True) as win_dll:
+                with patch.object(m.os, "name", "posix"), patch.object(
+                    m.os, "kill", return_value=None
+                ):
+                    self.assertEqual(
+                        m._process_liveness(os.getpid() + 1),
+                        m._PROCESS_ALIVE,
+                    )
+                win_dll.assert_not_called()
+        finally:
+            m._load_process_native_bindings.cache_clear()
+
+    def test_lock_native_bindings_cache_types_and_signatures(self):
+        import ctypes
+
+        m = self._import_safe_edit()
+
+        class FakeFunction:
+            def __init__(self):
+                self.argtypes = None
+                self.restype = None
+
+        class FakeKernel32:
+            pass
+
+        kernel32 = FakeKernel32()
+        kernel32.LockFileEx = FakeFunction()
+        kernel32.UnlockFileEx = FakeFunction()
+        m._load_lock_native_bindings.cache_clear()
+        try:
+            with patch.object(
+                ctypes, "WinDLL", return_value=kernel32, create=True
+            ) as win_dll:
+                first = m._load_lock_native_bindings()
+                second = m._load_lock_native_bindings()
+                self.assertIs(first, second)
+                self.assertEqual(win_dll.call_count, 1)
+                self.assertEqual(len(first.lock_file_ex.argtypes), 6)
+                self.assertEqual(len(first.unlock_file_ex.argtypes), 5)
+                self.assertIs(first.overlapped_type, second.overlapped_type)
+                self.assertIsNot(first.overlapped_type(), first.overlapped_type())
+                m._load_lock_native_bindings.cache_clear()
+                third = m._load_lock_native_bindings()
+                self.assertIsNot(first, third)
+                self.assertEqual(win_dll.call_count, 2)
+        finally:
+            m._load_lock_native_bindings.cache_clear()
+
+    def test_directory_native_bindings_cache_and_signatures(self):
+        import ctypes
+
+        m = self._import_safe_edit()
+
+        class FakeFunction:
+            def __init__(self):
+                self.argtypes = None
+                self.restype = None
+
+        class FakeKernel32:
+            pass
+
+        kernel32 = FakeKernel32()
+        for name in (
+            "CreateFileW",
+            "GetFileInformationByHandle",
+            "GetFileInformationByHandleEx",
+            "CloseHandle",
+        ):
+            setattr(kernel32, name, FakeFunction())
+        m._load_directory_native_bindings.cache_clear()
+        try:
+            with patch.object(
+                ctypes, "WinDLL", return_value=kernel32, create=True
+            ) as win_dll:
+                first = m._load_directory_native_bindings()
+                second = m._load_directory_native_bindings()
+                self.assertIs(first, second)
+                self.assertEqual(win_dll.call_count, 1)
+                self.assertEqual(len(first.create_file_w.argtypes), 7)
+                self.assertEqual(len(first.get_file_information_by_handle.argtypes), 2)
+                self.assertEqual(len(first.get_file_information_by_handle_ex.argtypes), 4)
+                self.assertEqual(len(first.close_handle.argtypes), 1)
+                self.assertIs(first.file_id_128_type, second.file_id_128_type)
+                self.assertIs(first.file_id_information_type, second.file_id_information_type)
+                self.assertIs(first.by_handle_file_information_type, second.by_handle_file_information_type)
+                m._load_directory_native_bindings.cache_clear()
+                third = m._load_directory_native_bindings()
+                self.assertIsNot(first, third)
+                self.assertEqual(win_dll.call_count, 2)
+        finally:
+            m._load_directory_native_bindings.cache_clear()
+
+    def test_move_native_bindings_are_cached_and_configured(self):
+        import ctypes
+
+        m = self._import_safe_edit()
+
+        class FakeFunction:
+            def __init__(self):
+                self.argtypes = None
+                self.restype = None
+
+        class FakeKernel32:
+            pass
+
+        kernel32 = FakeKernel32()
+        kernel32.MoveFileExW = FakeFunction()
+        m._load_move_native_bindings.cache_clear()
+        try:
+            with patch.object(
+                ctypes, "WinDLL", return_value=kernel32, create=True
+            ) as win_dll:
+                first = m._load_move_native_bindings()
+                second = m._load_move_native_bindings()
+                self.assertIs(first, second)
+                self.assertEqual(win_dll.call_count, 1)
+                self.assertEqual(len(first.move_file_ex_w.argtypes), 3)
+                self.assertIsNotNone(first.move_file_ex_w.restype)
+                m._load_move_native_bindings.cache_clear()
+                third = m._load_move_native_bindings()
+                self.assertIsNot(first, third)
+                self.assertEqual(win_dll.call_count, 2)
+        finally:
+            m._load_move_native_bindings.cache_clear()
+
+    def test_posix_rename_native_bindings_cache_and_errno_each_call(self):
+        import ctypes
+
+        m = self._import_safe_edit()
+
+        class FakeFunction:
+            def __init__(self, result):
+                self.result = result
+                self.calls = []
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                self.calls.append(args)
+                return self.result
+
+        class FakeLibC:
+            pass
+
+        libc = FakeLibC()
+        libc.renameat2 = FakeFunction(-1)
+        m._load_posix_rename_native_bindings.cache_clear()
+        try:
+            with patch.object(ctypes, "CDLL", return_value=libc) as cdll:
+                first = m._load_posix_rename_native_bindings()
+                second = m._load_posix_rename_native_bindings()
+                self.assertIs(first, second)
+                self.assertEqual(cdll.call_count, 1)
+                self.assertIs(first.renameat2, libc.renameat2)
+                self.assertIsNone(first.renameatx_np)
+                self.assertEqual(len(first.renameat2.argtypes), 5)
+                with patch.object(ctypes, "set_errno") as set_errno, patch.object(
+                    ctypes, "get_errno", side_effect=[17, 18]
+                ) as get_errno:
+                    for error_number in (17, 18):
+                        with self.assertRaises(OSError) as context:
+                            m._posix_rename_atomic(
+                                1, "source", 2, "destination",
+                                m._RENAME_NOREPLACE,
+                                Path("source"), Path("destination"),
+                            )
+                        self.assertEqual(context.exception.errno, error_number)
+                self.assertEqual(get_errno.call_count, 2)
+                self.assertEqual(
+                    [entry.args for entry in set_errno.call_args_list],
+                    [(0,), (0,)],
+                )
+                self.assertEqual(libc.renameat2.calls[0][1], b"source")
+                self.assertEqual(libc.renameat2.calls[1][3], b"destination")
+                m._load_posix_rename_native_bindings.cache_clear()
+                third = m._load_posix_rename_native_bindings()
+                self.assertIsNot(first, third)
+                self.assertEqual(cdll.call_count, 2)
+        finally:
+            m._load_posix_rename_native_bindings.cache_clear()
+
+    def test_posix_rename_native_bindings_select_mac_and_report_missing(self):
+        import ctypes
+
+        m = self._import_safe_edit()
+
+        class FakeFunction:
+            def __init__(self, result=0):
+                self.result = result
+                self.calls = []
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                self.calls.append(args)
+                return self.result
+
+        class FakeLibC:
+            pass
+
+        mac_libc = FakeLibC()
+        mac_libc.renameatx_np = FakeFunction()
+        m._load_posix_rename_native_bindings.cache_clear()
+        try:
+            with patch.object(m.sys, "platform", "darwin"), patch.object(
+                ctypes, "CDLL", return_value=mac_libc
+            ):
+                bindings = m._load_posix_rename_native_bindings()
+                self.assertIsNone(bindings.renameat2)
+                self.assertIs(bindings.renameatx_np, mac_libc.renameatx_np)
+                m._posix_rename_atomic(
+                    1, "source", 2, "destination", 999,
+                    Path("source"), Path("destination"),
+                )
+                self.assertEqual(mac_libc.renameatx_np.calls[0][-1], m._RENAME_MAC_EXCL)
+        finally:
+            m._load_posix_rename_native_bindings.cache_clear()
+
+        missing_libc = FakeLibC()
+        m._load_posix_rename_native_bindings.cache_clear()
+        try:
+            with patch.object(m.sys, "platform", "linux"), patch.object(
+                ctypes, "CDLL", return_value=missing_libc
+            ):
+                bindings = m._load_posix_rename_native_bindings()
+                self.assertIsNone(bindings.renameat2)
+                self.assertIsNone(bindings.renameatx_np)
+                with self.assertRaisesRegex(
+                    m.SafeEditError,
+                    "this POSIX platform lacks renameat2/renameatx_np; refusing an unsafe transaction pathname replacement",
+                ):
+                    m._posix_rename_atomic(
+                        1, "source", 2, "destination",
+                        m._RENAME_NOREPLACE,
+                        Path("source"), Path("destination"),
+                    )
+        finally:
+            m._load_posix_rename_native_bindings.cache_clear()
+
+    def test_posix_rename_native_bindings_missing_mac_symbol_keeps_mac_error(self):
+        import ctypes
+
+        m = self._import_safe_edit()
+
+        class FakeLibC:
+            pass
+
+        m._load_posix_rename_native_bindings.cache_clear()
+        try:
+            with patch.object(m.sys, "platform", "darwin"), patch.object(
+                ctypes, "CDLL", return_value=FakeLibC()
+            ):
+                bindings = m._load_posix_rename_native_bindings()
+                self.assertIsNone(bindings.renameat2)
+                self.assertIsNone(bindings.renameatx_np)
+                with self.assertRaisesRegex(
+                    m.SafeEditError,
+                    "macOS renameatx_np is unavailable; refusing an unsafe transaction pathname replacement",
+                ):
+                    m._posix_rename_atomic(
+                        1, "source", 2, "destination",
+                        m._RENAME_NOREPLACE,
+                        Path("source"), Path("destination"),
+                    )
+        finally:
+            m._load_posix_rename_native_bindings.cache_clear()
+
+    def test_windows_process_liveness_native_error_slots_and_close(self):
+        import ctypes
+
+        m = self._import_safe_edit()
+
+        class SequenceFunction:
+            def __init__(self, values):
+                self.values = list(values)
+                self.calls = []
+
+            def __call__(self, *args):
+                self.calls.append(args)
+                return self.values.pop(0)
+
+        open_process = SequenceFunction([0, 0, 99])
+        close_handle = SequenceFunction([1])
+        bindings = m._ProcessNativeBindings(
+            object(), open_process, close_handle
+        )
+        test_pids = [
+            pid for pid in range(1, 5) if pid != os.getpid()
+        ][:3]
+        with patch.object(m.os, "name", "nt"), patch.object(
+            m, "_load_process_native_bindings", return_value=bindings
+        ), patch.object(
+            ctypes, "set_last_error", create=True
+        ) as set_last_error, patch.object(
+            ctypes,
+            "get_last_error",
+            side_effect=[87, 5],
+            create=True,
+        ) as get_last_error:
+            self.assertEqual(
+                m._process_liveness(test_pids[0]), m._PROCESS_DEAD
+            )
+            self.assertEqual(
+                m._process_liveness(test_pids[1]), m._PROCESS_UNKNOWN
+            )
+            self.assertEqual(
+                m._process_liveness(test_pids[2]), m._PROCESS_ALIVE
+            )
+
+        self.assertEqual(len(open_process.calls), 3)
+        self.assertEqual(len(close_handle.calls), 1)
+        self.assertEqual(close_handle.calls[0][0].value, 99)
+        self.assertEqual(set_last_error.call_count, 3)
+        self.assertEqual(get_last_error.call_count, 2)
+        self.assertTrue(
+            all(call.args == (0,) for call in set_last_error.call_args_list)
+        )
+
+    def test_windows_lock_native_results_state_and_error_slots(self):
+        import ctypes
+        import types
+
+        m = self._import_safe_edit()
+
+        class Overlapped(ctypes.Structure):
+            _fields_ = [("marker", ctypes.c_int)]
+
+        class SequenceFunction:
+            def __init__(self, values):
+                self.values = list(values)
+                self.calls = []
+
+            def __call__(self, *args):
+                self.calls.append(args)
+                return self.values.pop(0)
+
+        lock_file_ex = SequenceFunction([1, 0, 0])
+        unlock_file_ex = SequenceFunction([1])
+        bindings = m._LockNativeBindings(
+            object(), Overlapped, lock_file_ex, unlock_file_ex
+        )
+        fake_msvcrt = types.SimpleNamespace(
+            get_osfhandle=lambda fd: fd + 1000
+        )
+        with patch.object(m.os, "name", "nt"), patch.dict(
+            sys.modules, {"msvcrt": fake_msvcrt}
+        ), patch.object(
+            m, "_load_lock_native_bindings", return_value=bindings
+        ), patch.object(
+            ctypes, "set_last_error", create=True
+        ) as set_last_error, patch.object(
+            ctypes,
+            "get_last_error",
+            side_effect=[33, 5],
+            create=True,
+        ) as get_last_error, patch.object(
+            ctypes,
+            "WinError",
+            side_effect=lambda code: OSError(code, f"native-{code}"),
+            create=True,
+        ):
+            locked, platform_state = m._try_lock_kernel_fd(7)
+            self.assertTrue(locked)
+            self.assertIsInstance(platform_state, Overlapped)
+
+            locked, busy_state = m._try_lock_kernel_fd(8)
+            self.assertFalse(locked)
+            self.assertIsNone(busy_state)
+
+            with self.assertRaisesRegex(
+                m.SafeEditError, "kernel file locking failed"
+            ):
+                m._try_lock_kernel_fd(9)
+
+            m._unlock_kernel_fd(7, platform_state)
+
+        self.assertEqual(len(lock_file_ex.calls), 3)
+        self.assertEqual(len(unlock_file_ex.calls), 1)
+        self.assertIs(
+            unlock_file_ex.calls[0][-1]._obj,
+            platform_state,
+        )
+        self.assertIs(type(platform_state), bindings.overlapped_type)
+        self.assertEqual(set_last_error.call_count, 4)
+        self.assertEqual(get_last_error.call_count, 2)
+        self.assertTrue(
+            all(call.args == (0,) for call in set_last_error.call_args_list)
+        )
+
+    def test_windows_directory_and_move_native_error_mapping(self):
+        import ctypes
+
+        m = self._import_safe_edit()
+
+        class SequenceFunction:
+            def __init__(self, values):
+                self.values = list(values)
+                self.calls = []
+
+            def __call__(self, *args):
+                self.calls.append(args)
+                return self.values.pop(0)
+
+        invalid_handle = ctypes.c_void_p(-1).value
+        create_file_w = SequenceFunction([invalid_handle])
+        close_handle = SequenceFunction([0])
+        directory_bindings = m._DirectoryNativeBindings(
+            object(),
+            create_file_w,
+            SequenceFunction([]),
+            None,
+            close_handle,
+            object,
+            object,
+            object,
+        )
+        with patch.object(
+            m,
+            "_load_directory_native_bindings",
+            return_value=directory_bindings,
+        ), patch.object(
+            ctypes, "set_last_error", create=True
+        ) as directory_set_last_error, patch.object(
+            ctypes,
+            "get_last_error",
+            side_effect=[5, 6],
+            create=True,
+        ), patch.object(
+            ctypes,
+            "WinError",
+            side_effect=lambda code: OSError(code, f"native-{code}"),
+            create=True,
+        ):
+            with self.assertRaisesRegex(
+                m.SafeEditError, "cannot pin directory"
+            ):
+                m._open_windows_directory_handle(Path("directory"))
+            with self.assertRaises(OSError) as close_context:
+                m._close_windows_handle(77)
+
+        self.assertEqual(close_context.exception.errno, 6)
+        self.assertEqual(directory_set_last_error.call_count, 2)
+        self.assertTrue(
+            all(
+                call.args == (0,)
+                for call in directory_set_last_error.call_args_list
+            )
+        )
+
+        move_file_ex_w = SequenceFunction([1, 0, 0, 0])
+        move_bindings = m._MoveNativeBindings(object(), move_file_ex_w)
+        source = Path("source.txt")
+        destination = Path("destination.txt")
+        with patch.object(
+            m, "_load_move_native_bindings", return_value=move_bindings
+        ), patch.object(
+            ctypes, "set_last_error", create=True
+        ) as move_set_last_error, patch.object(
+            ctypes,
+            "get_last_error",
+            side_effect=[2, 183, 5],
+            create=True,
+        ) as move_get_last_error, patch.object(
+            ctypes,
+            "WinError",
+            side_effect=lambda code: OSError(code, f"native-{code}"),
+            create=True,
+        ):
+            m._windows_move_noreplace(source, destination)
+            with self.assertRaises(FileNotFoundError) as missing_context:
+                m._windows_move_noreplace(source, destination)
+            with self.assertRaises(FileExistsError) as exists_context:
+                m._windows_move_noreplace(source, destination)
+            with self.assertRaises(OSError) as other_context:
+                m._windows_move_noreplace(source, destination)
+
+        self.assertEqual(missing_context.exception.errno, errno.ENOENT)
+        self.assertEqual(missing_context.exception.filename, str(source))
+        self.assertEqual(exists_context.exception.errno, errno.EEXIST)
+        self.assertEqual(
+            exists_context.exception.filename, str(destination)
+        )
+        self.assertEqual(other_context.exception.errno, 5)
+        self.assertEqual(other_context.exception.filename, str(source))
+        self.assertEqual(move_set_last_error.call_count, 4)
+        self.assertEqual(move_get_last_error.call_count, 3)
+        self.assertTrue(
+            all(call.args == (0,) for call in move_set_last_error.call_args_list)
+        )
+
+    def test_capability_process_cache_ttl_and_copy_isolation(self):
+        m = self._import_safe_edit()
+
+        def capability(label):
+            return {
+                "directoryWritable": True,
+                "canWriteTmp": True,
+                "canCreateLock": True,
+                "executionMode": "full",
+                "suggestions": [label],
+            }
+
+        m.clear_fs_capability_cache()
+        try:
+            with patch.object(
+                m,
+                "check_fs_capability",
+                side_effect=[capability("first"), capability("refreshed")],
+            ) as probe, patch.object(
+                m.time, "monotonic", side_effect=[10.0, 11.0, 13.0]
+            ):
+                first_args = m.argparse.Namespace()
+                first = m._cached_fs_capability(
+                    first_args, str(self.tmpdir / "first.txt")
+                )
+                first["suggestions"].append("caller mutation")
+                first["directoryWritable"] = False
+
+                cached = m._cached_fs_capability(
+                    m.argparse.Namespace(), str(self.tmpdir / "second.txt")
+                )
+                self.assertEqual(cached["suggestions"], ["first"])
+                self.assertTrue(cached["directoryWritable"])
+
+                refreshed = m._cached_fs_capability(
+                    m.argparse.Namespace(), str(self.tmpdir / "third.txt")
+                )
+
+            self.assertEqual(probe.call_count, 2)
+            self.assertEqual(refreshed["suggestions"], ["refreshed"])
+            self.assertEqual(
+                first_args._fs_capability_cache[
+                    m._fs_capability_cache_key(
+                        str(self.tmpdir / "first.txt")
+                    )
+                ]["suggestions"],
+                ["first"],
+            )
+        finally:
+            m.clear_fs_capability_cache()
+
+    def test_capability_process_cache_evicts_oldest_entry(self):
+        m = self._import_safe_edit()
+
+        def capability_for(target):
+            return {
+                "directoryWritable": True,
+                "canWriteTmp": True,
+                "canCreateLock": True,
+                "executionMode": "full",
+                "suggestions": [str(target)],
+            }
+
+        targets = [
+            self.tmpdir / name / "target.txt"
+            for name in ("cache-a", "cache-b", "cache-c")
+        ]
+        m.clear_fs_capability_cache()
+        try:
+            with patch.object(
+                m, "_FS_CAPABILITY_CACHE_MAX_ENTRIES", 2
+            ), patch.object(
+                m, "_FS_CAPABILITY_TTL_SECONDS", 100.0
+            ), patch.object(
+                m.time, "monotonic", side_effect=[0.0, 1.0, 2.0, 3.0]
+            ), patch.object(
+                m,
+                "check_fs_capability",
+                side_effect=capability_for,
+            ) as probe:
+                for target in targets:
+                    m._cached_fs_capability(
+                        m.argparse.Namespace(), str(target)
+                    )
+                m._cached_fs_capability(
+                    m.argparse.Namespace(), str(targets[0])
+                )
+
+            self.assertEqual(probe.call_count, 4)
+            self.assertEqual(len(m._FS_CAPABILITY_CACHE), 2)
+            self.assertIn(
+                m._fs_capability_cache_key(str(targets[0])),
+                m._FS_CAPABILITY_CACHE,
+            )
+            self.assertIn(
+                m._fs_capability_cache_key(str(targets[2])),
+                m._FS_CAPABILITY_CACHE,
+            )
+        finally:
+            m.clear_fs_capability_cache()
+
+    def test_capability_invalidation_clears_process_and_local_cache(self):
+        m = self._import_safe_edit()
+        target = str(self.tmpdir / "invalidate.txt")
+        key = m._fs_capability_cache_key(target)
+        value = {
+            "directoryWritable": True,
+            "canWriteTmp": True,
+            "canCreateLock": True,
+            "executionMode": "full",
+            "suggestions": [],
+        }
+        args = m.argparse.Namespace(
+            _fs_capability_cache={key: m._copy_fs_capability(value)}
+        )
+        m.clear_fs_capability_cache()
+        try:
+            m._FS_CAPABILITY_CACHE[key] = (
+                time.monotonic() + 60.0,
+                m._copy_fs_capability(value),
+            )
+            m._invalidate_fs_capability(target, args)
+            self.assertNotIn(key, m._FS_CAPABILITY_CACHE)
+            self.assertNotIn(key, args._fs_capability_cache)
+        finally:
+            m.clear_fs_capability_cache()
+    def _edit_transaction_payload(self, target):
+        original = b"alpha\n"
+        return {
+            "files": [
+                {
+                    "file": str(target),
+                    "action": "edit",
+                    "expectedSha256": hashlib.sha256(
+                        original
+                    ).hexdigest(),
+                    "operations": [
+                        {
+                            "op": "edit",
+                            "old": "alpha",
+                            "new": "beta",
+                            "expected_count": 1,
+                        }
+                    ],
+                }
+            ]
+        }
+
+    def _create_transaction_payload(self, target, text="owned"):
+        return {
+            "files": [
+                {
+                    "file": str(target),
+                    "action": "create",
+                    "text": text,
+                    "encoding": "utf-8",
+                    "lineEnding": "lf",
+                }
+            ]
+        }
+
     def test_visualize_whitespace_format(self):
         """Test visualize_whitespace converts whitespace to visible symbols."""
         m = self._import_safe_edit()
@@ -4263,6 +5052,59 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         )
         self.assertLess(elapsed, 1.0)
 
+    def test_trim_trailing_whitespace_randomized_differential(self):
+        m = self._import_safe_edit()
+        rng = __import__("random").Random(0x5AFE)
+        characters = "abXYZ \t\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029\u00a0"
+        for index in range(20000):
+            text = "".join(
+                rng.choice(characters) for _ in range(rng.randrange(120))
+            )
+            expected = m._TRAILING_WHITESPACE_RE.sub("", text)
+            self.assertEqual(
+                m.trim_trailing_whitespace(text),
+                expected,
+                f"random trim case {index}",
+            )
+
+    def test_trim_trailing_whitespace_runs_eol_and_identity(self):
+        m = self._import_safe_edit()
+        clean = "prefix\r\nsuffix\u2028tail"
+        self.assertIs(m.trim_trailing_whitespace(clean), clean)
+
+        for run_length in (1, 4, 5, 100000):
+            for character in (" ", "\t"):
+                for line_end in ("\n", "\r", "\r\n"):
+                    text = "head" + (character * run_length) + line_end + "tail"
+                    self.assertEqual(
+                        m.trim_trailing_whitespace(text),
+                        "head" + line_end + "tail",
+                        (run_length, repr(character), repr(line_end)),
+                    )
+
+        for pair in (" \t", "\t "):
+            for run_length in (1, 4, 5, 100000):
+                mixed_run = "".join(
+                    pair[index % 2] for index in range(run_length)
+                )
+                for line_end in ("\n", "\r", "\r\n", ""):
+                    if line_end:
+                        text = "head" + mixed_run + line_end + "tail"
+                        expected = "head" + line_end + "tail"
+                    else:
+                        text = "head" + mixed_run
+                        expected = "head"
+                    self.assertEqual(
+                        m.trim_trailing_whitespace(text),
+                        expected,
+                        (repr(pair), run_length, repr(line_end)),
+                    )
+        mixed = "a \r\nb\t\rc \n d\t\v\f\x85\u2028\u2029\u00a0"
+        self.assertEqual(
+            m.trim_trailing_whitespace(mixed),
+            "a\r\nb\rc\n d\t\v\f\x85\u2028\u2029\u00a0",
+        )
+
     def test_append_and_prepend_bypass_full_line_split(self):
         m = self._import_safe_edit()
         operations = [
@@ -4291,7 +5133,8 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
             result = m.find_closest_match(text, pattern)
 
         self.assertEqual(result, (1, "same\nsame\nsame"))
-        self.assertEqual(matcher_mock.call_count, 1)
+        # One matcher selects the window; one computes the final true score.
+        self.assertEqual(matcher_mock.call_count, 2)
 
     def test_json_match_failure_reuses_loaded_text(self):
         m = self._import_safe_edit()
@@ -4734,11 +5577,14 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
 
     def test_existing_file_hash_does_not_follow_symlinks(self):
         m = self._import_safe_edit()
-        path = self.tmpdir / "possible-symlink.txt"
-        path.write_bytes(b"target\n")
-
-        with patch.object(Path, "is_symlink", return_value=True):
-            self.assertIsNone(m._existing_regular_file_sha256(path))
+        target = self.tmpdir / "symlink-target.txt"
+        link = self.tmpdir / "possible-symlink.txt"
+        target.write_bytes(b"target\n")
+        try:
+            link.symlink_to(target)
+        except OSError as exc:
+            self.skipTest(f"symlinks unavailable: {exc}")
+        self.assertIsNone(m._existing_regular_file_sha256(link))
 
     def test_create_requires_existing_parent_and_explicit_format(self):
         missing_parent = self.tmpdir / "missing" / "new.txt"
@@ -4965,26 +5811,30 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertEqual(path.read_bytes(), b"bar\n")
         self.assertFalse(lock.exists())
 
-    def test_stale_lock_removed_when_age_exceeded_even_with_alive_pid(self):
-        """Test lock is removed by age check even when PID is alive."""
+    def test_stale_lock_preserved_when_pid_alive_even_if_old(self):
+        """An old lock owned by a live process must never be stolen."""
         path = self.tmpdir / "stale_alive.txt"
         path.write_bytes(b"foo\n")
         lock = _get_lock_path(path)
-        # Use current PID (alive), but set lock age > stale_seconds
-        lock.write_text(f"pid={os.getpid()} time={time.time() - 200} file=.stale_alive.txt.safe-edit.lock\n", encoding="utf-8")
-        # Set mtime to match the old timestamp in the content
+        lock.write_text(
+            f"pid={os.getpid()} time={time.time() - 200} "
+            "file=.stale_alive.txt.safe-edit.lock\n",
+            encoding="utf-8",
+        )
         old_time = time.time() - 200
         os.utime(lock, (old_time, old_time))
 
-        self.run_tool(
+        result = self.run_tool(
             "edit", "--file", path,
             "--old", "foo", "--new", "bar",
             "--expected-count", "1",
-            "--lock-timeout", "1",
+            "--lock-timeout", "0.05",
             "--lock-stale-seconds", "60",
+            "--json", expect=2,
         )
-        self.assertEqual(path.read_bytes(), b"bar\n")
-        self.assertFalse(lock.exists())
+        self.assertEqual(json.loads(result.stdout)["error"]["type"], "lock_error")
+        self.assertEqual(path.read_bytes(), b"foo\n")
+        self.assertTrue(lock.exists())
 
     def test_stale_lock_preserved_when_pid_alive_and_not_stale(self):
         """Test lock is NOT removed when PID is alive and age < stale_seconds."""
@@ -5096,6 +5946,615 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         parser = m.build_parser()
         action = next(a for a in parser._actions if "--lock-stale-seconds" in a.option_strings)
         self.assertEqual(action.default, 120.0)
+
+    def test_stale_cleanup_timeout_zero_retries_without_sleep(self):
+        m = self._import_safe_edit()
+        path = self.tmpdir / "timeout-zero-stale.txt"
+        path.write_bytes(b"content\n")
+        lock_path = _get_lock_path(path)
+        lock_path.write_text("damaged legacy lock\n", encoding="utf-8")
+        old_time = time.time() - 60
+        os.utime(lock_path, (old_time, old_time))
+
+        with patch.object(
+            m.time,
+            "sleep",
+            side_effect=AssertionError("stale recovery must retry immediately"),
+        ):
+            with m.FileLock(path, timeout=0, stale_seconds=1):
+                self.assertTrue(lock_path.exists())
+        self.assertFalse(lock_path.exists())
+
+    def test_lock_retry_sleep_never_exceeds_remaining_timeout(self):
+        m = self._import_safe_edit()
+        with patch.object(m.time, "monotonic", return_value=10.0), patch.object(
+            m.time, "sleep"
+        ) as sleep_mock:
+            self.assertTrue(
+                m._sleep_for_lock_retry(10.0005, 6, "0" * 32)
+            )
+        self.assertEqual(sleep_mock.call_count, 1)
+        self.assertLessEqual(sleep_mock.call_args.args[0], 0.0005001)
+
+    def test_stale_cleanup_does_not_unlink_replaced_metadata(self):
+        m = self._import_safe_edit()
+        lock_path = self.tmpdir / "metadata-race.lock"
+        lock_path.write_bytes(
+            m._build_lock_payload(lock_path, "a" * 32, "owner")
+        )
+        real_snapshot = m._read_lock_snapshot
+        calls = 0
+
+        def replace_before_second_snapshot(path):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                path.unlink()
+                path.write_bytes(
+                    m._build_lock_payload(path, "b" * 32, "owner")
+                )
+            return real_snapshot(path)
+
+        with patch.object(
+            m, "_process_liveness", return_value=m._PROCESS_DEAD
+        ), patch.object(
+            m,
+            "_read_lock_snapshot",
+            side_effect=replace_before_second_snapshot,
+        ):
+            outcome = m._inspect_and_remove_stale_lock(lock_path, 0)
+
+        self.assertEqual(outcome.state, m._LOCK_CLEANUP_RACED)
+        self.assertTrue(lock_path.exists())
+        self.assertEqual(real_snapshot(lock_path).token, "b" * 32)
+
+    def test_permission_denied_liveness_is_unknown_and_not_stale(self):
+        m = self._import_safe_edit()
+        denied = PermissionError(errno.EPERM, "not permitted")
+        with patch.object(m.os, "name", "posix"), patch.object(
+            m.os, "kill", side_effect=denied
+        ):
+            self.assertEqual(
+                m._process_liveness(12345),
+                m._PROCESS_UNKNOWN,
+            )
+            self.assertTrue(m._is_process_alive(12345))
+
+        lock_path = self.tmpdir / "unknown-owner.lock"
+        lock_path.write_text(
+            f"pid={os.getpid()} token={'c' * 32} "
+            f"time={time.time()} protocol=1\n",
+            encoding="utf-8",
+        )
+        old_time = time.time() - 600
+        os.utime(lock_path, (old_time, old_time))
+        with patch.object(
+            m, "_process_liveness", return_value=m._PROCESS_UNKNOWN
+        ):
+            outcome = m._inspect_and_remove_stale_lock(lock_path, 1)
+        self.assertEqual(outcome.state, m._LOCK_CLEANUP_BUSY)
+        self.assertTrue(lock_path.exists())
+
+    def test_lock_handoff_uses_low_latency_backoff(self):
+        m = self._import_safe_edit()
+        timings = {}
+        for delay in (0.001, 0.005, 0.020):
+            samples = []
+            for sample in range(2):
+                path = self.tmpdir / f"handoff-{delay}-{sample}.txt"
+                path.write_bytes(b"content\n")
+                ready = threading.Event()
+                released_at = []
+                errors = []
+
+                def holder():
+                    try:
+                        with m.FileLock(path, 1, 0):
+                            ready.set()
+                            time.sleep(delay)
+                        released_at.append(time.perf_counter())
+                    except BaseException as exc:
+                        errors.append(exc)
+                        ready.set()
+
+                thread = threading.Thread(target=holder)
+                thread.start()
+                self.assertTrue(ready.wait(1))
+                contender = m.FileLock(path, 1, 0)
+                contender.__enter__()
+                acquired_at = time.perf_counter()
+                contender.__exit__(None, None, None)
+                thread.join(1)
+                self.assertFalse(thread.is_alive())
+                if errors:
+                    raise errors[0]
+                self.assertTrue(released_at)
+                samples.append(acquired_at - released_at[0])
+            timings[delay] = min(samples)
+
+        for delay, elapsed in timings.items():
+            with self.subTest(delay=delay, elapsed=elapsed):
+                self.assertGreaterEqual(elapsed, 0)
+                self.assertLess(elapsed, 0.045)
+
+    def test_release_token_mismatch_does_not_delete_new_owner(self):
+        m = self._import_safe_edit()
+        path = self.tmpdir / "release-token.txt"
+        path.write_bytes(b"content\n")
+        lock = m.FileLock(path, 1, 0)
+        lock.__enter__()
+        replacement_token = "d" * 32
+        lock.lock_path.write_bytes(
+            m._build_lock_payload(path, replacement_token, "owner")
+        )
+        lock.__exit__(None, None, None)
+
+        snapshot = m._read_lock_snapshot(lock.lock_path)
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.token, replacement_token)
+        lock.lock_path.unlink()
+
+    def test_release_holds_kernel_stripes_until_markers_removed(self):
+        m = self._import_safe_edit()
+        path = self.tmpdir / "release-kernel-order.txt"
+        path.write_bytes(b"content\n")
+        lock = m.FileLock(path, 1, 0)
+        lock.__enter__()
+        owned_paths = tuple(lock.acquired_lock_paths)
+        real_release = m._release_owned_lock
+
+        def assert_kernel_held(lock_path, token):
+            self.assertTrue(lock._kernel_guards)
+            return real_release(lock_path, token)
+
+        with patch.object(
+            m,
+            "_release_owned_lock",
+            side_effect=assert_kernel_held,
+        ):
+            lock.__exit__(None, None, None)
+
+        self.assertTrue(all(not item.exists() for item in owned_paths))
+        self.assertFalse(lock._acquired_lock_tokens)
+        self.assertFalse(lock._kernel_guards)
+
+    def test_kernel_group_partial_acquire_releases_everything(self):
+        m = self._import_safe_edit()
+        paths = []
+        stripes = set()
+        index = 0
+        while len(stripes) < 2:
+            path = self.tmpdir / f"partial-stripe-{index}.txt"
+            path.write_bytes(b"content\n")
+            paths.append(path)
+            probe = m.FileLockSet(paths, 1, 0)
+            stripes = set(
+                probe._stripes_for_specs(probe._desired_lock_specs())
+            )
+            index += 1
+
+        lock = m.FileLockSet(paths, 1, 0)
+        ordered = tuple(sorted(stripes))
+        real_acquire = m._try_acquire_kernel_stripe
+        calls = 0
+
+        def fail_after_first(stripe):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                return None
+            return real_acquire(stripe)
+
+        with patch.object(
+            m,
+            "_try_acquire_kernel_stripe",
+            side_effect=fail_after_first,
+        ):
+            self.assertFalse(lock._try_acquire_kernel_group(ordered))
+
+        self.assertFalse(lock._kernel_guards)
+        self.assertTrue(lock._try_acquire_kernel_group(ordered))
+        lock._release_kernel_group()
+        self.assertFalse(lock._kernel_guards)
+
+    def test_kernel_group_cleanup_attempts_all_guards_after_error(self):
+        m = self._import_safe_edit()
+        paths = []
+        stripes = set()
+        index = 0
+        while len(stripes) < 3:
+            path = self.tmpdir / f"cleanup-stripe-{index}.txt"
+            path.write_bytes(b"content\n")
+            paths.append(path)
+            probe = m.FileLockSet(paths, 1, 0)
+            stripes = set(
+                probe._stripes_for_specs(probe._desired_lock_specs())
+            )
+            index += 1
+
+        lock = m.FileLockSet(paths, 1, 0)
+        ordered = tuple(sorted(stripes))
+        real_acquire = m._try_acquire_kernel_stripe
+        real_close = m._KernelStripeGuard.close
+        acquire_calls = 0
+        close_calls = []
+
+        def fail_third_acquire(stripe):
+            nonlocal acquire_calls
+            acquire_calls += 1
+            if acquire_calls == 3:
+                return None
+            return real_acquire(stripe)
+
+        def close_all_then_report(guard):
+            close_calls.append(guard.stripe)
+            real_close(guard)
+            if len(close_calls) == 1:
+                raise OSError("injected close diagnostic")
+
+        with patch.object(
+            m,
+            "_try_acquire_kernel_stripe",
+            side_effect=fail_third_acquire,
+        ), patch.object(
+            m._KernelStripeGuard,
+            "close",
+            side_effect=close_all_then_report,
+            autospec=True,
+        ):
+            with self.assertRaises(m.SafeEditError):
+                lock._try_acquire_kernel_group(ordered)
+
+        self.assertEqual(len(close_calls), 2)
+        self.assertFalse(lock._kernel_guards)
+        self.assertTrue(lock._try_acquire_kernel_group(ordered))
+        lock._release_kernel_group()
+
+    def test_marker_release_failure_is_recovered_as_v2_orphan(self):
+        m = self._import_safe_edit()
+        path = self.tmpdir / "release-failure-orphan.txt"
+        path.write_bytes(b"content\n")
+        failed = m.FileLock(path, 1, 0)
+        failed.__enter__()
+        orphan_paths = tuple(failed.acquired_lock_paths)
+
+        with patch.object(
+            m,
+            "_release_owned_lock",
+            return_value=m._LOCK_RELEASE_RACED,
+        ):
+            with self.assertRaises(m.SafeEditError):
+                failed.__exit__(None, None, None)
+
+        self.assertFalse(failed._kernel_guards)
+        self.assertFalse(failed.acquired_lock_paths)
+        self.assertFalse(failed._acquired_lock_tokens)
+        with patch.object(
+            m,
+            "_release_owned_lock",
+            side_effect=AssertionError(
+                "uncovered repeated release must not touch markers"
+            ),
+        ) as release_mock:
+            failed._release_all(suppress_errors=True)
+        release_mock.assert_not_called()
+
+        replacement = m.FileLock(path, 0, 0)
+        replacement.__enter__()
+        try:
+            replacement_tokens = {
+                marker: m._read_lock_snapshot(marker).token
+                for marker in replacement.acquired_lock_paths
+            }
+            failed._release_all(suppress_errors=True)
+            for marker, token in replacement_tokens.items():
+                self.assertEqual(
+                    m._read_lock_snapshot(marker).token,
+                    token,
+                )
+        finally:
+            replacement.__exit__(None, None, None)
+
+        self.assertTrue(all(not marker.exists() for marker in orphan_paths))
+
+
+    def test_protocol2_uses_legacy_marker_namespace(self):
+        m = self._import_safe_edit()
+        legacy_dir = Path(m._get_tmp_dir()) / "safe-edit" / "locks"
+        self.assertEqual(m._get_lock_dir(), legacy_dir)
+
+        path = self.tmpdir / "legacy-visible-v2.txt"
+        path.write_bytes(b"content\n")
+        with m.FileLock(path, 1, 0) as lock:
+            snapshot = m._read_lock_snapshot(lock.lock_path)
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(snapshot.protocol, 2)
+            self.assertEqual(lock.lock_path.parent, legacy_dir)
+
+    def test_live_protocol1_marker_blocks_protocol2(self):
+        m = self._import_safe_edit()
+        path = self.tmpdir / "v1-blocks-v2.txt"
+        path.write_bytes(b"content\n")
+        legacy_dir = Path(m._get_tmp_dir()) / "safe-edit" / "locks"
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        marker = legacy_dir / f"{m._get_lock_key(str(path))}.lock"
+        marker.write_text(
+            f"pid={os.getpid()} time={time.time()} protocol=1\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(m.SafeEditError):
+            with m.FileLock(path, 0.03, 120):
+                pass
+        self.assertTrue(marker.exists())
+        marker.unlink()
+
+    @unittest.skipIf(os.name == "nt", "POSIX legacy namespace test")
+    def test_independent_protocol1_process_interoperates_with_v2(self):
+        m = self._import_safe_edit()
+        if m._get_tmp_dir() != "/tmp":
+            self.skipTest("requires the historical /tmp namespace")
+        path = self.tmpdir / "independent-v1-v2.txt"
+        ready = self.tmpdir / "independent-v1.ready"
+        release = self.tmpdir / "independent-v1.release"
+        path.write_bytes(b"content\n")
+        v1_code = (
+            "import hashlib,os,pathlib,sys,time\n"
+            "target=os.path.abspath(sys.argv[1])\n"
+            "value=('path\\0'+os.path.normcase(target)).encode('utf-8')\n"
+            "key=hashlib.sha256(value).hexdigest()[:32]\n"
+            "lock=pathlib.Path('/tmp/safe-edit/locks')/(key+'.lock')\n"
+            "lock.parent.mkdir(parents=True,exist_ok=True)\n"
+            "fd=os.open(str(lock),os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)\n"
+            "os.write(fd,f'pid={os.getpid()} time={time.time()} protocol=1\\n'.encode())\n"
+            "os.close(fd)\n"
+            "pathlib.Path(sys.argv[2]).write_text('ready')\n"
+            "while not pathlib.Path(sys.argv[3]).exists(): time.sleep(0.005)\n"
+            "lock.unlink(missing_ok=True)\n"
+        )
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                v1_code,
+                str(path),
+                str(ready),
+                str(release),
+            ]
+        )
+        try:
+            deadline = time.monotonic() + 3
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertTrue(ready.exists())
+            with self.assertRaises(m.SafeEditError):
+                with m.FileLock(path, 0.05, 120):
+                    pass
+        finally:
+            release.write_text("release", encoding="utf-8")
+            try:
+                holder.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                holder.wait(timeout=3)
+        self.assertEqual(holder.returncode, 0)
+
+        with m.FileLock(path, 1, 0):
+            probe_code = (
+                "import hashlib,os,pathlib,sys\n"
+                "target=os.path.abspath(sys.argv[1])\n"
+                "value=('path\\0'+os.path.normcase(target)).encode('utf-8')\n"
+                "key=hashlib.sha256(value).hexdigest()[:32]\n"
+                "lock=pathlib.Path('/tmp/safe-edit/locks')/(key+'.lock')\n"
+                "try:\n"
+                " fd=os.open(str(lock),os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)\n"
+                "except FileExistsError: raise SystemExit(0)\n"
+                "os.close(fd); lock.unlink(missing_ok=True)\n"
+                "raise SystemExit(8)\n"
+            )
+            probe = subprocess.run(
+                [sys.executable, "-c", probe_code, str(path)],
+                timeout=3,
+            )
+        self.assertEqual(probe.returncode, 0)
+
+    def test_protocol2_same_pid_orphan_is_recovered_without_sleep(self):
+        m = self._import_safe_edit()
+        path = self.tmpdir / "protocol2-orphan.txt"
+        path.write_bytes(b"content\n")
+        lock = m.FileLock(path, 0, 0)
+        lock.lock_path.write_bytes(
+            m._build_lock_payload(path, "e" * 32, "owner")
+        )
+
+        with patch.object(
+            m.time,
+            "sleep",
+            side_effect=AssertionError("v2 orphan must be reclaimed immediately"),
+        ):
+            with lock:
+                self.assertTrue(lock.lock_path.exists())
+
+        self.assertFalse(lock.lock_path.exists())
+        stripe_paths = {
+            m._kernel_stripe_path(
+                m._kernel_stripe_for_lock(marker)
+            )
+            for marker, _target in lock._desired_lock_specs()
+        }
+        self.assertTrue(all(item.exists() for item in stripe_paths))
+
+    def test_own_lock_payload_is_bounded_for_very_long_target(self):
+        m = self._import_safe_edit()
+        target = Path("x" * 20000)
+        payload = m._build_lock_payload(target, "f" * 32, "owner")
+        self.assertLess(len(payload), m._LOCK_PAYLOAD_MAX_BYTES)
+        self.assertIn(b"protocol=2", payload)
+        self.assertIn(b"fileHash=", payload)
+
+    def test_external_oversized_lock_backs_off_then_ages_out(self):
+        m = self._import_safe_edit()
+        lock_path = self.tmpdir / "oversized-external.lock"
+        lock_path.write_bytes(b"x" * (m._LOCK_PAYLOAD_MAX_BYTES + 1))
+
+        snapshot = m._read_lock_snapshot(lock_path)
+        self.assertIsNotNone(snapshot)
+        self.assertFalse(snapshot.complete)
+        outcome = m._inspect_and_remove_stale_lock(lock_path, 120)
+        self.assertEqual(outcome.state, m._LOCK_CLEANUP_BUSY)
+        self.assertTrue(lock_path.exists())
+
+        old_time = time.time() - 10
+        os.utime(lock_path, (old_time, old_time))
+        outcome = m._inspect_and_remove_stale_lock(lock_path, 1)
+        self.assertEqual(outcome.state, m._LOCK_CLEANUP_REMOVED)
+        self.assertFalse(lock_path.exists())
+
+    def test_malformed_huge_pid_is_invalid_not_live(self):
+        m = self._import_safe_edit()
+        lock_path = self.tmpdir / "huge-pid.lock"
+        lock_path.write_bytes(
+            b"pid=999999999999999999999999 token=legacy time=1\n"
+        )
+        snapshot = m._read_lock_snapshot(lock_path)
+        self.assertIsNotNone(snapshot)
+        self.assertIsNone(snapshot.pid)
+        with patch.object(
+            m,
+            "_process_liveness",
+            side_effect=AssertionError("invalid PID must not reach liveness"),
+        ):
+            outcome = m._inspect_and_remove_stale_lock(lock_path, 120)
+        self.assertEqual(outcome.state, m._LOCK_CLEANUP_BUSY)
+        self.assertTrue(lock_path.exists())
+        self.assertEqual(
+            m._process_liveness(10 ** 100),
+            m._PROCESS_UNKNOWN,
+        )
+
+    def test_nonfinite_and_negative_lock_options_are_rejected(self):
+        path = self.tmpdir / "invalid-lock-option.txt"
+        path.write_bytes(b"foo\n")
+        cases = (
+            ("--lock-timeout", "nan"),
+            ("--lock-timeout", "inf"),
+            ("--lock-stale-seconds", "-1"),
+        )
+        for option, value in cases:
+            with self.subTest(option=option, value=value):
+                result = self.run_tool(
+                    "edit",
+                    "--file",
+                    path,
+                    "--old",
+                    "foo",
+                    "--new",
+                    "bar",
+                    option,
+                    value,
+                    "--json",
+                    expect=2,
+                )
+                payload = json.loads(result.stdout)
+                self.assertIn(
+                    "finite non-negative",
+                    payload["error"]["message"],
+                )
+                self.assertEqual(path.read_bytes(), b"foo\n")
+
+    def test_many_file_release_has_no_per_marker_timeout(self):
+        m = self._import_safe_edit()
+        paths = []
+        for index in range(24):
+            path = self.tmpdir / f"release-many-{index}.txt"
+            path.write_bytes(b"content\n")
+            paths.append(path)
+
+        lock = m.FileLockSet(paths, 1, 0)
+        lock.__enter__()
+        started = time.perf_counter()
+        lock.__exit__(None, None, None)
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 0.75)
+        self.assertFalse(lock._kernel_guards)
+        self.assertFalse(lock.acquired_lock_paths)
+
+    def test_kernel_stripe_blocks_legacy_marker_aba_across_processes(self):
+        m = self._import_safe_edit()
+        path = self.tmpdir / "kernel-aba-process.txt"
+        ready = self.tmpdir / "kernel-aba.ready"
+        release = self.tmpdir / "kernel-aba.release"
+        path.write_bytes(b"content\n")
+        holder_code = (
+            "import pathlib,runpy,sys,time\n"
+            "m=runpy.run_path(sys.argv[1])\n"
+            "target=pathlib.Path(sys.argv[2])\n"
+            "ready=pathlib.Path(sys.argv[3])\n"
+            "release=pathlib.Path(sys.argv[4])\n"
+            "with m['FileLock'](target,2,0):\n"
+            " ready.write_text('ready')\n"
+            " while not release.exists(): time.sleep(0.005)\n"
+        )
+        contender_code = (
+            "import pathlib,runpy,sys\n"
+            "m=runpy.run_path(sys.argv[1])\n"
+            "target=pathlib.Path(sys.argv[2])\n"
+            "try:\n"
+            " with m['FileLock'](target,0.08,0): pass\n"
+            "except m['SafeEditError']:\n"
+            " raise SystemExit(0)\n"
+            "raise SystemExit(9)\n"
+        )
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                holder_code,
+                str(SCRIPT),
+                str(path),
+                str(ready),
+                str(release),
+            ]
+        )
+        try:
+            deadline = time.monotonic() + 3
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertTrue(ready.exists())
+
+            marker = _get_lock_path(path)
+            snapshot = m._read_lock_snapshot(marker)
+            self.assertIsNotNone(snapshot)
+            marker.unlink()
+            marker.write_text(
+                f"pid={os.getpid()} token={'a' * 32} "
+                f"time={time.time()} protocol=1\n",
+                encoding="utf-8",
+            )
+
+            contender = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    contender_code,
+                    str(SCRIPT),
+                    str(path),
+                ],
+                timeout=3,
+            )
+            self.assertEqual(contender.returncode, 0)
+        finally:
+            release.write_text("release", encoding="utf-8")
+            try:
+                holder.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                holder.wait(timeout=3)
+            marker = _get_lock_path(path)
+            marker.unlink(missing_ok=True)
+
+        self.assertEqual(holder.returncode, 0)
 
 
     def test_replace_lines_preserves_indent_by_default(self):
@@ -5251,6 +6710,136 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
     # =========================================================================
     # check_fs_capability tests
     # =========================================================================
+
+    def test_probe_temp_file_uses_random_names_and_cleans_failures(self):
+        m = self._import_safe_edit()
+        tmp_dir = m._get_tmp_dir()
+        self.assertTrue(m._probe_temp_file(tmp_dir, ".safe-edit-probe-"))
+
+        real_mkstemp = m.tempfile.mkstemp
+        fd, path = real_mkstemp(
+            prefix=".safe-edit-close-", dir=tmp_dir
+        )
+        real_close = m.os.close
+        close_calls = [0]
+
+        def fail_first_close(value):
+            close_calls[0] += 1
+            if close_calls[0] == 1:
+                raise OSError("close-failure")
+            return real_close(value)
+
+        with patch.object(
+            m.tempfile, "mkstemp", return_value=(fd, path)
+        ), patch.object(m.os, "close", side_effect=fail_first_close):
+            self.assertFalse(m._probe_temp_file(tmp_dir, ".safe-edit-close-"))
+        self.assertFalse(Path(path).exists())
+
+        fd, path = real_mkstemp(
+            prefix=".safe-edit-unlink-", dir=tmp_dir
+        )
+        real_unlink = m.os.unlink
+        unlink_calls = [0]
+
+        def fail_first_unlink(value):
+            unlink_calls[0] += 1
+            if unlink_calls[0] == 1:
+                raise OSError("unlink-failure")
+            return real_unlink(value)
+
+        with patch.object(
+            m.tempfile, "mkstemp", return_value=(fd, path)
+        ), patch.object(m.os, "unlink", side_effect=fail_first_unlink):
+            self.assertFalse(m._probe_temp_file(tmp_dir, ".safe-edit-unlink-"))
+        self.assertFalse(Path(path).exists())
+
+        with patch.object(
+            m.tempfile, "mkstemp", side_effect=OSError("probe-failure")
+        ):
+            self.assertFalse(m._probe_temp_file(tmp_dir, ".safe-edit-fail-"))
+
+    def test_check_fs_capability_random_probes_and_shared_tmp_flags(self):
+        m = self._import_safe_edit()
+        path = self.tmpdir / "cap-random.txt"
+        path.write_bytes(b"test\n")
+        tmp_dir = m._get_tmp_dir()
+        real_mkstemp = m.tempfile.mkstemp
+
+        with patch.object(
+            m.tempfile, "mkstemp", wraps=real_mkstemp
+        ) as mkstemp_mock:
+            result = m.check_fs_capability(str(path))
+        self.assertEqual(mkstemp_mock.call_count, 2)
+        self.assertTrue(result["canWriteTmp"])
+        self.assertTrue(result["canCreateLock"])
+        prefixes = [call.kwargs.get("prefix", "") for call in mkstemp_mock.call_args_list]
+        self.assertEqual(prefixes, [".safe-edit-probe-"] * 2)
+        self.assertTrue(all(call.kwargs["dir"] for call in mkstemp_mock.call_args_list))
+        self.assertIn(tmp_dir, [call.kwargs["dir"] for call in mkstemp_mock.call_args_list])
+
+        calls = [0]
+
+        def fail_tmp_probe(*args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 2:
+                raise OSError("tmp-probe-failure")
+            return real_mkstemp(*args, **kwargs)
+
+        with patch.object(
+            m.tempfile, "mkstemp", side_effect=fail_tmp_probe
+        ):
+            failed = m.check_fs_capability(str(path))
+        self.assertFalse(failed["canWriteTmp"])
+        self.assertFalse(failed["canCreateLock"])
+        self.assertIn("Cannot write to", " ".join(failed["suggestions"]))
+        self.assertIn("Cannot create lock in", " ".join(failed["suggestions"]))
+
+    def test_fixed_temp_probe_name_does_not_block_tmp_selection(self):
+        if os.name == "nt":
+            self.skipTest("fixed /tmp probe is POSIX-only")
+        m = self._import_safe_edit()
+        fixed = Path("/tmp/.safe-edit-probe")
+        created_by_test = False
+        try:
+            try:
+                fd = os.open(
+                    str(fixed),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+            except FileExistsError:
+                pass
+            else:
+                created_by_test = True
+                os.close(fd)
+            m._get_tmp_dir.cache_clear()
+            self.assertEqual(m._get_tmp_dir(), "/tmp")
+        finally:
+            if created_by_test:
+                fixed.unlink(missing_ok=True)
+            m._get_tmp_dir.cache_clear()
+
+    def test_target_directory_fixed_probe_name_does_not_block_random_probe(self):
+        m = self._import_safe_edit()
+        fixed = self.tmpdir / ".safe-edit-probe"
+        created_by_test = False
+        try:
+            try:
+                fd = os.open(
+                    str(fixed),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+            except FileExistsError:
+                pass
+            else:
+                created_by_test = True
+                os.close(fd)
+            result = m.check_fs_capability(str(self.tmpdir / "target.txt"))
+            self.assertTrue(result["directoryWritable"])
+        finally:
+            if created_by_test:
+                fixed.unlink(missing_ok=True)
 
     def test_check_fs_capability_returns_required_keys(self):
         """Test check_fs_capability returns all required keys."""
@@ -5671,7 +7260,7 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
             call for call in read_mock.call_args_list
             if os.path.samefile(str(call.args[0]), str(target))
         ]
-        self.assertEqual(len(target_reads), 2)
+        self.assertEqual(len(target_reads), 1)
         self.assertEqual(apply_mock.call_count, 1)
         self.assertEqual(json_loads_mock.call_count, 1)
         self.assertTrue(result["written"])
@@ -5707,21 +7296,21 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         args = m.build_parser().parse_args(
             ["transaction", "--request-file", str(request)]
         )
-        real_read_target = m.read_target
-        reads = {"target": 0}
+        def mutate_before_commit(_plans):
+            target.write_bytes(b"external\n")
 
-        def mutate_before_commit(path, max_bytes):
-            if os.path.samefile(str(path), str(target)):
-                reads["target"] += 1
-                if reads["target"] == 2:
-                    target.write_bytes(b"external\n")
-            return real_read_target(path, max_bytes)
-
-        with patch.object(m, "read_target", side_effect=mutate_before_commit):
+        with patch.object(
+            m,
+            "_transaction_before_mutations",
+            side_effect=mutate_before_commit,
+        ):
             with self.assertRaises(m.SafeEditError) as ctx:
                 m.run(args)
 
-        self.assertIn("target changed after transaction prevalidation", str(ctx.exception))
+        self.assertIn(
+            "target metadata changed after transaction prevalidation",
+            str(ctx.exception),
+        )
         self.assertEqual(target.read_bytes(), b"external\n")
 
     def test_transaction_commit_mismatch_preserves_hash_diagnostics(self):
@@ -5754,17 +7343,21 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         args = m.build_parser().parse_args(
             ["transaction", "--request-file", str(request)]
         )
-        real_read_target = m.read_target
-        reads = {"target": 0}
+        real_checkpoint = m._revalidate_prepared_checkpoint
+        mutated = {"done": False}
 
-        def mutate_before_commit(path, max_bytes):
-            if os.path.samefile(str(path), str(target)):
-                reads["target"] += 1
-                if reads["target"] == 2:
-                    target.write_bytes(b"external\n")
-            return real_read_target(path, max_bytes)
+        def mutate_after_checkpoint(runtime):
+            checked = real_checkpoint(runtime)
+            if not mutated["done"]:
+                target.write_bytes(b"external\n")
+                mutated["done"] = True
+            return checked
 
-        with patch.object(m, "read_target", side_effect=mutate_before_commit):
+        with patch.object(
+            m,
+            "_revalidate_prepared_checkpoint",
+            side_effect=mutate_after_checkpoint,
+        ):
             with self.assertRaises(m.SafeEditError) as ctx:
                 m.run(args)
 
@@ -5834,21 +7427,2524 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         args = m.build_parser().parse_args(
             ["transaction", "--request-file", str(request)]
         )
-        real_create = m.exclusive_create
-        calls = {"count": 0}
+        def fail_after_first(_mutation, _file_index):
+            raise m.SafeEditError("injected write failure")
 
-        def fail_second(path, data):
-            calls["count"] += 1
-            if calls["count"] == 2:
-                raise m.SafeEditError("injected write failure")
-            return real_create(path, data)
-
-        with patch.object(m, "exclusive_create", side_effect=fail_second):
+        with patch.object(
+            m,
+            "_transaction_after_mutation",
+            side_effect=fail_after_first,
+        ):
             with self.assertRaises(m.SafeEditError) as ctx:
                 m.run(args)
         self.assertIn("transaction rolled back", str(ctx.exception))
         self.assertFalse(first.exists())
         self.assertFalse(second.exists())
+
+    def test_transaction_prepare_rejects_same_hash_identity_swap(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "preview-swap.txt"
+        alternate = self.tmpdir / "preview-alternate.txt"
+        target.write_bytes(b"alpha\n")
+        alternate.write_bytes(b"alpha\n")
+        alternate_identity = m._prepared_path_identity(alternate)
+        args = self._transaction_args(m)
+        payload = self._edit_transaction_payload(target)
+        real_read = m.read_target
+        swapped = {"done": False}
+
+        def swap_before_preview_read(path, max_bytes):
+            if (
+                not swapped["done"]
+                and m._transaction_path_identity(Path(path))
+                == m._transaction_path_identity(target)
+            ):
+                os.replace(alternate, target)
+                swapped["done"] = True
+            return real_read(path, max_bytes)
+
+        with patch.object(
+            m,
+            "read_target",
+            side_effect=swap_before_preview_read,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.prepare_transaction(args, payload)
+
+        self.assertTrue(swapped["done"])
+        self.assertIn("target identity changed", str(ctx.exception))
+        self.assertEqual(
+            m._prepared_path_identity(target),
+            alternate_identity,
+        )
+        self.assertEqual(target.read_bytes(), b"alpha\n")
+
+    def test_transaction_commit_rejects_parent_swap_with_same_hash(self):
+        m = self._import_safe_edit()
+        parent = self.tmpdir / "prepared-parent"
+        moved = self.tmpdir / "moved-parent"
+        parent.mkdir()
+        target = parent / "target.txt"
+        target.write_bytes(b"alpha\n")
+        args = self._transaction_args(m)
+        prepared = m.prepare_transaction(
+            args,
+            self._edit_transaction_payload(target),
+        )
+
+        parent.rename(moved)
+        parent.mkdir()
+        rebound = parent / target.name
+        rebound.write_bytes(b"alpha\n")
+
+        with self.assertRaises(m.SafeEditError) as ctx:
+            m.commit_prepared_transaction(prepared)
+
+        self.assertIn("parent", str(ctx.exception).lower())
+        self.assertEqual((moved / target.name).read_bytes(), b"alpha\n")
+        self.assertEqual(rebound.read_bytes(), b"alpha\n")
+
+    def test_transaction_last_same_hash_swap_causes_zero_writes(self):
+        m = self._import_safe_edit()
+        first = self.tmpdir / "zero-write-first.txt"
+        second = self.tmpdir / "zero-write-second.txt"
+        alternate = self.tmpdir / "zero-write-alternate.txt"
+        first.write_bytes(b"alpha\n")
+        second.write_bytes(b"alpha\n")
+        alternate.write_bytes(b"alpha\n")
+        args = self._transaction_args(m)
+        first_file = self._edit_transaction_payload(first)["files"][0]
+        second_file = self._edit_transaction_payload(second)["files"][0]
+        prepared = m.prepare_transaction(
+            args,
+            {"files": [first_file, second_file]},
+        )
+
+        def replace_last_with_same_hash(_plans):
+            os.replace(alternate, second)
+
+        with patch.object(
+            m,
+            "_transaction_before_mutations",
+            side_effect=replace_last_with_same_hash,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.commit_prepared_transaction(prepared)
+
+        self.assertIn("identity changed", str(ctx.exception))
+        self.assertEqual(first.read_bytes(), b"alpha\n")
+        self.assertEqual(second.read_bytes(), b"alpha\n")
+
+    def test_transaction_type_change_causes_zero_writes(self):
+        m = self._import_safe_edit()
+        first = self.tmpdir / "type-first.txt"
+        second = self.tmpdir / "type-second.txt"
+        first.write_bytes(b"alpha\n")
+        second.write_bytes(b"alpha\n")
+        args = self._transaction_args(m)
+        prepared = m.prepare_transaction(
+            args,
+            {
+                "files": [
+                    self._edit_transaction_payload(first)["files"][0],
+                    self._edit_transaction_payload(second)["files"][0],
+                ]
+            },
+        )
+        second.unlink()
+        second.mkdir()
+
+        with self.assertRaises(m.SafeEditError):
+            m.commit_prepared_transaction(prepared)
+
+        self.assertEqual(first.read_bytes(), b"alpha\n")
+        self.assertTrue(second.is_dir())
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory-fd semantics")
+    def test_transaction_posix_parent_rebind_after_pin_causes_zero_writes(self):
+        m = self._import_safe_edit()
+        parent = self.tmpdir / "pinned-parent"
+        moved = self.tmpdir / "pinned-parent-moved"
+        parent.mkdir()
+        target = parent / "target.txt"
+        target.write_bytes(b"alpha\n")
+        args = self._transaction_args(m)
+        prepared = m.prepare_transaction(
+            args,
+            self._edit_transaction_payload(target),
+        )
+
+        def rebind_parent_after_pin(_plans):
+            parent.rename(moved)
+            parent.mkdir()
+            (parent / target.name).write_bytes(b"alpha\n")
+
+        with patch.object(
+            m,
+            "_transaction_before_mutations",
+            side_effect=rebind_parent_after_pin,
+        ):
+            with self.assertRaises(m.SafeEditError):
+                m.commit_prepared_transaction(prepared)
+
+        self.assertEqual((moved / target.name).read_bytes(), b"alpha\n")
+        self.assertEqual((parent / target.name).read_bytes(), b"alpha\n")
+
+    @unittest.skipIf(os.name == "nt", "backslash is a separator on Windows")
+    def test_transaction_posix_allows_backslash_in_basename(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "literal\\backslash.txt"
+        target.write_bytes(b"alpha\n")
+
+        result = m.run_transaction_payload(
+            self._transaction_args(m),
+            self._edit_transaction_payload(target),
+        )
+
+        self.assertTrue(result["written"])
+        self.assertEqual(target.read_bytes(), b"beta\n")
+
+    def test_transaction_successful_rollback_reports_actual_state(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "rollback-state.txt"
+        target.write_bytes(b"alpha\n")
+
+        def fail_after_write(_mutation, _file_index):
+            raise RuntimeError("injected post-write failure")
+
+        with patch.object(
+            m,
+            "_transaction_after_mutation",
+            side_effect=fail_after_write,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertEqual(target.read_bytes(), b"alpha\n")
+        self.assertFalse(payload["written"])
+        self.assertTrue(payload["rolledBack"])
+        self.assertFalse(payload["partialWrite"])
+        self.assertFalse(payload["rollbackConflict"])
+
+    def test_transaction_create_rollback_preserves_external_replacement(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "create-external-replace.txt"
+        create_payload = {
+            "files": [
+                {
+                    "file": str(target),
+                    "action": "create",
+                    "text": "owned",
+                    "encoding": "utf-8",
+                    "lineEnding": "lf",
+                }
+            ]
+        }
+
+        def replace_then_fail(_mutation, _file_index):
+            target.unlink()
+            target.write_bytes(b"external")
+            raise RuntimeError("external replacement")
+
+        with patch.object(
+            m,
+            "_transaction_after_mutation",
+            side_effect=replace_then_fail,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    create_payload,
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertEqual(target.read_bytes(), b"external")
+        self.assertFalse(payload["written"])
+        self.assertFalse(payload["rolledBack"])
+        self.assertTrue(payload["partialWrite"])
+        self.assertTrue(payload["rollbackConflict"])
+
+    def test_transaction_create_rollback_preserves_external_modification(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "create-external-modify.txt"
+        create_payload = {
+            "files": [
+                {
+                    "file": str(target),
+                    "action": "create",
+                    "text": "owned",
+                    "encoding": "utf-8",
+                    "lineEnding": "lf",
+                }
+            ]
+        }
+
+        def modify_then_fail(_mutation, _file_index):
+            target.write_bytes(b"external")
+            raise RuntimeError("external modification")
+
+        with patch.object(
+            m,
+            "_transaction_after_mutation",
+            side_effect=modify_then_fail,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    create_payload,
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertEqual(target.read_bytes(), b"external")
+        self.assertFalse(payload["written"])
+        self.assertFalse(payload["rolledBack"])
+        self.assertTrue(payload["partialWrite"])
+        self.assertTrue(payload["rollbackConflict"])
+
+    def test_transaction_edit_rollback_preserves_external_replacement(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "edit-external-replace.txt"
+        alternate = self.tmpdir / "edit-external-alternate.txt"
+        target.write_bytes(b"alpha\n")
+
+        def replace_then_fail(_mutation, _file_index):
+            alternate.write_bytes(b"external")
+            os.replace(alternate, target)
+            raise RuntimeError("external replacement")
+
+        with patch.object(
+            m,
+            "_transaction_after_mutation",
+            side_effect=replace_then_fail,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertEqual(target.read_bytes(), b"external")
+        self.assertFalse(payload["written"])
+        self.assertFalse(payload["rolledBack"])
+        self.assertTrue(payload["partialWrite"])
+        self.assertTrue(payload["rollbackConflict"])
+
+    def test_transaction_rollback_failure_reports_remaining_output(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "rollback-failure.txt"
+        create_payload = {
+            "files": [
+                {
+                    "file": str(target),
+                    "action": "create",
+                    "text": "owned",
+                    "encoding": "utf-8",
+                    "lineEnding": "lf",
+                }
+            ]
+        }
+
+        with patch.object(
+            m,
+            "_transaction_after_mutation",
+            side_effect=RuntimeError("post-write failure"),
+        ), patch.object(
+            m,
+            "_rollback_prepared_mutation",
+            side_effect=m.SafeEditError("rollback injected failure"),
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    create_payload,
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertEqual(target.read_bytes(), b"owned")
+        self.assertTrue(payload["written"])
+        self.assertFalse(payload["rolledBack"])
+        self.assertTrue(payload["partialWrite"])
+        self.assertFalse(payload["rollbackConflict"])
+        self.assertTrue(payload["rollbackErrors"])
+
+    def test_transaction_post_write_verify_failure_rolls_back(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "post-verify-failure.txt"
+        target.write_bytes(b"alpha\n")
+        real_read = m._read_pinned_entry
+        corrupted = {"done": False}
+        output_sha = hashlib.sha256(b"beta\n").hexdigest()
+
+        def corrupt_one_post_write_snapshot(*args, **kwargs):
+            snapshot = real_read(*args, **kwargs)
+            if (
+                snapshot.sha256 == output_sha
+                and args[1] == target.name
+                and not corrupted["done"]
+            ):
+                corrupted["done"] = True
+                return snapshot._replace(sha256="0" * 64)
+            return snapshot
+
+        with patch.object(
+            m,
+            "_read_pinned_entry",
+            side_effect=corrupt_one_post_write_snapshot,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertTrue(corrupted["done"])
+        self.assertEqual(target.read_bytes(), b"alpha\n")
+        self.assertFalse(payload["written"])
+        self.assertTrue(payload["rolledBack"])
+        self.assertFalse(payload["partialWrite"])
+
+    def test_transaction_partial_create_is_safely_rolled_back(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "partial-create.txt"
+        create_payload = {
+            "files": [
+                {
+                    "file": str(target),
+                    "action": "create",
+                    "text": "abcdef",
+                    "encoding": "utf-8",
+                    "lineEnding": "lf",
+                }
+            ]
+        }
+        real_write = m.os.write
+        calls = {"count": 0}
+
+        def write_part_then_fail(fd, data):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return real_write(fd, data[:2])
+            raise OSError("injected partial write")
+
+        with patch.object(
+            m.os,
+            "write",
+            side_effect=write_part_then_fail,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    create_payload,
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertFalse(target.exists())
+        self.assertFalse(payload["written"])
+        self.assertFalse(payload["rolledBack"])
+        self.assertFalse(payload["partialWrite"])
+        self.assertFalse(payload["rollbackConflict"])
+
+    def test_transaction_create_fstat_failure_retains_unverified_stage(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "create-fstat-failure.txt"
+        create_payload = {
+            "files": [
+                {
+                    "file": str(target),
+                    "action": "create",
+                    "text": "owned",
+                    "encoding": "utf-8",
+                    "lineEnding": "lf",
+                }
+            ]
+        }
+        captured = {"fd": None}
+        real_open = m._PreparedParentPin.open_exclusive
+        real_fstat = m.os.fstat
+
+        def capture_create_fd(pin, basename, mode):
+            fd = real_open(pin, basename, mode)
+            if basename.endswith(".txn"):
+                captured["fd"] = fd
+            return fd
+
+        def fail_created_fstat(fd):
+            if fd == captured["fd"]:
+                raise OSError("injected created fstat failure")
+            return real_fstat(fd)
+
+        with patch.object(
+            m._PreparedParentPin,
+            "open_exclusive",
+            new=capture_create_fd,
+        ), patch.object(
+            m.os,
+            "fstat",
+            side_effect=fail_created_fstat,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    create_payload,
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertFalse(target.exists())
+        self.assertFalse(payload["written"])
+        self.assertFalse(payload["rolledBack"])
+        self.assertTrue(payload["partialWrite"])
+        artifacts = list(self.tmpdir.glob(".safe-edit-*.txn"))
+        self.assertEqual(len(artifacts), 1)
+        diagnostics = " ".join(payload["rollbackErrors"])
+        self.assertIn(
+            f"artifact basename={artifacts[0].name!r}",
+            diagnostics,
+        )
+        self.assertIn("pinned parent identity=", diagnostics)
+        self.assertIn("best-effort path=", diagnostics)
+
+    def test_transaction_stage_fstat_failure_retains_unverified_stage(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "stage-fstat-failure.txt"
+        target.write_bytes(b"alpha\n")
+        captured = {"fd": None}
+        real_open = m._PreparedParentPin.open_exclusive
+        real_fstat = m.os.fstat
+
+        def capture_stage_fd(pin, basename, mode):
+            fd = real_open(pin, basename, mode)
+            if basename.endswith(".txn"):
+                captured["fd"] = fd
+            return fd
+
+        def fail_stage_fstat(fd):
+            if fd == captured["fd"]:
+                raise OSError("injected stage fstat failure")
+            return real_fstat(fd)
+
+        with patch.object(
+            m._PreparedParentPin,
+            "open_exclusive",
+            new=capture_stage_fd,
+        ), patch.object(
+            m.os,
+            "fstat",
+            side_effect=fail_stage_fstat,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertEqual(target.read_bytes(), b"alpha\n")
+        self.assertFalse(payload["written"])
+        self.assertTrue(payload["partialWrite"])
+        artifacts = list(self.tmpdir.glob(".safe-edit-*.txn"))
+        self.assertEqual(len(artifacts), 1)
+        diagnostics = " ".join(payload["rollbackErrors"])
+        self.assertIn(
+            f"artifact basename={artifacts[0].name!r}",
+            diagnostics,
+        )
+        self.assertIn("pinned parent identity=", diagnostics)
+        self.assertIn("best-effort path=", diagnostics)
+
+    def test_transaction_create_close_failure_rolls_back(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "create-close-failure.txt"
+        create_payload = {
+            "files": [
+                {
+                    "file": str(target),
+                    "action": "create",
+                    "text": "owned",
+                    "encoding": "utf-8",
+                    "lineEnding": "lf",
+                }
+            ]
+        }
+        captured = {"fd": None, "failed": False}
+        real_open = m._PreparedParentPin.open_exclusive
+        real_close = m.os.close
+
+        def capture_create_fd(pin, basename, mode):
+            fd = real_open(pin, basename, mode)
+            if basename.endswith(".txn"):
+                captured["fd"] = fd
+            return fd
+
+        def close_then_fail(fd):
+            if fd == captured["fd"] and not captured["failed"]:
+                captured["failed"] = True
+                real_close(fd)
+                raise OSError("injected created close failure")
+            return real_close(fd)
+
+        with patch.object(
+            m._PreparedParentPin,
+            "open_exclusive",
+            new=capture_create_fd,
+        ), patch.object(
+            m.os,
+            "close",
+            side_effect=close_then_fail,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    create_payload,
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertTrue(captured["failed"])
+        self.assertFalse(target.exists())
+        self.assertFalse(payload["written"])
+        self.assertFalse(payload["rolledBack"])
+        self.assertEqual(
+            list(self.tmpdir.glob(".safe-edit-*.txn")),
+            [],
+        )
+
+    def test_transaction_create_fsync_failure_rolls_back(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "create-fsync-failure.txt"
+        create_payload = {
+            "files": [
+                {
+                    "file": str(target),
+                    "action": "create",
+                    "text": "owned",
+                    "encoding": "utf-8",
+                    "lineEnding": "lf",
+                }
+            ]
+        }
+        captured = {"fd": None, "failed": False}
+        real_open = m._PreparedParentPin.open_exclusive
+        real_fsync = m.os.fsync
+
+        def capture_create_fd(pin, basename, mode):
+            fd = real_open(pin, basename, mode)
+            if basename.endswith(".txn"):
+                captured["fd"] = fd
+            return fd
+
+        def fail_created_fsync(fd):
+            if fd == captured["fd"] and not captured["failed"]:
+                captured["failed"] = True
+                raise OSError("injected created fsync failure")
+            return real_fsync(fd)
+
+        with patch.object(
+            m._PreparedParentPin,
+            "open_exclusive",
+            new=capture_create_fd,
+        ), patch.object(
+            m.os,
+            "fsync",
+            side_effect=fail_created_fsync,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    create_payload,
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertTrue(captured["failed"])
+        self.assertFalse(target.exists())
+        self.assertFalse(payload["written"])
+        self.assertFalse(payload["rolledBack"])
+        self.assertEqual(
+            list(self.tmpdir.glob(".safe-edit-*.txn")),
+            [],
+        )
+
+    def test_transaction_stage_close_failure_cleans_stage(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "stage-close-failure.txt"
+        target.write_bytes(b"alpha\n")
+        captured = {"fd": None, "failed": False}
+        real_open = m._PreparedParentPin.open_exclusive
+        real_close = m.os.close
+
+        def capture_stage_fd(pin, basename, mode):
+            fd = real_open(pin, basename, mode)
+            if basename.endswith(".txn"):
+                captured["fd"] = fd
+            return fd
+
+        def close_stage_then_fail(fd):
+            if fd == captured["fd"] and not captured["failed"]:
+                captured["failed"] = True
+                real_close(fd)
+                raise OSError("injected stage close failure")
+            return real_close(fd)
+
+        with patch.object(
+            m._PreparedParentPin,
+            "open_exclusive",
+            new=capture_stage_fd,
+        ), patch.object(
+            m.os,
+            "close",
+            side_effect=close_stage_then_fail,
+        ):
+            with self.assertRaises(m.SafeEditError):
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        self.assertTrue(captured["failed"])
+        self.assertEqual(target.read_bytes(), b"alpha\n")
+        self.assertEqual(
+            list(self.tmpdir.glob(".safe-edit-*.txn")),
+            [],
+        )
+
+    def test_transaction_stage_fsync_failure_cleans_stage(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "stage-fsync-failure.txt"
+        target.write_bytes(b"alpha\n")
+        captured = {"fd": None, "failed": False}
+        real_open = m._PreparedParentPin.open_exclusive
+        real_fsync = m.os.fsync
+
+        def capture_stage_fd(pin, basename, mode):
+            fd = real_open(pin, basename, mode)
+            if basename.endswith(".txn"):
+                captured["fd"] = fd
+            return fd
+
+        def fail_stage_fsync(fd):
+            if fd == captured["fd"] and not captured["failed"]:
+                captured["failed"] = True
+                raise OSError("injected stage fsync failure")
+            return real_fsync(fd)
+
+        with patch.object(
+            m._PreparedParentPin,
+            "open_exclusive",
+            new=capture_stage_fd,
+        ), patch.object(
+            m.os,
+            "fsync",
+            side_effect=fail_stage_fsync,
+        ):
+            with self.assertRaises(m.SafeEditError):
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        self.assertTrue(captured["failed"])
+        self.assertEqual(target.read_bytes(), b"alpha\n")
+        self.assertEqual(
+            list(self.tmpdir.glob(".safe-edit-*.txn")),
+            [],
+        )
+
+    def test_transaction_claim_preserves_external_generation(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "claim-external.txt"
+        replacement = self.tmpdir / "claim-external-replacement.txt"
+        target.write_bytes(b"alpha\n")
+        real_move = m._PreparedParentPin.move_entry_noreplace
+        injected = {"done": False}
+
+        def replace_before_claim(
+            pin,
+            source,
+            destination,
+            *,
+            recovery=False,
+        ):
+            if (
+                not recovery
+                and source == target.name
+                and destination.endswith(".txn")
+                and not injected["done"]
+            ):
+                replacement.write_bytes(b"external\n")
+                os.replace(replacement, target)
+                injected["done"] = True
+            return real_move(
+                pin,
+                source,
+                destination,
+                recovery=recovery,
+            )
+
+        with patch.object(
+            m._PreparedParentPin,
+            "move_entry_noreplace",
+            new=replace_before_claim,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertTrue(injected["done"])
+        self.assertEqual(target.read_bytes(), b"external\n")
+        self.assertFalse(payload["written"])
+        self.assertFalse(payload["partialWrite"])
+        self.assertTrue(payload["rollbackConflict"])
+        self.assertEqual(
+            list(self.tmpdir.glob(".safe-edit-*.txn")),
+            [],
+        )
+
+    def test_transaction_edit_install_collision_preserves_external(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "edit-install-collision.txt"
+        target.write_bytes(b"alpha\n")
+        real_move = m._PreparedParentPin.move_entry_noreplace
+        injected = {"done": False}
+
+        def collide_before_install(
+            pin,
+            source,
+            destination,
+            *,
+            recovery=False,
+        ):
+            if (
+                not recovery
+                and source.endswith(".txn")
+                and destination == target.name
+                and not injected["done"]
+            ):
+                target.write_bytes(b"external\n")
+                injected["done"] = True
+            return real_move(
+                pin,
+                source,
+                destination,
+                recovery=recovery,
+            )
+
+        with patch.object(
+            m._PreparedParentPin,
+            "move_entry_noreplace",
+            new=collide_before_install,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        artifacts = list(self.tmpdir.glob(".safe-edit-*.txn"))
+        self.assertEqual(target.read_bytes(), b"external\n")
+        self.assertFalse(payload["written"])
+        self.assertTrue(payload["partialWrite"])
+        self.assertTrue(payload["rollbackConflict"])
+        self.assertEqual(len(artifacts), 1)
+        self.assertIn(
+            str(artifacts[0]),
+            " ".join(payload["rollbackErrors"]),
+        )
+
+    def test_transaction_create_install_collision_preserves_external(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "create-install-collision.txt"
+        real_move = m._PreparedParentPin.move_entry_noreplace
+        injected = {"done": False}
+
+        def collide_before_install(
+            pin,
+            source,
+            destination,
+            *,
+            recovery=False,
+        ):
+            if (
+                not recovery
+                and source.endswith(".txn")
+                and destination == target.name
+                and not injected["done"]
+            ):
+                target.write_bytes(b"external")
+                injected["done"] = True
+            return real_move(
+                pin,
+                source,
+                destination,
+                recovery=recovery,
+            )
+
+        with patch.object(
+            m._PreparedParentPin,
+            "move_entry_noreplace",
+            new=collide_before_install,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._create_transaction_payload(target),
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertEqual(target.read_bytes(), b"external")
+        self.assertFalse(payload["written"])
+        self.assertFalse(payload["partialWrite"])
+        self.assertTrue(payload["rollbackConflict"])
+        self.assertEqual(
+            list(self.tmpdir.glob(".safe-edit-*.txn")),
+            [],
+        )
+
+    def test_transaction_edit_install_error_after_move_rolls_back(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "edit-install-after-move.txt"
+        target.write_bytes(b"alpha\n")
+        real_move = m._PreparedParentPin.move_entry_noreplace
+        injected = {"done": False}
+
+        def move_then_fail(
+            pin,
+            source,
+            destination,
+            *,
+            recovery=False,
+        ):
+            result = real_move(
+                pin,
+                source,
+                destination,
+                recovery=recovery,
+            )
+            if (
+                not recovery
+                and source.endswith(".txn")
+                and destination == target.name
+                and not injected["done"]
+            ):
+                injected["done"] = True
+                raise OSError("injected error after install")
+            return result
+
+        with patch.object(
+            m._PreparedParentPin,
+            "move_entry_noreplace",
+            new=move_then_fail,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertEqual(target.read_bytes(), b"alpha\n")
+        self.assertFalse(payload["written"])
+        self.assertTrue(payload["rolledBack"])
+        self.assertFalse(payload["partialWrite"])
+        self.assertFalse(payload["rollbackConflict"])
+        self.assertEqual(
+            list(self.tmpdir.glob(".safe-edit-*.txn")),
+            [],
+        )
+
+    def test_transaction_claim_error_after_move_restores_original(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "claim-after-move.txt"
+        target.write_bytes(b"alpha\n")
+        real_move = m._PreparedParentPin.move_entry_noreplace
+        real_restore = m._restore_claimed_entry
+        restore_phases = []
+        injected = {"done": False}
+
+        def move_then_fail(
+            pin,
+            source,
+            destination,
+            *,
+            recovery=False,
+        ):
+            result = real_move(
+                pin,
+                source,
+                destination,
+                recovery=recovery,
+            )
+            if (
+                not recovery
+                and source == target.name
+                and destination.endswith(".txn")
+                and not injected["done"]
+            ):
+                injected["done"] = True
+                raise OSError("injected error after claim")
+            return result
+
+        def observe_restore(*args, **kwargs):
+            result = real_restore(*args, **kwargs)
+            journal = kwargs["journal"]
+            restore_phases.append(
+                (kwargs["phase_prefix"], journal.phase)
+            )
+            return result
+        with patch.object(
+            m._PreparedParentPin,
+            "move_entry_noreplace",
+            new=move_then_fail,
+        ), patch.object(
+            m,
+            "_restore_claimed_entry",
+            side_effect=observe_restore,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertEqual(target.read_bytes(), b"alpha\n")
+        self.assertFalse(payload["written"])
+        self.assertFalse(payload["partialWrite"])
+        self.assertTrue(payload["rollbackConflict"])
+        self.assertEqual(
+            list(self.tmpdir.glob(".safe-edit-*.txn")),
+            [],
+        )
+        self.assertEqual(
+            restore_phases,
+            [
+                (
+                    "RECONCILE_CLAIM_RESTORE",
+                    "RECONCILE_CLAIM_RESTORE_SYNCED",
+                )
+            ],
+        )
+    def test_transaction_cleanup_error_after_unlink_is_verified(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "unlink-after-success.txt"
+        target.write_bytes(b"alpha\n")
+        real_unlink = m._PreparedParentPin.unlink_entry
+        injected = {"done": False}
+
+        def unlink_then_fail(pin, basename, *, recovery=False):
+            result = real_unlink(
+                pin,
+                basename,
+                recovery=recovery,
+            )
+            if basename.endswith(".txn") and not injected["done"]:
+                injected["done"] = True
+                raise OSError("injected error after unlink")
+            return result
+
+        with patch.object(
+            m._PreparedParentPin,
+            "unlink_entry",
+            new=unlink_then_fail,
+        ):
+            result = m.run_transaction_payload(
+                self._transaction_args(m),
+                self._edit_transaction_payload(target),
+            )
+
+        self.assertTrue(result["written"])
+        self.assertNotIn("cleanupWarnings", result)
+        self.assertEqual(target.read_bytes(), b"beta\n")
+        self.assertEqual(
+            list(self.tmpdir.glob(".safe-edit-*.txn")),
+            [],
+        )
+
+    def test_transaction_cleanup_failure_retains_diagnostic_artifact(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "unlink-retained.txt"
+        target.write_bytes(b"alpha\n")
+        real_unlink = m._PreparedParentPin.unlink_entry
+        injected = {"done": False}
+
+        def fail_one_unlink(pin, basename, *, recovery=False):
+            if basename.endswith(".txn") and not injected["done"]:
+                injected["done"] = True
+                raise OSError("injected unlink failure")
+            return real_unlink(
+                pin,
+                basename,
+                recovery=recovery,
+            )
+
+        with patch.object(
+            m._PreparedParentPin,
+            "unlink_entry",
+            new=fail_one_unlink,
+        ):
+            result = m.run_transaction_payload(
+                self._transaction_args(m),
+                self._edit_transaction_payload(target),
+            )
+
+        artifacts = list(self.tmpdir.glob(".safe-edit-*.txn"))
+        self.assertTrue(result["written"])
+        self.assertEqual(target.read_bytes(), b"beta\n")
+        self.assertEqual(len(artifacts), 1)
+        self.assertIn("cleanupWarnings", result)
+        diagnostics = " ".join(result["cleanupWarnings"])
+        self.assertIn(str(artifacts[0]), diagnostics)
+        self.assertIn(
+            f"artifact basename={artifacts[0].name!r}",
+            diagnostics,
+        )
+        self.assertIn("pinned parent identity=", diagnostics)
+        self.assertIn("best-effort path=", diagnostics)
+
+    def test_transaction_keyboard_interrupt_after_mutation_rolls_back(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "keyboard-after-mutation.txt"
+        target.write_bytes(b"alpha\n")
+
+        with patch.object(
+            m,
+            "_transaction_after_mutation",
+            side_effect=KeyboardInterrupt("injected interrupt"),
+        ):
+            with self.assertRaises(KeyboardInterrupt) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        self.assertEqual(target.read_bytes(), b"alpha\n")
+        self.assertFalse(ctx.exception._transaction_written)
+        self.assertTrue(ctx.exception._transaction_rolled_back)
+        self.assertFalse(ctx.exception._transaction_partial_write)
+        self.assertEqual(
+            list(self.tmpdir.glob(".safe-edit-*.txn")),
+            [],
+        )
+
+    def test_transaction_keyboard_interrupt_during_stage_is_hidden(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "keyboard-hidden-stage.txt"
+
+        with patch.object(
+            m,
+            "_write_transaction_fd",
+            side_effect=KeyboardInterrupt("injected interrupt"),
+        ):
+            with self.assertRaises(KeyboardInterrupt) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._create_transaction_payload(target),
+                )
+
+        self.assertFalse(target.exists())
+        self.assertFalse(ctx.exception._transaction_written)
+        self.assertFalse(ctx.exception._transaction_partial_write)
+        self.assertEqual(
+            list(self.tmpdir.glob(".safe-edit-*.txn")),
+            [],
+        )
+
+
+    def test_transaction_stage_open_success_then_interrupt_is_retained(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "stage-open-interrupt.txt"
+        interrupt = KeyboardInterrupt("stage open returned then interrupted")
+        captured = {"fd": None}
+        real_open = m._PreparedParentPin.open_exclusive
+
+        def open_then_interrupt(pin, basename, mode):
+            fd = real_open(pin, basename, mode)
+            captured["fd"] = fd
+            raise interrupt
+
+        try:
+            with patch.object(
+                m._PreparedParentPin,
+                "open_exclusive",
+                new=open_then_interrupt,
+            ):
+                with self.assertRaises(KeyboardInterrupt) as ctx:
+                    m.run_transaction_payload(
+                        self._transaction_args(m),
+                        self._create_transaction_payload(target),
+                    )
+        finally:
+            if captured["fd"] is not None:
+                m.os.close(captured["fd"])
+
+        self.assertIs(ctx.exception, interrupt)
+        self.assertFalse(ctx.exception._transaction_written)
+        self.assertTrue(ctx.exception._transaction_partial_write)
+        artifacts = list(self.tmpdir.glob(".safe-edit-*.txn"))
+        self.assertEqual(len(artifacts), 1)
+        diagnostics = " ".join(
+            ctx.exception._transaction_rollback_errors
+        )
+        self.assertIn(f"artifact basename={artifacts[0].name!r}", diagnostics)
+        self.assertIn("pinned parent identity=", diagnostics)
+        self.assertIn("best-effort path=", diagnostics)
+
+    def test_transaction_stage_replacement_without_marker_is_retained(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "stage-replacement-no-marker.txt"
+        external = self.tmpdir / "external-stage-generation.txt"
+        external.write_bytes(b"external stage generation")
+        interrupt = KeyboardInterrupt(
+            "stage identity capture interrupted"
+        )
+        real_open = m._PreparedParentPin.open_exclusive
+        real_fstat = m.os.fstat
+        real_close = m.os.close
+        captured = {
+            "fd": None,
+            "pin": None,
+            "basename": None,
+            "identity_failed": False,
+            "replaced": False,
+        }
+
+        def capture_stage_open(pin, basename, mode):
+            fd = real_open(pin, basename, mode)
+            captured["fd"] = fd
+            captured["pin"] = pin
+            captured["basename"] = basename
+            return fd
+
+        def interrupt_before_stage_identity(fd):
+            if (
+                fd == captured["fd"]
+                and not captured["identity_failed"]
+            ):
+                captured["identity_failed"] = True
+                raise interrupt
+            return real_fstat(fd)
+
+        def close_then_replace_stage(fd):
+            if (
+                fd == captured["fd"]
+                and captured["identity_failed"]
+                and not captured["replaced"]
+            ):
+                result = real_close(fd)
+                stage_path = captured["pin"].entry_path(
+                    captured["basename"]
+                )
+                os.replace(external, stage_path)
+                captured["replaced"] = True
+                return result
+            return real_close(fd)
+
+        with patch.object(
+            m._PreparedParentPin,
+            "open_exclusive",
+            new=capture_stage_open,
+        ), patch.object(
+            m.os,
+            "fstat",
+            side_effect=interrupt_before_stage_identity,
+        ), patch.object(
+            m.os,
+            "close",
+            side_effect=close_then_replace_stage,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._create_transaction_payload(target),
+                )
+
+        self.assertIs(ctx.exception, interrupt)
+        self.assertTrue(captured["replaced"])
+        self.assertFalse(target.exists())
+        self.assertFalse(interrupt._transaction_written)
+        self.assertTrue(interrupt._transaction_partial_write)
+        artifacts = list(self.tmpdir.glob(".safe-edit-*.txn"))
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(
+            artifacts[0].read_bytes(),
+            b"external stage generation",
+        )
+        diagnostics = " ".join(interrupt._transaction_rollback_errors)
+        self.assertIn(
+            "retained unowned or externally changed",
+            diagnostics,
+        )
+        self.assertIn(
+            f"artifact basename={artifacts[0].name!r}",
+            diagnostics,
+        )
+    def test_transaction_install_both_endpoints_absent_is_uncertain(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "install-both-endpoints-absent.txt"
+        real_move = m._PreparedParentPin.move_entry_noreplace
+        injected = {"deleted": False}
+
+        def install_then_delete_target(
+            pin,
+            source,
+            destination,
+            *,
+            recovery=False,
+        ):
+            result = real_move(
+                pin,
+                source,
+                destination,
+                recovery=recovery,
+            )
+            if (
+                not recovery
+                and source.endswith(".txn")
+                and destination == target.name
+                and not injected["deleted"]
+            ):
+                target.unlink()
+                injected["deleted"] = True
+                raise OSError("install returned after target disappeared")
+            return result
+
+        with patch.object(
+            m._PreparedParentPin,
+            "move_entry_noreplace",
+            new=install_then_delete_target,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._create_transaction_payload(target),
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertTrue(injected["deleted"])
+        self.assertFalse(target.exists())
+        self.assertTrue(payload["written"])
+        self.assertTrue(payload["partialWrite"])
+        self.assertFalse(payload["rolledBack"])
+        diagnostics = " ".join(payload["rollbackErrors"])
+        self.assertIn("install outcome is ambiguous", diagnostics)
+        self.assertGreaterEqual(diagnostics.count("is ABSENT"), 2)
+
+    def test_transaction_install_after_move_probe_failure_is_conservative(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "install-probe-failure.txt"
+        target.write_bytes(b"alpha\n")
+        real_move = m._PreparedParentPin.move_entry_noreplace
+        real_stat = m._PreparedParentPin.stat_entry
+        injected = {"moved": False}
+
+        def move_then_fail(
+            pin,
+            source,
+            destination,
+            *,
+            recovery=False,
+        ):
+            result = real_move(
+                pin,
+                source,
+                destination,
+                recovery=recovery,
+            )
+            if (
+                not recovery
+                and source.endswith(".txn")
+                and destination == target.name
+                and not injected["moved"]
+            ):
+                injected["moved"] = True
+                raise OSError("install returned then failed")
+            return result
+
+        def fail_recovery_probes(pin, basename, *, recovery=False):
+            if injected["moved"] and recovery:
+                raise OSError("all endpoint probes failed")
+            return real_stat(pin, basename, recovery=recovery)
+
+        with patch.object(
+            m._PreparedParentPin,
+            "move_entry_noreplace",
+            new=move_then_fail,
+        ), patch.object(
+            m._PreparedParentPin,
+            "stat_entry",
+            new=fail_recovery_probes,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertEqual(target.read_bytes(), b"beta\n")
+        self.assertTrue(payload["written"])
+        self.assertTrue(payload["partialWrite"])
+        diagnostics = " ".join(payload["rollbackErrors"])
+        self.assertIn("artifact basename=", diagnostics)
+        self.assertIn("pinned parent identity=", diagnostics)
+        self.assertIn("best-effort path=", diagnostics)
+
+    def test_transaction_claim_interrupt_with_probe_failure_preserves_object(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "claim-probe-interrupt.txt"
+        target.write_bytes(b"alpha\n")
+        interrupt = KeyboardInterrupt("claim returned then interrupted")
+        real_move = m._PreparedParentPin.move_entry_noreplace
+        real_stat = m._PreparedParentPin.stat_entry
+        injected = {"moved": False}
+
+        def move_then_interrupt(
+            pin,
+            source,
+            destination,
+            *,
+            recovery=False,
+        ):
+            result = real_move(
+                pin,
+                source,
+                destination,
+                recovery=recovery,
+            )
+            if (
+                not recovery
+                and source == target.name
+                and not injected["moved"]
+            ):
+                injected["moved"] = True
+                raise interrupt
+            return result
+
+        def fail_recovery_probes(pin, basename, *, recovery=False):
+            if injected["moved"] and recovery:
+                raise OSError("claim endpoint probes failed")
+            return real_stat(pin, basename, recovery=recovery)
+
+        with patch.object(
+            m._PreparedParentPin,
+            "move_entry_noreplace",
+            new=move_then_interrupt,
+        ), patch.object(
+            m._PreparedParentPin,
+            "stat_entry",
+            new=fail_recovery_probes,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        self.assertIs(ctx.exception, interrupt)
+        self.assertFalse(ctx.exception._transaction_written)
+        self.assertTrue(ctx.exception._transaction_partial_write)
+        diagnostics = " ".join(
+            ctx.exception._transaction_rollback_errors
+        )
+        self.assertIn("artifact basename=", diagnostics)
+        self.assertIn("pinned parent identity=", diagnostics)
+        self.assertIn("best-effort path=", diagnostics)
+
+
+    def test_transaction_helper_return_control_gap_rolls_back_same_object(self):
+        m = self._import_safe_edit()
+        cases = (
+            ("create", KeyboardInterrupt("create helper return gap")),
+            ("edit", MemoryError("edit helper return gap")),
+        )
+        for action, primary in cases:
+            with self.subTest(action=action):
+                target = self.tmpdir / f"helper-gap-{action}.txt"
+                if action == "edit":
+                    target.write_bytes(b"alpha\n")
+                    payload = self._edit_transaction_payload(target)
+                    helper_name = "_replace_pinned_bytes"
+                else:
+                    payload = self._create_transaction_payload(target)
+                    helper_name = "_create_pinned_output"
+                real_helper = getattr(m, helper_name)
+
+                def return_then_raise(*args, **kwargs):
+                    real_helper(*args, **kwargs)
+                    raise primary
+
+                with patch.object(
+                    m,
+                    helper_name,
+                    side_effect=return_then_raise,
+                ):
+                    with self.assertRaises(type(primary)) as ctx:
+                        m.run_transaction_payload(
+                            self._transaction_args(m),
+                            payload,
+                        )
+
+                self.assertIs(ctx.exception, primary)
+                if action == "edit":
+                    self.assertEqual(target.read_bytes(), b"alpha\n")
+                else:
+                    self.assertFalse(target.exists())
+                self.assertFalse(primary._transaction_written)
+                self.assertTrue(primary._transaction_rolled_back)
+                self.assertFalse(primary._transaction_partial_write)
+                self.assertEqual(
+                    list(self.tmpdir.glob(".safe-edit-*.txn")),
+                    [],
+                )
+
+    def test_transaction_response_control_gap_reports_committed_state(self):
+        m = self._import_safe_edit()
+        for index, primary in enumerate(
+            (
+                MemoryError("response memory error"),
+                KeyboardInterrupt("response interrupt"),
+            )
+        ):
+            with self.subTest(error=type(primary).__name__):
+                target = self.tmpdir / f"response-gap-{index}.txt"
+                target.write_bytes(b"alpha\n")
+                with patch.object(
+                    m,
+                    "_transaction_before_response",
+                    side_effect=primary,
+                ):
+                    with self.assertRaises(type(primary)) as ctx:
+                        m.run_transaction_payload(
+                            self._transaction_args(m),
+                            self._edit_transaction_payload(target),
+                        )
+
+                self.assertIs(ctx.exception, primary)
+                self.assertEqual(target.read_bytes(), b"beta\n")
+                self.assertTrue(primary._transaction_written)
+                self.assertTrue(primary._transaction_partial_write)
+                self.assertFalse(primary._transaction_rolled_back)
+                self.assertIn(
+                    type(primary).__name__,
+                    " ".join(primary._transaction_rollback_errors),
+                )
+                self.assertEqual(
+                    list(self.tmpdir.glob(".safe-edit-*.txn")),
+                    [],
+                )
+
+    def test_transaction_context_exit_control_reports_committed_state(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "context-exit-control.txt"
+        target.write_bytes(b"alpha\n")
+        primary = SystemExit("context exit failed")
+        real_close = m._PreparedParentPin.close
+        injected = {"done": False}
+
+        def close_then_exit(pin, suppress_errors=False):
+            result = real_close(pin, suppress_errors=suppress_errors)
+            if not injected["done"]:
+                injected["done"] = True
+                raise primary
+            return result
+
+        with patch.object(
+            m._PreparedParentPin,
+            "close",
+            new=close_then_exit,
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        self.assertIs(ctx.exception, primary)
+        self.assertEqual(target.read_bytes(), b"beta\n")
+        self.assertTrue(primary._transaction_written)
+        self.assertTrue(primary._transaction_partial_write)
+        self.assertIn(
+            "context exit failed",
+            " ".join(primary._transaction_rollback_errors),
+        )
+
+    def test_transaction_primary_control_survives_context_cleanup_control(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "primary-and-context-control.txt"
+        target.write_bytes(b"alpha\n")
+        primary = MemoryError("primary mutation failure")
+        secondary = KeyboardInterrupt("secondary close failure")
+        real_close = m._PreparedParentPin.close
+        injected = {"done": False}
+
+        def close_then_interrupt(pin, suppress_errors=False):
+            result = real_close(pin, suppress_errors=suppress_errors)
+            if not injected["done"]:
+                injected["done"] = True
+                raise secondary
+            return result
+
+        with patch.object(
+            m,
+            "_transaction_after_mutation",
+            side_effect=primary,
+        ), patch.object(
+            m._PreparedParentPin,
+            "close",
+            new=close_then_interrupt,
+        ):
+            with self.assertRaises(MemoryError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        self.assertIs(ctx.exception, primary)
+        self.assertEqual(target.read_bytes(), b"alpha\n")
+        self.assertTrue(primary._transaction_rolled_back)
+        self.assertFalse(primary._transaction_partial_write)
+        self.assertIn(
+            "secondary close failure",
+            " ".join(primary._transaction_rollback_errors),
+        )
+
+    def test_transaction_primary_control_survives_rollback_control_and_bad_str(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "rollback-control-primary.txt"
+        target.write_bytes(b"alpha\n")
+        primary = KeyboardInterrupt("primary rollback trigger")
+        secondary = SystemExit("rollback fsync control")
+        real_fsync = m._PreparedParentPin.fsync
+        injected = {"done": False}
+
+        def fail_rollback_sync(pin, *, recovery=False):
+            if recovery and not injected["done"]:
+                injected["done"] = True
+                raise secondary
+            return real_fsync(pin, recovery=recovery)
+
+        with patch.object(
+            m,
+            "_transaction_after_mutation",
+            side_effect=primary,
+        ), patch.object(
+            m._PreparedParentPin,
+            "fsync",
+            new=fail_rollback_sync,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        self.assertIs(ctx.exception, primary)
+        self.assertEqual(target.read_bytes(), b"alpha\n")
+        self.assertFalse(primary._transaction_written)
+        self.assertTrue(primary._transaction_partial_write)
+        self.assertIn(
+            "rollback fsync control",
+            " ".join(primary._transaction_rollback_errors),
+        )
+
+        class UnprintableRollback(m.SafeEditError):
+            def __str__(self):
+                raise RuntimeError("cannot stringify rollback")
+
+        target2 = self.tmpdir / "rollback-unprintable.txt"
+        primary2 = MemoryError("primary for unprintable rollback")
+        with patch.object(
+            m,
+            "_transaction_after_mutation",
+            side_effect=primary2,
+        ), patch.object(
+            m,
+            "_rollback_prepared_mutation",
+            side_effect=UnprintableRollback(),
+        ):
+            with self.assertRaises(MemoryError) as ctx2:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._create_transaction_payload(target2),
+                )
+
+        self.assertIs(ctx2.exception, primary2)
+        self.assertTrue(primary2._transaction_written)
+        self.assertTrue(primary2._transaction_partial_write)
+        self.assertIn(
+            "UnprintableRollback",
+            " ".join(primary2._transaction_rollback_errors),
+        )
+
+
+    def test_transaction_install_target_read_failure_is_ambiguous(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "install-target-read-failure.txt"
+        target.write_bytes(b"alpha\n")
+        real_move = m._PreparedParentPin.move_entry_noreplace
+        real_read = m._read_pinned_entry
+        injected = {"moved": False}
+
+        def move_then_fail(
+            pin,
+            source,
+            destination,
+            *,
+            recovery=False,
+        ):
+            result = real_move(
+                pin,
+                source,
+                destination,
+                recovery=recovery,
+            )
+            if (
+                not recovery
+                and source.endswith(".txn")
+                and destination == target.name
+                and not injected["moved"]
+            ):
+                injected["moved"] = True
+                raise OSError("install returned then target read failed")
+            return result
+
+        def fail_installed_target_read(
+            pin,
+            basename,
+            max_bytes,
+            *,
+            capture_data=True,
+            recovery=False,
+        ):
+            if (
+                injected["moved"]
+                and recovery
+                and basename == target.name
+            ):
+                raise OSError("installed target is unreadable")
+            return real_read(
+                pin,
+                basename,
+                max_bytes,
+                capture_data=capture_data,
+                recovery=recovery,
+            )
+
+        with patch.object(
+            m._PreparedParentPin,
+            "move_entry_noreplace",
+            new=move_then_fail,
+        ), patch.object(
+            m,
+            "_read_pinned_entry",
+            new=fail_installed_target_read,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertTrue(injected["moved"])
+        self.assertEqual(target.read_bytes(), b"beta\n")
+        self.assertTrue(payload["written"])
+        self.assertTrue(payload["partialWrite"])
+        self.assertFalse(payload["rolledBack"])
+        diagnostics = " ".join(payload["rollbackErrors"])
+        self.assertIn("install outcome is ambiguous", diagnostics)
+        self.assertIn("installed target is unreadable", diagnostics)
+        self.assertIn("artifact basename=", diagnostics)
+
+    def test_transaction_install_hardlink_alias_is_ambiguous(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "install-hardlink-alias.txt"
+        target.write_bytes(b"alpha\n")
+        probe = self.tmpdir / "hardlink-support-probe.txt"
+        try:
+            os.link(target, probe)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest(f"hard links are unavailable: {exc}")
+        finally:
+            if probe.exists():
+                probe.unlink()
+
+        real_move = m._PreparedParentPin.move_entry_noreplace
+        injected = {"linked": False}
+
+        def install_then_link_stage(
+            pin,
+            source,
+            destination,
+            *,
+            recovery=False,
+        ):
+            result = real_move(
+                pin,
+                source,
+                destination,
+                recovery=recovery,
+            )
+            if (
+                not recovery
+                and source.endswith(".txn")
+                and destination == target.name
+                and not injected["linked"]
+            ):
+                os.link(target, pin.entry_path(source))
+                injected["linked"] = True
+                raise OSError("install returned with a hardlink alias")
+            return result
+
+        with patch.object(
+            m._PreparedParentPin,
+            "move_entry_noreplace",
+            new=install_then_link_stage,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertTrue(injected["linked"])
+        self.assertEqual(target.read_bytes(), b"beta\n")
+        self.assertTrue(payload["written"])
+        self.assertTrue(payload["partialWrite"])
+        self.assertFalse(payload["rolledBack"])
+        diagnostics = " ".join(payload["rollbackErrors"])
+        self.assertIn("install outcome is ambiguous", diagnostics)
+        self.assertIn("stage", diagnostics)
+        self.assertIn("target", diagnostics)
+
+    def test_transaction_claim_absent_target_unknown_quarantine_is_partial(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "claim-unknown-quarantine.txt"
+        target.write_bytes(b"alpha\n")
+        primary = KeyboardInterrupt("claim returned before verification")
+        real_move = m._PreparedParentPin.move_entry_noreplace
+        real_stat = m._PreparedParentPin.stat_entry
+        injected = {"moved": False, "quarantine": None}
+
+        def claim_then_interrupt(
+            pin,
+            source,
+            destination,
+            *,
+            recovery=False,
+        ):
+            result = real_move(
+                pin,
+                source,
+                destination,
+                recovery=recovery,
+            )
+            if (
+                not recovery
+                and source == target.name
+                and not injected["moved"]
+            ):
+                injected["moved"] = True
+                injected["quarantine"] = destination
+                raise primary
+            return result
+
+        def make_claim_state_partial(
+            pin,
+            basename,
+            *,
+            recovery=False,
+        ):
+            if injected["moved"] and recovery:
+                if basename == target.name:
+                    return None
+                if basename == injected["quarantine"]:
+                    raise OSError("claimed quarantine state is unknown")
+            return real_stat(pin, basename, recovery=recovery)
+
+        with patch.object(
+            m._PreparedParentPin,
+            "move_entry_noreplace",
+            new=claim_then_interrupt,
+        ), patch.object(
+            m._PreparedParentPin,
+            "stat_entry",
+            new=make_claim_state_partial,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        self.assertIs(ctx.exception, primary)
+        self.assertFalse(target.exists())
+        self.assertFalse(primary._transaction_written)
+        self.assertTrue(primary._transaction_partial_write)
+        self.assertFalse(primary._transaction_rolled_back)
+        diagnostics = " ".join(primary._transaction_rollback_errors)
+        self.assertIn("claim endpoints are both absent or unverified", diagnostics)
+        self.assertIn("artifact basename=", diagnostics)
+        self.assertIn("pinned parent identity=", diagnostics)
+
+    def test_transaction_finalization_cleanup_controls_propagate(self):
+        m = self._import_safe_edit()
+        for point in ("inspect", "unlink", "post_stat"):
+            with self.subTest(point=point):
+                target = self.tmpdir / f"finalize-control-{point}.txt"
+                target.write_bytes(b"alpha\n")
+                primary = KeyboardInterrupt(
+                    f"finalization {point} interrupt"
+                )
+                real_stat = m._PreparedParentPin.stat_entry
+                real_unlink = m._PreparedParentPin.unlink_entry
+                state = {
+                    "armed": False,
+                    "injected": False,
+                    "unlinked": None,
+                }
+
+                def arm_finalization(_mutation, _file_index):
+                    state["armed"] = True
+
+                def maybe_interrupt_stat(
+                    pin,
+                    basename,
+                    *,
+                    recovery=False,
+                ):
+                    should_interrupt = (
+                        state["armed"]
+                        and recovery
+                        and not state["injected"]
+                        and (
+                            (
+                                point == "inspect"
+                                and basename.endswith(".txn")
+                            )
+                            or (
+                                point == "post_stat"
+                                and basename == state["unlinked"]
+                            )
+                        )
+                    )
+                    if should_interrupt:
+                        state["injected"] = True
+                        raise primary
+                    return real_stat(
+                        pin,
+                        basename,
+                        recovery=recovery,
+                    )
+
+                def maybe_interrupt_unlink(
+                    pin,
+                    basename,
+                    *,
+                    recovery=False,
+                ):
+                    if (
+                        point == "unlink"
+                        and state["armed"]
+                        and recovery
+                        and basename.endswith(".txn")
+                        and not state["injected"]
+                    ):
+                        state["injected"] = True
+                        raise primary
+                    result = real_unlink(
+                        pin,
+                        basename,
+                        recovery=recovery,
+                    )
+                    if (
+                        point == "post_stat"
+                        and state["armed"]
+                        and recovery
+                        and basename.endswith(".txn")
+                        and state["unlinked"] is None
+                    ):
+                        state["unlinked"] = basename
+                    return result
+
+                with patch.object(
+                    m,
+                    "_transaction_after_mutation",
+                    side_effect=arm_finalization,
+                ), patch.object(
+                    m._PreparedParentPin,
+                    "stat_entry",
+                    new=maybe_interrupt_stat,
+                ), patch.object(
+                    m._PreparedParentPin,
+                    "unlink_entry",
+                    new=maybe_interrupt_unlink,
+                ):
+                    with self.assertRaises(KeyboardInterrupt) as ctx:
+                        m.run_transaction_payload(
+                            self._transaction_args(m),
+                            self._edit_transaction_payload(target),
+                        )
+
+                self.assertIs(ctx.exception, primary)
+                self.assertTrue(state["injected"])
+                if point == "post_stat":
+                    self.assertEqual(target.read_bytes(), b"beta\n")
+                    self.assertTrue(primary._transaction_written)
+                    self.assertFalse(primary._transaction_rolled_back)
+                    self.assertTrue(primary._transaction_partial_write)
+                else:
+                    self.assertEqual(target.read_bytes(), b"alpha\n")
+                    self.assertFalse(primary._transaction_written)
+                    self.assertTrue(primary._transaction_rolled_back)
+                    self.assertFalse(primary._transaction_partial_write)
+
+    def test_transaction_finalized_target_change_is_not_reported_written(self):
+        m = self._import_safe_edit()
+        for action in ("delete", "replace"):
+            with self.subTest(action=action):
+                target = self.tmpdir / f"finalized-target-{action}.txt"
+                replacement = (
+                    self.tmpdir / f"finalized-replacement-{action}.txt"
+                )
+                target.write_bytes(b"alpha\n")
+                primary = MemoryError(
+                    f"finalization target {action} control"
+                )
+                real_unlink = m._PreparedParentPin.unlink_entry
+                injected = {"done": False}
+
+                def finalize_then_change_target(
+                    pin,
+                    basename,
+                    *,
+                    recovery=False,
+                ):
+                    result = real_unlink(
+                        pin,
+                        basename,
+                        recovery=recovery,
+                    )
+                    if (
+                        recovery
+                        and basename.endswith(".txn")
+                        and not injected["done"]
+                    ):
+                        if action == "delete":
+                            target.unlink()
+                        else:
+                            replacement.write_bytes(b"external\n")
+                            os.replace(replacement, target)
+                        injected["done"] = True
+                        raise primary
+                    return result
+
+                with patch.object(
+                    m._PreparedParentPin,
+                    "unlink_entry",
+                    new=finalize_then_change_target,
+                ):
+                    with self.assertRaises(MemoryError) as ctx:
+                        m.run_transaction_payload(
+                            self._transaction_args(m),
+                            self._edit_transaction_payload(target),
+                        )
+
+                self.assertIs(ctx.exception, primary)
+                self.assertTrue(injected["done"])
+                self.assertFalse(primary._transaction_written)
+                self.assertFalse(primary._transaction_rolled_back)
+                self.assertTrue(primary._transaction_partial_write)
+                if action == "delete":
+                    self.assertFalse(target.exists())
+                else:
+                    self.assertEqual(target.read_bytes(), b"external\n")
+
+    def test_transaction_unprintable_finalization_probe_preserves_primary(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "unprintable-finalization-probe.txt"
+        target.write_bytes(b"alpha\n")
+        primary = KeyboardInterrupt("primary finalization interrupt")
+        real_unlink = m._PreparedParentPin.unlink_entry
+        injected = {"done": False}
+
+        class UnprintableProbeError(Exception):
+            def __str__(self):
+                raise RuntimeError("probe text is unavailable")
+
+        def interrupt_finalization_unlink(
+            pin,
+            basename,
+            *,
+            recovery=False,
+        ):
+            if (
+                recovery
+                and basename.endswith(".txn")
+                and not injected["done"]
+            ):
+                injected["done"] = True
+                raise primary
+            return real_unlink(
+                pin,
+                basename,
+                recovery=recovery,
+            )
+
+        with patch.object(
+            m._PreparedParentPin,
+            "unlink_entry",
+            new=interrupt_finalization_unlink,
+        ), patch.object(
+            m,
+            "_probe_journal_artifact",
+            side_effect=UnprintableProbeError(),
+        ):
+            with self.assertRaises(KeyboardInterrupt) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        self.assertIs(ctx.exception, primary)
+        self.assertTrue(injected["done"])
+        self.assertEqual(target.read_bytes(), b"beta\n")
+        self.assertTrue(primary._transaction_written)
+        self.assertFalse(primary._transaction_rolled_back)
+        self.assertTrue(primary._transaction_partial_write)
+        diagnostics = " ".join(primary._transaction_rollback_errors)
+        self.assertIn("UnprintableProbeError", diagnostics)
+        self.assertIn("artifact basename=", diagnostics)
+        self.assertIn("pinned parent identity=", diagnostics)
+        self.assertIn("best-effort path=", diagnostics)
+
+    def test_transaction_noop_jit_revalidation_after_prior_mutation(self):
+        m = self._import_safe_edit()
+        for action in ("changed", "deleted", "replaced"):
+            with self.subTest(action=action):
+                first = self.tmpdir / f"noop-first-{action}.txt"
+                second = self.tmpdir / f"noop-second-{action}.txt"
+                first.write_bytes(b"alpha\n")
+                second.write_bytes(b"same\n")
+                payload = {
+                    "files": [
+                        {
+                            "file": str(first),
+                            "action": "edit",
+                            "expectedSha256": hashlib.sha256(
+                                b"alpha\n"
+                            ).hexdigest(),
+                            "operations": [
+                                {
+                                    "op": "edit",
+                                    "old": "alpha",
+                                    "new": "beta",
+                                    "expected_count": 1,
+                                }
+                            ],
+                        },
+                        {
+                            "file": str(second),
+                            "action": "edit",
+                            "expectedSha256": hashlib.sha256(
+                                b"same\n"
+                            ).hexdigest(),
+                            "operations": [
+                                {
+                                    "op": "edit",
+                                    "old": "same",
+                                    "new": "same",
+                                    "expected_count": 1,
+                                }
+                            ],
+                        },
+                    ]
+                }
+
+                def mutate_second(_mutation, file_index):
+                    if file_index != 1:
+                        return
+                    if action == "changed":
+                        second.write_bytes(b"external\n")
+                    elif action == "deleted":
+                        second.unlink()
+                    else:
+                        replacement = (
+                            self.tmpdir / f"noop-replacement-{action}.txt"
+                        )
+                        replacement.write_bytes(b"same\n")
+                        os.replace(replacement, second)
+
+                with patch.object(
+                    m,
+                    "_transaction_after_mutation",
+                    side_effect=mutate_second,
+                ):
+                    with self.assertRaises(m.SafeEditError) as ctx:
+                        m.run_transaction_payload(
+                            self._transaction_args(m),
+                            payload,
+                        )
+
+                error = m.build_error_payload(
+                    ctx.exception,
+                    command="transaction",
+                )
+                self.assertEqual(first.read_bytes(), b"alpha\n")
+                if action == "changed":
+                    self.assertEqual(second.read_bytes(), b"external\n")
+                elif action == "deleted":
+                    self.assertFalse(second.exists())
+                else:
+                    self.assertEqual(second.read_bytes(), b"same\n")
+                self.assertTrue(error["rolledBack"])
+                self.assertFalse(error["partialWrite"])
+                self.assertEqual(
+                    list(self.tmpdir.glob(".safe-edit-*.txn")),
+                    [],
+                )
+
+    def test_transaction_stage_fault_and_unlink_failure_is_diagnostic(self):
+        m = self._import_safe_edit()
+        for fault in ("write", "fstat", "close"):
+            with self.subTest(fault=fault):
+                target = self.tmpdir / f"stage-cleanup-{fault}.txt"
+                captured = {
+                    "fd": None,
+                    "fstat_failed": False,
+                    "close_failed": False,
+                }
+                real_open = m._PreparedParentPin.open_exclusive
+                real_write = m._write_transaction_fd
+                real_fstat = m.os.fstat
+                real_close = m.os.close
+                real_unlink = m._PreparedParentPin.unlink_entry
+
+                def capture_open(pin, basename, mode):
+                    fd = real_open(pin, basename, mode)
+                    captured["fd"] = fd
+                    return fd
+
+                def maybe_fail_write(fd, data):
+                    if fault == "write":
+                        raise OSError("stage write failed")
+                    return real_write(fd, data)
+
+                def maybe_fail_fstat(fd):
+                    if (
+                        fault == "fstat"
+                        and fd == captured["fd"]
+                        and not captured["fstat_failed"]
+                    ):
+                        captured["fstat_failed"] = True
+                        raise OSError("stage fstat failed")
+                    return real_fstat(fd)
+
+                def maybe_fail_close(fd):
+                    if (
+                        fault in ("write", "close")
+                        and fd == captured["fd"]
+                        and not captured["close_failed"]
+                    ):
+                        captured["close_failed"] = True
+                        real_close(fd)
+                        raise OSError("stage close failed")
+                    return real_close(fd)
+
+                def fail_unlink(pin, basename, *, recovery=False):
+                    if basename.endswith(".txn"):
+                        raise OSError("stage unlink failed")
+                    return real_unlink(
+                        pin,
+                        basename,
+                        recovery=recovery,
+                    )
+
+                with patch.object(
+                    m._PreparedParentPin,
+                    "open_exclusive",
+                    new=capture_open,
+                ), patch.object(
+                    m,
+                    "_write_transaction_fd",
+                    new=maybe_fail_write,
+                ), patch.object(
+                    m.os,
+                    "fstat",
+                    side_effect=maybe_fail_fstat,
+                ), patch.object(
+                    m.os,
+                    "close",
+                    side_effect=maybe_fail_close,
+                ), patch.object(
+                    m._PreparedParentPin,
+                    "unlink_entry",
+                    new=fail_unlink,
+                ):
+                    with self.assertRaises(m.SafeEditError) as ctx:
+                        m.run_transaction_payload(
+                            self._transaction_args(m),
+                            self._create_transaction_payload(target),
+                        )
+
+                error = m.build_error_payload(
+                    ctx.exception,
+                    command="transaction",
+                )
+                artifacts = list(self.tmpdir.glob(".safe-edit-*.txn"))
+                self.assertEqual(len(artifacts), 1)
+                self.assertFalse(error["written"])
+                self.assertTrue(error["partialWrite"])
+                diagnostics = " ".join(error["rollbackErrors"])
+                self.assertIn(
+                    f"artifact basename={artifacts[0].name!r}",
+                    diagnostics,
+                )
+                self.assertIn("pinned parent identity=", diagnostics)
+                self.assertIn("best-effort path=", diagnostics)
+                if fault == "write":
+                    self.assertIn(
+                        "staging descriptor close failed for artifact basename=",
+                        diagnostics,
+                    )
+                    self.assertIn("OSError: stage close failed", diagnostics)
+                artifacts[0].unlink()
+
+    def test_transaction_success_leaves_no_transaction_artifacts(self):
+        m = self._import_safe_edit()
+        edited = self.tmpdir / "success-clean-edit.txt"
+        created = self.tmpdir / "success-clean-create.txt"
+        edited.write_bytes(b"alpha\n")
+        payload = {
+            "files": [
+                self._edit_transaction_payload(edited)["files"][0],
+                self._create_transaction_payload(created)["files"][0],
+            ]
+        }
+
+        result = m.run_transaction_payload(
+            self._transaction_args(m),
+            payload,
+        )
+
+        self.assertTrue(result["written"])
+        self.assertEqual(edited.read_bytes(), b"beta\n")
+        self.assertEqual(created.read_bytes(), b"owned")
+        self.assertEqual(
+            list(self.tmpdir.glob(".safe-edit-*.txn")),
+            [],
+        )
+
+    def test_transaction_same_byte_metadata_change_blocks_rollback(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "same-byte-metadata.txt"
+        target.write_bytes(b"alpha\n")
+        external_mtime = {"value": None}
+
+        def rewrite_same_bytes_then_fail(mutation, _file_index):
+            current = target.stat()
+            target.write_bytes(b"beta\n")
+            changed_mtime = current.st_mtime_ns + 2_000_000_000
+            os.utime(
+                target,
+                ns=(current.st_atime_ns, changed_mtime),
+            )
+            external_mtime["value"] = target.stat().st_mtime_ns
+            raise RuntimeError("external same-byte rewrite")
+
+        with patch.object(
+            m,
+            "_transaction_after_mutation",
+            side_effect=rewrite_same_bytes_then_fail,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertEqual(target.read_bytes(), b"beta\n")
+        self.assertEqual(
+            target.stat().st_mtime_ns,
+            external_mtime["value"],
+        )
+        self.assertFalse(payload["written"])
+        self.assertTrue(payload["partialWrite"])
+        self.assertTrue(payload["rollbackConflict"])
+        self.assertEqual(
+            len(list(self.tmpdir.glob(".safe-edit-*.txn"))),
+            1,
+        )
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory-fd recovery")
+    def test_transaction_rollback_uses_pinned_parent_after_rebind(self):
+        m = self._import_safe_edit()
+        parent = self.tmpdir / "rollback-parent"
+        moved = self.tmpdir / "rollback-parent-moved"
+        parent.mkdir()
+        target = parent / "target.txt"
+        target.write_bytes(b"alpha\n")
+
+        def rebind_parent_then_fail(_mutation, _file_index):
+            parent.rename(moved)
+            parent.mkdir()
+            (parent / target.name).write_bytes(b"new-parent")
+            raise RuntimeError("parent rebound after mutation")
+
+        with patch.object(
+            m,
+            "_transaction_after_mutation",
+            side_effect=rebind_parent_then_fail,
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run_transaction_payload(
+                    self._transaction_args(m),
+                    self._edit_transaction_payload(target),
+                )
+
+        payload = m.build_error_payload(
+            ctx.exception,
+            command="transaction",
+        )
+        self.assertEqual(
+            (moved / target.name).read_bytes(),
+            b"alpha\n",
+        )
+        self.assertEqual(
+            (parent / target.name).read_bytes(),
+            b"new-parent",
+        )
+        self.assertTrue(payload["rolledBack"])
+        self.assertEqual(
+            list(moved.glob(".safe-edit-*.txn")),
+            [],
+        )
+        self.assertEqual(
+            list(parent.glob(".safe-edit-*.txn")),
+            [],
+        )
+
+    def test_transaction_large_commit_verification_is_streaming(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "large-streaming.txt"
+        original = b"alpha\n" + (b"x" * (10 * 1024 * 1024))
+        target.write_bytes(original)
+        payload = {
+            "files": [
+                {
+                    "file": str(target),
+                    "action": "edit",
+                    "expectedSha256": hashlib.sha256(
+                        original
+                    ).hexdigest(),
+                    "operations": [
+                        {
+                            "op": "edit",
+                            "old": "alpha",
+                            "new": "beta",
+                            "expected_count": 1,
+                        }
+                    ],
+                }
+            ]
+        }
+        args = self._transaction_args(m)
+        prepared = m.prepare_transaction(args, payload)
+        real_read = m._read_pinned_entry
+        capture_flags = []
+
+        def record_capture(*args, **kwargs):
+            capture_flags.append(
+                kwargs.get("capture_data", True)
+            )
+            return real_read(*args, **kwargs)
+
+        with patch.object(
+            m,
+            "_read_pinned_entry",
+            side_effect=record_capture,
+        ):
+            result = m.commit_prepared_transaction(prepared)
+
+        self.assertTrue(result["written"])
+        self.assertTrue(capture_flags)
+        self.assertFalse(any(capture_flags))
+        self.assertEqual(
+            target.stat().st_size,
+            len(original) - 1,
+        )
 
     def test_path_lock_key_survives_atomic_replace(self):
         m = self._import_safe_edit()
@@ -6076,14 +10172,25 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertEqual(completed.returncode, 0, completed.stderr)
         payload = json.loads(completed.stdout)
         names = {item["name"] for item in payload["results"]}
+        results_by_name = {
+            item["name"]: item for item in payload["results"]
+        }
+        self.assertIn("core.verify-file-bytes-streaming", names)
+        self.assertFalse(
+            results_by_name["core.batch-literal-ops"]["fastPathEligible"]
+        )
         self.assertIn("cli.inspect", names)
         self.assertIn("cli.stat", names)
         self.assertIn("core.batch-line-ops", names)
+        self.assertIn("core.batch-literal-ops", names)
         self.assertIn("core.normalize-whitespace-tail", names)
+        self.assertIn("core.normalize-whitespace-first-many", names)
         self.assertIn("core.normalize-whitespace-context-tail", names)
         self.assertIn("core.trim-trailing-whitespace", names)
         self.assertIn("core.closest-match-repeated-miss", names)
         self.assertIn("core.closest-match-multiline-miss", names)
+        self.assertIn("core.closest-match-high-diversity-miss", names)
+        self.assertIn("core.compact-diff-reordered-repetitions", names)
         for item in payload["results"]:
             self.assertGreaterEqual(item["medianMs"], 0)
             self.assertGreaterEqual(item["p95Ms"], item["minMs"])
@@ -6188,6 +10295,1036 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
             "\n",
         )
         self.assertEqual((unchanged, changed, strategy), ("content", 0, "regex"))
+
+
+    def test_compact_diff_bounds_reordered_repetitive_input(self):
+        m = self._import_safe_edit()
+        before = "left\nright\n" * 4000
+        after = "right\nleft\n" * 4000
+        real_unified_diff = m.difflib.unified_diff
+        compared_sizes = []
+
+        def track_window(before_lines, after_lines, *args, **kwargs):
+            compared_sizes.append((len(before_lines), len(after_lines)))
+            return real_unified_diff(before_lines, after_lines, *args, **kwargs)
+
+        started = time.perf_counter()
+        with patch.object(
+            m.difflib, "unified_diff", side_effect=track_window
+        ):
+            diff, truncated = m.generate_compact_diff(
+                Path("reordered.txt"), before, after, 3
+            )
+        elapsed = time.perf_counter() - started
+
+        self.assertTrue(truncated)
+        self.assertIn("--- reordered.txt (before)", diff)
+        self.assertIn("+++ reordered.txt (after)", diff)
+        self.assertLessEqual(
+            len(diff),
+            m._COMPACT_DIFF_MAX_CHARS
+            + len("\n... [compact diff truncated]"),
+        )
+        self.assertTrue(compared_sizes)
+        self.assertLess(
+            max(max(pair) for pair in compared_sizes),
+            len(before.splitlines()) // 4,
+        )
+        self.assertLess(elapsed, 5.0)
+
+    def test_normalize_whitespace_first_consumes_only_first_span(self):
+        m = self._import_safe_edit()
+        text = "alpha   beta / alpha\tbeta / alpha beta"
+        real_iter = m._iter_whitespace_spans
+
+        def guarded_spans(*args, **kwargs):
+            spans = real_iter(*args, **kwargs)
+            yield next(spans)
+            raise AssertionError("first=True must not materialize later spans")
+
+        with patch.object(
+            m, "_iter_whitespace_spans", side_effect=guarded_spans
+        ):
+            result, changed, strategy = m.apply_literal_edit(
+                text,
+                {"old": "alpha beta", "new": "done", "first": True},
+                "\n",
+                normalize_whitespace=True,
+            )
+
+        self.assertEqual(result, "done / alpha\tbeta / alpha beta")
+        self.assertEqual(changed, 1)
+        self.assertEqual(strategy, "normalize-whitespace")
+
+    def test_fuzzy_single_line_prefilter_adapts_without_changing_result(self):
+        m = self._import_safe_edit()
+        pattern = "abcdefghijklmnopqrstuvwxyz" * 4
+        lines = [
+            hashlib.sha512(f"candidate-{index}".encode("ascii")).hexdigest()
+            for index in range(512)
+        ]
+        lines[400] = pattern[:-1] + "X"
+        with patch.object(
+            m,
+            "_fuzzy_lcs_ratio_upper",
+            side_effect=AssertionError("small workload must skip LCS"),
+        ):
+            direct = m._single_line_prefilter(lines, pattern, len(lines) - 1)
+        with patch.object(
+            m, "_FUZZY_SINGLELINE_LCS_MIN_COMPARISON_UNITS", 1
+        ), patch.object(
+            m, "_fuzzy_lcs_ratio_upper", wraps=m._fuzzy_lcs_ratio_upper
+        ) as lcs:
+            filtered = m._single_line_prefilter(lines, pattern, len(lines) - 1)
+        self.assertEqual(direct, filtered)
+        self.assertEqual(direct[2], 400)
+        self.assertGreater(lcs.call_count, 0)
+
+    def test_high_diversity_fuzzy_miss_scans_once_without_candidate_loss(self):
+        m = self._import_safe_edit()
+
+        class CountingText(str):
+            def __new__(cls, value):
+                instance = super().__new__(cls, value)
+                instance.splitlines_calls = 0
+                return instance
+
+            def splitlines(self, keepends=False):
+                self.splitlines_calls += 1
+                return super().splitlines(keepends)
+
+        def digest(seed):
+            return "".join(
+                hashlib.sha512(f"{seed}-{part}".encode("ascii")).hexdigest()
+                for part in range(2)
+            )
+
+        text = CountingText(
+            "\n".join(digest(f"line-{index}") for index in range(1000))
+        )
+        pattern = digest("not-present")
+        real_matcher = m.difflib.SequenceMatcher
+        ratio_calls = 0
+
+        class CountingMatcher:
+            def __init__(self, *args, **kwargs):
+                self._inner = real_matcher(*args, **kwargs)
+
+            def ratio(self):
+                nonlocal ratio_calls
+                ratio_calls += 1
+                return self._inner.ratio()
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        with patch.object(m.difflib, "SequenceMatcher", CountingMatcher):
+            result = m.find_closest_match(text, pattern)
+
+        self.assertIsNone(result)
+        self.assertLessEqual(text.splitlines_calls, 1)
+        # The top-256 set is only a seed. Every candidate whose safe upper
+        # bound can still reach the threshold must remain eligible.
+        self.assertGreater(ratio_calls, 256)
+        self.assertLessEqual(ratio_calls, 1000)
+
+    def test_fuzzy_seed_does_not_hide_best_candidate_after_256_lines(self):
+        m = self._import_safe_edit()
+        pattern = "abcdefghijklmnopqrstuvwxyz"
+        distractors = [
+            ("ab" * 13) + f"-{index:03d}"
+            for index in range(300)
+        ]
+        best = "acegikmoqsuwy"
+        match = m.find_closest_match_result(
+            "\n".join(distractors + [best]),
+            pattern,
+        )
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.line, 301)
+        self.assertEqual(match.fragment, best)
+        self.assertAlmostEqual(match.similarity, 2 / 3)
+
+    def test_fuzzy_workers_agree_and_choose_earliest_cross_chunk_tie(self):
+        m = self._import_safe_edit()
+        lines = [f"noise-{index:04d}-zzzz" for index in range(1024)]
+        lines[300] = "abcdxfghij"
+        lines[900] = "abcdxfghij"
+        text = "\n".join(lines)
+        pattern = "abcdefghij"
+        module_dir = str(REPO_ROOT / "skills" / "safe-edit")
+        sys.path.insert(0, module_dir)
+        try:
+            results = [
+                m.find_closest_match_result(text, pattern, workers=workers)
+                for workers in (1, 2, 4)
+            ]
+        finally:
+            sys.path.pop(0)
+
+        self.assertTrue(all(result is not None for result in results))
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0], results[2])
+        self.assertEqual(results[0].line, 301)
+
+    def test_fuzzy_single_line_substring_selection_and_true_similarity(self):
+        m = self._import_safe_edit()
+        match = m.find_closest_match_result(
+            "xx target yy\ntarget",
+            "target",
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual(match.line, 1)
+        self.assertEqual(
+            m._find_closest_start(
+                ["xx target yy", "target"],
+                ("target",),
+            ),
+            (1, 1.0, 0),
+        )
+        self.assertAlmostEqual(match.similarity, 2 * 6 / (6 + 12))
+        self.assertEqual(match.expected, "target")
+
+        self.assertIsNone(
+            m.find_closest_match("ab", "abcdefghij")
+        )
+        boundary = m.find_closest_match_result("abc", "abcdefghij")
+        self.assertIsNotNone(boundary)
+        self.assertAlmostEqual(boundary.similarity, 6 / 13)
+
+    def test_fuzzy_cached_full_expected_is_not_reused_for_truncated_old(self):
+        m = self._import_safe_edit()
+        actual = "alpha\nalpha beta gamma deltX\n"
+        full_expected = "alpha beta gamma delta"
+        cached = m.find_closest_match_result(actual, full_expected)
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached.line, 2)
+
+        analysis = m.analyze_match_failure(
+            "alpha",
+            actual,
+            closest_match=cached,
+        )
+        explanation = m.explain_match_failure(
+            "alpha",
+            actual,
+            closest_match=cached,
+        )
+        self.assertEqual(analysis["closestMatch"]["line"], 1)
+        self.assertIn("at line 1:", explanation)
+
+    def test_fuzzy_span_handles_all_splitline_separators_and_unicode(self):
+        m = self._import_safe_edit()
+        separators = (
+            "\n", "\r\n", "\r", "\v", "\f", "\x1c",
+            "\x1d", "\x1e", "\x85", "\u2028", "\u2029",
+        )
+        prefix = "前🙂"
+        fragment = "  目标Ω  "
+        for separator in separators:
+            with self.subTest(separator=repr(separator)):
+                text = prefix + separator + fragment + separator + "尾"
+                match = m.find_closest_match_result(text, "目标Ω")
+                self.assertIsNotNone(match)
+                self.assertEqual(match.line, 2)
+                self.assertEqual(match.start, len(prefix + separator))
+                self.assertEqual(match.length, len(fragment))
+                self.assertEqual(match.fragment, fragment)
+
+        self.assertEqual(
+            m.find_closest_match("a\n\nb", "a\n\n"),
+            (1, "a\n"),
+        )
+
+    def test_transaction_hashes_each_planned_buffer_once(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "transaction-hash-count.txt"
+        original = b"alpha\n"
+        output = b"beta\n"
+        target.write_bytes(original)
+        expected = hashlib.sha256(original).hexdigest()
+        args = m.build_parser().parse_args(
+            ["transaction", "--no-lock", "--json"]
+        )
+        calls = []
+        real_sha256 = m.hashlib.sha256
+
+        def counted_sha256(value=b""):
+            calls.append(value)
+            return real_sha256(value)
+
+        with patch.object(m.hashlib, "sha256", side_effect=counted_sha256):
+            result = m.run_transaction_payload(
+                args,
+                {
+                    "files": [
+                        {
+                            "file": str(target),
+                            "expectedSha256": expected,
+                            "operations": [
+                                {
+                                    "op": "edit",
+                                    "old": "alpha",
+                                    "new": "beta",
+                                    "expected_count": 1,
+                                }
+                            ],
+                        }
+                    ]
+                },
+            )
+
+        self.assertTrue(result["written"])
+        self.assertEqual(target.read_bytes(), output)
+        self.assertEqual(
+            sum(value == original for value in calls),
+            1,
+            calls,
+        )
+        self.assertEqual(
+            sum(value == output for value in calls),
+            1,
+            calls,
+        )
+
+    def test_import_defers_process_pool_modules(self):
+        module_dir = REPO_ROOT / "skills" / "safe-edit"
+        code = (
+            "import sys;"
+            f"sys.path.insert(0, {str(module_dir)!r});"
+            "import safe_edit;"
+            "print('concurrent.futures.process' in sys.modules)"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "False")
+
+
+    def test_strict_file_compare_chunk_boundaries_and_errors(self):
+        m = self._import_safe_edit()
+        chunk_size = m._TRANSACTION_VERIFY_CHUNK_BYTES
+        path = self.tmpdir / "strict-compare.bin"
+
+        for size in (0, chunk_size - 1, chunk_size, chunk_size + 1, chunk_size * 2 + 17):
+            payload = bytes(index % 251 for index in range(size))
+            path.write_bytes(payload)
+            self.assertTrue(m._compare_file_bytes_strict(path, payload))
+            self.assertTrue(m._file_bytes_equal(path, payload))
+            if payload:
+                for index in (0, len(payload) // 2, len(payload) - 1):
+                    altered = bytearray(payload)
+                    altered[index] ^= 1
+                    self.assertFalse(
+                        m._compare_file_bytes_strict(path, bytes(altered))
+                    )
+                self.assertFalse(
+                    m._compare_file_bytes_strict(path, payload[:-1])
+                )
+                self.assertFalse(
+                    m._compare_file_bytes_strict(path, payload + b"x")
+                )
+            else:
+                self.assertFalse(m._compare_file_bytes_strict(path, b"x"))
+
+        payload = b"q" * (chunk_size + 1)
+        requests = []
+
+        class Reader:
+            def __init__(self, value):
+                self.value = value
+                self.offset = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, amount):
+                requests.append(amount)
+                start = self.offset
+                self.offset = min(len(self.value), start + amount)
+                return self.value[start:self.offset]
+
+        with patch.object(
+            m.Path, "open", return_value=Reader(payload)
+        ):
+            self.assertTrue(
+                m._compare_file_bytes_strict(path, payload)
+            )
+        self.assertTrue(requests)
+        self.assertLessEqual(max(requests), chunk_size)
+
+        class ErrorReader:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, amount):
+                raise OSError("strict-read-failure")
+
+        with patch.object(m.Path, "open", return_value=ErrorReader()):
+            with self.assertRaisesRegex(OSError, "strict-read-failure"):
+                m._compare_file_bytes_strict(path, b"payload")
+
+        with patch.object(
+            m, "_compare_file_bytes_strict", side_effect=OSError("best effort")
+        ):
+            self.assertFalse(m._file_bytes_equal(path, b"payload"))
+        with patch.object(
+            m, "_compare_file_bytes_strict", side_effect=ValueError("strict")
+        ):
+            with self.assertRaisesRegex(ValueError, "strict"):
+                m._file_bytes_equal(path, b"payload")
+
+    def test_existing_regular_file_sha256_streams_and_checks_bounds(self):
+        m = self._import_safe_edit()
+        path = self.tmpdir / "existing-hash.bin"
+        chunk_size = m._EXISTING_FILE_HASH_CHUNK_BYTES
+        payload = (b"sha-stream-" * ((chunk_size + 17) // 11))[: chunk_size + 17]
+        path.write_bytes(payload)
+        real_read = m.os.read
+        requests = []
+
+        def checked_read(fd, amount):
+            requests.append(amount)
+            self.assertLessEqual(amount, chunk_size)
+            return real_read(fd, amount)
+
+        with patch.object(
+            m.Path,
+            "read_bytes",
+            side_effect=AssertionError("read_bytes must not be used"),
+        ):
+            with patch.object(m.os, "read", side_effect=checked_read):
+                digest = m._existing_regular_file_sha256(path)
+        self.assertEqual(digest, hashlib.sha256(payload).hexdigest())
+        self.assertTrue(requests)
+        self.assertLessEqual(max(requests), chunk_size)
+
+        path.write_bytes(b"")
+        self.assertEqual(
+            m._existing_regular_file_sha256(path),
+            hashlib.sha256(b"").hexdigest(),
+        )
+
+        original_cap = m._EXISTING_FILE_HASH_MAX_BYTES
+        with patch.object(m, "_EXISTING_FILE_HASH_MAX_BYTES", 9):
+            path.write_bytes(b"123456789")
+            self.assertEqual(
+                m._existing_regular_file_sha256(path),
+                hashlib.sha256(b"123456789").hexdigest(),
+            )
+            path.write_bytes(b"0123456789")
+            with patch.object(
+                m.os, "read", side_effect=AssertionError("over-cap read")
+            ):
+                self.assertIsNone(m._existing_regular_file_sha256(path))
+
+        path.write_bytes(b"stable")
+        real_fstat = m.os.fstat
+        fstat_calls = [0]
+
+        def changed_fstat(fd):
+            info = real_fstat(fd)
+            fstat_calls[0] += 1
+            if fstat_calls[0] == 2:
+                values = list(info)
+                values[6] += 1
+                return os.stat_result(values)
+            return info
+
+        with patch.object(m.os, "fstat", side_effect=changed_fstat):
+            self.assertIsNone(m._existing_regular_file_sha256(path))
+
+        real_stat = m.os.stat
+
+        def changed_stat(path_value, *args, **kwargs):
+            info = real_stat(path_value, *args, **kwargs)
+            values = list(info)
+            values[1] += 1
+            return os.stat_result(values)
+
+        with patch.object(m.os, "stat", side_effect=changed_stat):
+            self.assertIsNone(m._existing_regular_file_sha256(path))
+
+        with patch.object(m.os, "read", side_effect=OSError("hash-read")):
+            self.assertIsNone(m._existing_regular_file_sha256(path))
+        with patch.object(m.os, "fstat", side_effect=OSError("hash-fstat")):
+            self.assertIsNone(m._existing_regular_file_sha256(path))
+        with patch.object(m.os, "stat", side_effect=OSError("hash-stat")):
+            self.assertIsNone(m._existing_regular_file_sha256(path))
+        with patch.object(m.os, "open", side_effect=MemoryError("control")):
+            with self.assertRaisesRegex(MemoryError, "control"):
+                m._existing_regular_file_sha256(path)
+
+        self.assertIsNone(
+            m._existing_regular_file_sha256(self.tmpdir)
+        )
+        link = self.tmpdir / "existing-hash-link.bin"
+        try:
+            link.symlink_to(path)
+        except OSError:
+            pass
+        else:
+            self.assertIsNone(m._existing_regular_file_sha256(link))
+
+        # A sparse file exercises the real 50 MiB boundary without a large fixture.
+        with path.open("wb") as handle:
+            handle.seek(original_cap - 1)
+            handle.write(b"Z")
+        self.assertIsNotNone(m._existing_regular_file_sha256(path))
+
+    def test_post_write_verification_uses_strict_stream(self):
+        m = self._import_safe_edit()
+        create_path = self.tmpdir / "strict-create.txt"
+        create_args = m.build_parser().parse_args(
+            [
+                "create",
+                "--file",
+                str(create_path),
+                "--text",
+                "created\n",
+                "--to-encoding",
+                "utf-8",
+                "--to-line-ending",
+                "lf",
+                "--no-lock",
+            ]
+        )
+        with patch.object(
+            m.Path,
+            "read_bytes",
+            side_effect=AssertionError("post-write read_bytes must not be used"),
+        ):
+            created = m.run(create_args)
+        with create_path.open("rb") as handle:
+            self.assertEqual(handle.read(), b"created\n")
+        self.assertTrue(created["written"])
+
+        edit_path = self.tmpdir / "strict-edit.txt"
+        edit_path.write_bytes(b"alpha\n")
+        edit_args = m.build_parser().parse_args(
+            [
+                "edit",
+                "--file",
+                str(edit_path),
+                "--old",
+                "alpha",
+                "--new",
+                "beta",
+                "--expected-count",
+                "1",
+                "--no-lock",
+            ]
+        )
+        with patch.object(
+            m.Path,
+            "read_bytes",
+            side_effect=AssertionError("post-write read_bytes must not be used"),
+        ):
+            edited = m.run(edit_args)
+        with edit_path.open("rb") as handle:
+            self.assertEqual(handle.read(), b"beta\n")
+        self.assertTrue(edited["written"])
+
+        failed_create = self.tmpdir / "strict-create-false.txt"
+        failed_create_args = m.build_parser().parse_args(
+            [
+                "create",
+                "--file",
+                str(failed_create),
+                "--text",
+                "created",
+                "--to-encoding",
+                "utf-8",
+                "--to-line-ending",
+                "lf",
+                "--no-lock",
+            ]
+        )
+        with patch.object(m, "_compare_file_bytes_strict", return_value=False):
+            with self.assertRaises(m.SafeEditError) as context:
+                m.run(failed_create_args)
+        self.assertIn(
+            "post-write verification failed: bytes on disk do not match intended output",
+            str(context.exception),
+        )
+
+        error_path = self.tmpdir / "strict-edit-error.txt"
+        error_path.write_bytes(b"alpha\n")
+        error_args = m.build_parser().parse_args(
+            [
+                "edit",
+                "--file",
+                str(error_path),
+                "--old",
+                "alpha",
+                "--new",
+                "beta",
+                "--expected-count",
+                "1",
+                "--no-lock",
+            ]
+        )
+        with patch.object(
+            m, "_compare_file_bytes_strict", side_effect=OSError("verify-io")
+        ):
+            with self.assertRaisesRegex(OSError, "verify-io"):
+                m.run(error_args)
+
+    def test_exact_literal_batch_randomized_differential(self):
+        m = self._import_safe_edit()
+        rng = __import__("random").Random(0x5AFE)
+        fast_path_hits = 0
+
+        def outcome(call):
+            try:
+                value = call()
+            except Exception as exc:
+                return (
+                    "error",
+                    type(exc),
+                    str(exc),
+                    getattr(exc, "_diagnostic_operation_index", None),
+                    getattr(exc, "_completed_operations", None),
+                )
+            return ("ok", value)
+
+        real_fast_path = m._try_apply_exact_literal_batch
+
+        def counted_fast_path(*args, **kwargs):
+            nonlocal fast_path_hits
+            value = real_fast_path(*args, **kwargs)
+            if value is not None:
+                fast_path_hits += 1
+            return value
+
+        with patch.object(
+            m, "_EXACT_LITERAL_BATCH_MIN_SAVED_SCAN_CHARS", 0
+        ):
+            for case in range(5000):
+                operation_count = 5 if case % 3 == 0 else 4
+                olds = []
+                for index in range(operation_count):
+                    suffix = "".join(
+                        rng.choice("abcdefghijklmno0123456789")
+                        for _ in range(8)
+                    )
+                    olds.append(f"batch-old-{case:04d}-{index}-{suffix}Z")
+
+                chunks = []
+                for old in olds:
+                    chunks.extend(("x" * 128, old, "y"))
+                text = "".join(chunks)
+                newline = "\r\n" if case & 1 else "\n"
+                operations = []
+                for index, old in enumerate(olds):
+                    if case % 11 == 0 and index + 1 < operation_count:
+                        new = olds[index + 1]
+                    elif case % 13 == 0 and index + 1 < operation_count:
+                        new = "prefix-" + olds[index + 1] + "-suffix"
+                    elif case % 7 == 0:
+                        new = f"replacement-{case}-{index}\r\nnext"
+                    else:
+                        new = f"replacement-{case}-{index}-{rng.randrange(1000000)}"
+                    operation = {
+                        "op": "edit",
+                        "old": old,
+                        "new": new,
+                        "expected_count": 1,
+                    }
+                    if case % 5 == 0:
+                        operation["first"] = bool(index & 1)
+                    operations.append(operation)
+
+                with patch.object(
+                    m,
+                    "_try_apply_exact_literal_batch",
+                    side_effect=counted_fast_path,
+                ):
+                    fast = outcome(
+                        lambda: m.apply_operations(text, operations, newline)
+                    )
+                with patch.object(
+                    m, "_try_apply_exact_literal_batch", return_value=None
+                ):
+                    reference = outcome(
+                        lambda: m.apply_operations(text, operations, newline)
+                    )
+                self.assertEqual(fast, reference, f"random case {case}")
+
+        self.assertGreater(fast_path_hits, 3000)
+    def test_exact_literal_batch_overlap_budget_falls_back(self):
+        m = self._import_safe_edit()
+        shared_prefix = "P" * 4090
+        olds = [shared_prefix + f"{index:06d}" for index in range(16)]
+        text = "\n".join(olds)
+        operations = [
+            {"op": "edit", "old": old, "new": "", "expected_count": 1}
+            for old in olds
+        ]
+
+        started = time.perf_counter()
+        self.assertIsNone(
+            m._try_apply_exact_literal_batch(text, operations, "\n")
+        )
+        self.assertLess(time.perf_counter() - started, 2.0)
+
+        fast = m.apply_operations(text, operations, "\n")
+        with patch.object(
+            m, "_try_apply_exact_literal_batch", return_value=None
+        ):
+            fallback = m.apply_operations(text, operations, "\n")
+        self.assertEqual(fast, fallback)
+
+    def test_exact_literal_batch_probe_passes_just_over_scan_threshold(self):
+        m = self._import_safe_edit()
+        operation_count = 16
+        chunk = max(
+            64,
+            m._EXACT_LITERAL_BATCH_MIN_SAVED_SCAN_CHARS
+            // (operation_count * (operation_count - 1))
+            + 32,
+        )
+        olds = [f"threshold-marker-{index:02d}" for index in range(operation_count)]
+        text = "".join("x" * chunk + old + "\n" for old in olds)
+        operations = [
+            {
+                "op": "edit",
+                "old": old,
+                "new": f"replacement-{index}",
+                "expected_count": 1,
+            }
+            for index, old in enumerate(olds)
+        ]
+        self.assertGreaterEqual(
+            len(text) * (operation_count - 1),
+            m._EXACT_LITERAL_BATCH_MIN_SAVED_SCAN_CHARS,
+        )
+        self.assertIsNotNone(
+            m._try_apply_exact_literal_batch(text, operations, "\n")
+        )
+
+    def test_exact_literal_batch_eligibility_and_fallback_boundaries(self):
+        m = self._import_safe_edit()
+
+        def outcome(call):
+            try:
+                value = call()
+            except Exception as exc:
+                return (
+                    "error",
+                    type(exc),
+                    str(exc),
+                    getattr(exc, "_diagnostic_operation_index", None),
+                    getattr(exc, "_completed_operations", None),
+                )
+            return ("ok", value)
+
+        def compare_with_reference(text, operations, newline="\n"):
+            fast = outcome(
+                lambda: m.apply_operations(text, operations, newline)
+            )
+            with patch.object(
+                m, "_try_apply_exact_literal_batch", return_value=None
+            ):
+                reference = outcome(
+                    lambda: m.apply_operations(text, operations, newline)
+                )
+            self.assertEqual(fast, reference)
+
+        valid_text = "".join(
+            ("x" * 30000) + marker + "y"
+            for marker in ("BATCH-0", "BATCH-1", "BATCH-2", "BATCH-3")
+        )
+        valid_operations = [
+            {
+                "op": "edit",
+                "old": marker,
+                "new": "line-1\r\nline-2",
+                "expected_count": 1,
+            }
+            for marker in ("BATCH-0", "BATCH-1", "BATCH-2", "BATCH-3")
+        ]
+        fast_value = m._try_apply_exact_literal_batch(
+            valid_text, valid_operations, "\r\n"
+        )
+        self.assertIsNotNone(fast_value)
+        self.assertEqual(
+            m.apply_operations(valid_text, valid_operations, "\r\n"),
+            fast_value,
+        )
+        self.assertEqual(fast_value[1][0]["index"], 1)
+        self.assertEqual(fast_value[1][0]["matchStrategy"], "exact")
+
+        duplicate = [
+            {
+                "op": "edit",
+                "old": "DUPLICATE",
+                "new": "first",
+                "expected_count": 1,
+            },
+            {
+                "op": "edit",
+                "old": "DUPLICATE",
+                "new": "second",
+                "expected_count": 1,
+            },
+            {
+                "op": "edit",
+                "old": "TAIL-C",
+                "new": "tail-c",
+                "expected_count": 1,
+            },
+            {
+                "op": "edit",
+                "old": "TAIL-D",
+                "new": "tail-d",
+                "expected_count": 1,
+            },
+        ]
+        duplicate_text = "x" * 90000 + "DUPLICATE" + "TAIL-C" + "TAIL-D"
+        self.assertIsNone(
+            m._try_apply_exact_literal_batch(duplicate_text, duplicate, "\n")
+        )
+        compare_with_reference(duplicate_text, duplicate)
+
+        containment = [
+            {"op": "edit", "old": "ABC", "new": "abc", "expected_count": 1},
+            {"op": "edit", "old": "BC", "new": "bc", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-C", "new": "tail-c", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-D", "new": "tail-d", "expected_count": 1},
+        ]
+        containment_text = "x" * 90000 + "ABC" + "TAIL-C" + "TAIL-D"
+        self.assertIsNone(
+            m._try_apply_exact_literal_batch(containment_text, containment, "\n")
+        )
+        compare_with_reference(containment_text, containment)
+
+        partial_overlap = [
+            {"op": "edit", "old": "ABC", "new": "abc", "expected_count": 1},
+            {"op": "edit", "old": "CDE", "new": "cde", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-C", "new": "tail-c", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-D", "new": "tail-d", "expected_count": 1},
+        ]
+        partial_text = "x" * 90000 + "ABCDE" + "TAIL-C" + "TAIL-D"
+        self.assertIsNone(
+            m._try_apply_exact_literal_batch(partial_text, partial_overlap, "\n")
+        )
+        compare_with_reference(partial_text, partial_overlap)
+
+        adjacent = [
+            {"op": "edit", "old": "AAA", "new": "111", "expected_count": 1},
+            {"op": "edit", "old": "BBB", "new": "222", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-C", "new": "tail-c", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-D", "new": "tail-d", "expected_count": 1},
+        ]
+        adjacent_text = "x" * 90000 + "AAABBBTAIL-CTAIL-D"
+        self.assertIsNone(
+            m._try_apply_exact_literal_batch(adjacent_text, adjacent, "\n")
+        )
+        compare_with_reference(adjacent_text, adjacent)
+
+        creates_later_target = [
+            {"op": "edit", "old": "ONE", "new": "TWO", "expected_count": 1},
+            {"op": "edit", "old": "TWO", "new": "done", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-C", "new": "tail-c", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-D", "new": "tail-d", "expected_count": 1},
+        ]
+        creates_text = "x" * 90000 + "ONE" + ("y" * 100) + "TWO" + "TAIL-C" + "TAIL-D"
+        self.assertIsNone(
+            m._try_apply_exact_literal_batch(
+                creates_text, creates_later_target, "\n"
+            )
+        )
+        compare_with_reference(creates_text, creates_later_target)
+
+        valid_copy = [dict(item) for item in valid_operations]
+        for kwargs in (
+            {"ignore_indent": True},
+            {"ignore_eol": True},
+            {"normalize_whitespace": True},
+            {"auto_match": True},
+            {"fuzzy": True},
+            {"auto_eol_match": True},
+            {"context_before": "scope"},
+            {"context_after": "scope"},
+        ):
+            self.assertIsNone(
+                m._try_apply_exact_literal_batch(
+                    valid_text, valid_copy, "\n", **kwargs
+                )
+            )
+
+        for invalid in (
+            {**valid_copy[0], "unknown": True},
+            {**valid_copy[0], "expected_count": True},
+            {**valid_copy[0], "expected_count": "1"},
+            {**valid_copy[0], "no_op_ok": True},
+            {**valid_copy[0], "context_before": "scope"},
+            {**valid_copy[0], "old": 1},
+            {**valid_copy[0], "new": 1},
+        ):
+            invalid_operations = [dict(item) for item in valid_copy]
+            invalid_operations[0] = invalid
+            self.assertIsNone(
+                m._try_apply_exact_literal_batch(
+                    valid_text, invalid_operations, "\n"
+                )
+            )
+
+    def test_exact_literal_batch_dependency_order_and_diagnostics(self):
+        m = self._import_safe_edit()
+
+        def outcome(call):
+            try:
+                value = call()
+            except Exception as exc:
+                return (
+                    "error",
+                    type(exc),
+                    str(exc),
+                    getattr(exc, "_diagnostic_operation_index", None),
+                    getattr(exc, "_completed_operations", None),
+                )
+            return ("ok", value)
+
+        def compare(text, operations, newline="\n"):
+            fast = outcome(
+                lambda: m.apply_operations(text, operations, newline)
+            )
+            with patch.object(
+                m, "_try_apply_exact_literal_batch", return_value=None
+            ):
+                reference = outcome(
+                    lambda: m.apply_operations(text, operations, newline)
+                )
+            self.assertEqual(fast, reference)
+            return fast
+
+        # A replacement can delete a later target that contains the old text.
+        delete_later = [
+            {"op": "edit", "old": "PREFIX", "new": "", "expected_count": 1},
+            {"op": "edit", "old": "PREFIX-TARGET", "new": "ok", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-C", "new": "tail-c", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-D", "new": "tail-d", "expected_count": 1},
+        ]
+        delete_text = "x" * 90000 + "PREFIX-TARGETTAIL-CTAIL-D"
+        self.assertIsNone(
+            m._try_apply_exact_literal_batch(delete_text, delete_later, "\n")
+        )
+        deleted = compare(delete_text, delete_later)
+        self.assertEqual(deleted[3], 2)
+        self.assertEqual(deleted[4][0]["index"], 1)
+
+        # Newline normalization must participate in dependency detection.
+        normalized_dependency = [
+            {"op": "edit", "old": "ONE", "new": "T\r\nWO", "expected_count": 1},
+            {"op": "edit", "old": "T\nWO", "new": "done", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-C", "new": "tail-c", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-D", "new": "tail-d", "expected_count": 1},
+        ]
+        normalized_text = "x" * 90000 + "ONE" + ("y" * 100) + "T\nWO" + "TAIL-C" + "TAIL-D"
+        self.assertIsNone(
+            m._try_apply_exact_literal_batch(
+                normalized_text, normalized_dependency, "\n"
+            )
+        )
+        normalized_error = compare(normalized_text, normalized_dependency, "\n")
+        self.assertEqual(normalized_error[3], 2)
+
+        # A target created across the replacement boundary is also unsafe.
+        cross_boundary = [
+            {"op": "edit", "old": "LEFT", "new": "Y", "expected_count": 1},
+            {"op": "edit", "old": "YZ", "new": "done", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-C", "new": "tail-c", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-D", "new": "tail-d", "expected_count": 1},
+        ]
+        cross_text = "x" * 90000 + "LEFTZ" + ("y" * 100) + "YZ" + "TAIL-C" + "TAIL-D"
+        self.assertIsNone(
+            m._try_apply_exact_literal_batch(cross_text, cross_boundary, "\n")
+        )
+        cross_error = compare(cross_text, cross_boundary)
+        self.assertEqual(cross_error[3], 2)
+
+        # Input operation order may differ from spatial order without changing semantics.
+        spatial_text = "".join(
+            ("x" * 30000) + marker + "y"
+            for marker in ("B", "A", "C", "D")
+        )
+        spatial_operations = [
+            {"op": "edit", "old": "A", "new": "a", "expected_count": 1},
+            {"op": "edit", "old": "B", "new": "b", "expected_count": 1},
+            {"op": "edit", "old": "C", "new": "c", "expected_count": 1},
+            {"op": "edit", "old": "D", "new": "d", "expected_count": 1},
+        ]
+        spatial_fast = m._try_apply_exact_literal_batch(
+            spatial_text, spatial_operations, "\n"
+        )
+        self.assertIsNotNone(spatial_fast)
+        self.assertEqual(
+            m.apply_operations(spatial_text, spatial_operations, "\n"),
+            spatial_fast,
+        )
+
+        # Missing, ambiguous, no-op, and invalid expected-count paths retain diagnostics.
+        missing = [
+            {"op": "edit", "old": "MISSING", "new": "x", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-B", "new": "b", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-C", "new": "c", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-D", "new": "d", "expected_count": 1},
+        ]
+        missing_text = "x" * 90000 + "TAIL-BTAIL-CTAIL-D"
+        self.assertIsNone(
+            m._try_apply_exact_literal_batch(missing_text, missing, "\n")
+        )
+        missing_error = compare(missing_text, missing)
+        self.assertEqual(missing_error[3], 1)
+        self.assertEqual(missing_error[4], [])
+
+        ambiguous = [
+            {"op": "edit", "old": "DUP", "new": "x", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-B", "new": "b", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-C", "new": "c", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-D", "new": "d", "expected_count": 1},
+        ]
+        ambiguous_text = "x" * 90000 + "DUPDUPTAIL-BTAIL-CTAIL-D"
+        self.assertIsNone(
+            m._try_apply_exact_literal_batch(ambiguous_text, ambiguous, "\n")
+        )
+        ambiguous_error = compare(ambiguous_text, ambiguous)
+        self.assertEqual(ambiguous_error[3], 1)
+        self.assertIn("expected 1", ambiguous_error[2])
+
+        no_op = [
+            {"op": "edit", "old": "MISSING", "new": "x", "expected_count": 1, "no_op_ok": True},
+            {"op": "edit", "old": "TAIL-B", "new": "b", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-C", "new": "c", "expected_count": 1},
+            {"op": "edit", "old": "TAIL-D", "new": "d", "expected_count": 1},
+        ]
+        self.assertIsNone(
+            m._try_apply_exact_literal_batch(missing_text, no_op, "\n")
+        )
+        self.assertEqual(compare(missing_text, no_op)[0], "ok")
+
+        for expected in (True, "1", 2):
+            invalid_expected = [dict(item) for item in missing]
+            invalid_expected[0]["expected_count"] = expected
+            self.assertIsNone(
+                m._try_apply_exact_literal_batch(
+                    missing_text, invalid_expected, "\n"
+                )
+            )
 
 if __name__ == "__main__":
     unittest.main()
