@@ -4,3 +4,7 @@
 !.agents/plugins/marketplace.json
 __pycache__/
 tests/perf/
+build/
+*.egg-info/
+.pytest_cache/
+.reasonix/
