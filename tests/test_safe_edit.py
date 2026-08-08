@@ -4029,6 +4029,10 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         try:
             with patch.object(
                 ctypes, "WinDLL", return_value=kernel32, create=True
+            ), patch.object(
+                ctypes, "set_last_error", create=True
+            ), patch.object(
+                ctypes, "get_last_error", create=True, return_value=0
             ):
                 actual = m._windows_directory_handle_identity(7, expected)
         finally:
@@ -6300,7 +6304,7 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         path.write_bytes(b"content\n")
         v1_code = (
             "import hashlib,os,pathlib,sys,time\n"
-            "target=os.path.abspath(sys.argv[1])\n"
+            "target=os.path.realpath(sys.argv[1])\n"
             "value=('path\\0'+os.path.normcase(target)).encode('utf-8')\n"
             "key=hashlib.sha256(value).hexdigest()[:32]\n"
             "lock=pathlib.Path('/tmp/safe-edit/locks')/(key+'.lock')\n"
@@ -6342,7 +6346,7 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         with m.FileLock(path, 1, 0):
             probe_code = (
                 "import hashlib,os,pathlib,sys\n"
-                "target=os.path.abspath(sys.argv[1])\n"
+                "target=os.path.realpath(sys.argv[1])\n"
                 "value=('path\\0'+os.path.normcase(target)).encode('utf-8')\n"
                 "key=hashlib.sha256(value).hexdigest()[:32]\n"
                 "lock=pathlib.Path('/tmp/safe-edit/locks')/(key+'.lock')\n"
@@ -7456,8 +7460,8 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         def swap_before_preview_read(path, max_bytes):
             if (
                 not swapped["done"]
-                and m._transaction_path_identity(Path(path))
-                == m._transaction_path_identity(target)
+                and os.path.realpath(str(path))
+                == os.path.realpath(str(target))
             ):
                 os.replace(alternate, target)
                 swapped["done"] = True
@@ -8293,7 +8297,7 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertTrue(payload["rollbackConflict"])
         self.assertEqual(len(artifacts), 1)
         self.assertIn(
-            str(artifacts[0]),
+            str(artifacts[0].resolve()),
             " ".join(payload["rollbackErrors"]),
         )
 
@@ -8548,7 +8552,7 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertEqual(len(artifacts), 1)
         self.assertIn("cleanupWarnings", result)
         diagnostics = " ".join(result["cleanupWarnings"])
-        self.assertIn(str(artifacts[0]), diagnostics)
+        self.assertIn(str(artifacts[0].resolve()), diagnostics)
         self.assertIn(
             f"artifact basename={artifacts[0].name!r}",
             diagnostics,

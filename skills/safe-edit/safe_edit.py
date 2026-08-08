@@ -94,7 +94,7 @@ def _process_liveness(pid: int) -> str:
     error_access_denied = 5
     error_invalid_parameter = 87
     bindings = _load_process_native_bindings()
-    ctypes.set_last_error(0)
+    _reset_thread_last_error()
     try:
         handle = bindings.open_process(
             process_query_limited_information,
@@ -106,7 +106,7 @@ def _process_liveness(pid: int) -> str:
     if handle:
         bindings.close_handle(ctypes.wintypes.HANDLE(handle))
         return _PROCESS_ALIVE
-    last_error = ctypes.get_last_error()
+    last_error = _read_thread_last_error()
     if last_error == error_invalid_parameter:
         return _PROCESS_DEAD
     if last_error == error_access_denied:
@@ -117,6 +117,32 @@ def _process_liveness(pid: int) -> str:
 def _is_process_alive(pid: int) -> bool:
     """Compatibility boolean; unknown owners are conservatively alive."""
     return _process_liveness(pid) != _PROCESS_DEAD
+
+
+def _reset_thread_last_error() -> None:
+    """Clear the thread last-error slot.
+
+    ``ctypes.set_last_error`` only exists on Python 3.12+; on older
+    Windows interpreters fall back to ``SetLastError`` via ``windll``.
+    Only called on Windows native paths.
+    """
+    import ctypes
+
+    setter = getattr(ctypes, "set_last_error", None)
+    if setter is not None:
+        setter(0)
+        return
+    ctypes.windll.kernel32.SetLastError(0)
+
+
+def _read_thread_last_error() -> int:
+    """Return the thread last-error value across Python versions."""
+    import ctypes
+
+    getter = getattr(ctypes, "get_last_error", None)
+    if getter is not None:
+        return int(getter())
+    return int(ctypes.GetLastError())
 
 
 def _read_lock_pid(lock_path: Path) -> Optional[int]:
@@ -5271,7 +5297,7 @@ def _try_lock_kernel_fd(fd: int) -> Tuple[bool, Any]:
     bindings = _load_lock_native_bindings()
     overlapped = bindings.overlapped_type()
     handle = msvcrt.get_osfhandle(fd)
-    ctypes.set_last_error(0)
+    _reset_thread_last_error()
     locked = bindings.lock_file_ex(
         ctypes.wintypes.HANDLE(handle),
         0x00000002 | 0x00000001,
@@ -5282,7 +5308,7 @@ def _try_lock_kernel_fd(fd: int) -> Tuple[bool, Any]:
     )
     if locked:
         return True, overlapped
-    last_error = ctypes.get_last_error()
+    last_error = _read_thread_last_error()
     if last_error == 33:
         return False, None
     fail(
@@ -5307,7 +5333,7 @@ def _unlock_kernel_fd(fd: int, platform_state: Any) -> None:
     if platform_state is None:
         return
     bindings = _load_lock_native_bindings()
-    ctypes.set_last_error(0)
+    _reset_thread_last_error()
     bindings.unlock_file_ex(
         ctypes.wintypes.HANDLE(msvcrt.get_osfhandle(fd)),
         0,
@@ -7220,7 +7246,7 @@ def _open_windows_directory_handle(path: Path) -> int:
     import ctypes.wintypes
 
     bindings = _load_directory_native_bindings()
-    ctypes.set_last_error(0)
+    _reset_thread_last_error()
     handle = bindings.create_file_w(
         str(path),
         0x00000080,
@@ -7232,7 +7258,7 @@ def _open_windows_directory_handle(path: Path) -> int:
     )
     invalid = ctypes.c_void_p(-1).value
     if handle in (None, invalid):
-        last_error = ctypes.get_last_error()
+        last_error = _read_thread_last_error()
         fail(
             f"cannot pin directory {path}: "
             f"{ctypes.WinError(last_error)}"
@@ -7249,12 +7275,12 @@ def _windows_directory_handle_identity(
 
     bindings = _load_directory_native_bindings()
     information = bindings.by_handle_file_information_type()
-    ctypes.set_last_error(0)
+    _reset_thread_last_error()
     if not bindings.get_file_information_by_handle(
         ctypes.wintypes.HANDLE(handle),
         ctypes.byref(information),
     ):
-        last_error = ctypes.get_last_error()
+        last_error = _read_thread_last_error()
         fail(
             "cannot inspect pinned directory handle: "
             f"{ctypes.WinError(last_error)}"
@@ -7275,7 +7301,7 @@ def _windows_directory_handle_identity(
     inspect_file_id = bindings.get_file_information_by_handle_ex
     if inspect_file_id is not None:
         file_id = bindings.file_id_information_type()
-        ctypes.set_last_error(0)
+        _reset_thread_last_error()
         if inspect_file_id(
             ctypes.wintypes.HANDLE(handle),
             18,
@@ -7305,9 +7331,9 @@ def _close_windows_handle(handle: int) -> None:
     import ctypes.wintypes
 
     bindings = _load_directory_native_bindings()
-    ctypes.set_last_error(0)
+    _reset_thread_last_error()
     if not bindings.close_handle(ctypes.wintypes.HANDLE(handle)):
-        last_error = ctypes.get_last_error()
+        last_error = _read_thread_last_error()
         raise OSError(last_error, str(ctypes.WinError(last_error)))
 
 
@@ -7336,14 +7362,14 @@ def _windows_move_noreplace(source: Path, destination: Path) -> None:
     import ctypes
 
     bindings = _load_move_native_bindings()
-    ctypes.set_last_error(0)
+    _reset_thread_last_error()
     if bindings.move_file_ex_w(
         str(source),
         str(destination),
         0x00000008,
     ):
         return
-    last_error = ctypes.get_last_error()
+    last_error = _read_thread_last_error()
     message = str(ctypes.WinError(last_error))
     if last_error in (2, 3):
         raise FileNotFoundError(
