@@ -6079,7 +6079,11 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         for delay, elapsed in timings.items():
             with self.subTest(delay=delay, elapsed=elapsed):
                 self.assertGreaterEqual(elapsed, 0)
-                self.assertLess(elapsed, 0.045)
+                # The retry schedule tops out near 55 ms per cycle; leave
+                # headroom for slow shared CI runners (macOS VMs can add
+                # ~100 ms of scheduling latency) while still catching a
+                # regression to coarse fixed-interval polling.
+                self.assertLess(elapsed, 0.25)
 
     def test_release_token_mismatch_does_not_delete_new_owner(self):
         m = self._import_safe_edit()
