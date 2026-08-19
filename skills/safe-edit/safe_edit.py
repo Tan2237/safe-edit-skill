@@ -5947,7 +5947,7 @@ def _compute_edit_plan(encoding: EncodingInfo, text: str, path: Path,
         }
 
     editMode levels:
-        builtin     → built-in Edit tool OK (plain UTF-8 LF, no BOM, small file)
+        builtin     → host-provided built-in file-editing tool OK (tool name may vary; plain UTF-8 LF, no BOM, small file)
         recommended → safe-edit preferred (large file, structured format, etc.)
         required    → safe-edit mandatory (non-UTF8, BOM, CRLF, mixed EOL)
     """

@@ -6,7 +6,7 @@ description: |
   The ONLY allowed edit mechanisms:
   - safe_edit_stat and safe_edit_transaction (preferred when available)
   - safe_edit.py (CLI fallback for editStrategy="safe-edit")
-  - built-in Edit tool (for editStrategy="edit-tool")
+  - host-provided built-in file-editing tool, regardless of its actual name (for editStrategy="edit-tool")
 
   Before modifying an existing file, inspect it once and cache editStrategy
   plus sha256. Batch related files in one stat and one transaction. Use
@@ -272,8 +272,8 @@ an edit; inspect the existing file first.
 
 The selected editStrategy is locked for the lifetime of the file. Do NOT switch to another edit mechanism after a command failure. Continue using the cached editStrategy.
 
-- `editStrategy: "safe-edit"` → Use `safe_edit_transaction` when callable; otherwise ALL edits on this file MUST use `safe_edit.py`. Do not switch back to built-in Edit.
-- `editStrategy: "edit-tool"` → Use built-in Edit tool for this file.
+- `editStrategy: "safe-edit"` → Use `safe_edit_transaction` when callable; otherwise ALL edits on this file MUST use `safe_edit.py`. Do not switch back to the host-provided built-in file-editing tool, whatever it is named.
+- `editStrategy: "edit-tool"` → Use the host-provided built-in file-editing tool available in the current environment; its actual name may vary.
 
 Resolve the Python executable before editing: prefer a runtime path supplied by
 the host, then `python`, then `py -3` on Windows. Run `preflight --json`

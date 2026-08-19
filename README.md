@@ -206,7 +206,7 @@ python safe_edit.py stat-many --request-stdin --json
 
 | editStrategy | 含义 |
 |---|---|
-| `edit-tool` | 用内置 Edit 工具即可 |
+| `edit-tool` | 使用宿主提供的内置文件编辑工具即可（实际工具名称可能不同） |
 | `safe-edit` | 必须用 safe-edit（文件有 BOM、非 UTF-8 编码、CRLF 行尾等） |
 
 如果 `editStrategy` 是 `safe-edit`，后续对该文件的所有编辑都应使用 safe-edit。
