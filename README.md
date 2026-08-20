@@ -12,7 +12,7 @@
 - `stat-many` 在一个进程内检查多个文件，并用随机临时名探测能力；同父目录结果短期合并，temp/lock 标志共用一次 probe；结果只是 best-effort 观测。
 - `preflight` 在写入前报告 Python、stdin、Base64、临时目录、锁和目标目录能力。
 - `transaction` 接收结构化多文件请求，先生成不可变 prepared plan，再按稳定顺序加锁并统一重验路径、身份与哈希后写入；失败时执行冲突安全的尽力回滚。
-- 结构化事务会按检测到的文件行尾自动兼容 LF/CRLF 多行目标；无需为纯 EOL 差异开启 `autoMatch`。
+- 结构化事务先精确匹配，再仅对多行目标或上下文回退到 LF/CRLF/CR 兼容匹配；混合行尾文件也无需为纯 EOL 差异开启 `autoMatch`。
 - MCP dry-run 默认返回有上限的精简 diff；只有预演结果成功进入有界缓存时才签发有效期最长 10 分钟的一次性 `transactionId`，确认时无需重传大 payload。
 - 成功写入会返回新 `sha256`，可直接作为下一轮 `expectedSha256`；`old == new` 操作会明确跳过。
 - Codex 插件及跨客户端安装器提供常驻 MCP 工具，直接接收结构化正文，避免 Base64、Windows argv 限制和重复启动 Python。
@@ -133,9 +133,10 @@ canonical path、parent/target identity 与原始哈希。缓存的是 prepared 
 成功结果中每个文件的 `sha256` 是落盘后的新 guard，后续迭代无需重新
 `safe_edit_stat`。
 
-结构化事务默认启用 `autoEolMatch`：例如 CRLF 文件可直接接受 LF 多行
-`old`，但不会同时放宽缩进或其它空白；如需严格 EOL 匹配可显式设为
-`false`。
+结构化事务默认启用 `autoEolMatch`：先做精确匹配，仅在未找到时对多行
+`old` 或上下文追加 EOL-only 回退，因此可处理 CRLF、LF、CR 与混合行尾，
+同时避免把原本唯一的精确目标放宽成多匹配。计数不符时不会继续放宽；如需
+严格 EOL 匹配可显式设为 `false`。
 
 MCP 单次请求的 `maxBytes` 上限为 128 MiB；每次最多 128 个文件、每个文件
 最多 256 个操作、合计最多 1,024 个操作，JSON 最大嵌套深度为 128。服务端
@@ -331,7 +332,7 @@ python safe_edit.py edit --file path/to/file --old "missing" --new "bar" --json
 
 ### Agent Recovery Protocol
 
-匹配失败时，JSON 错误输出包含完整的恢复协议字段，供 Agent 自动决策：
+匹配失败时，JSON 错误输出包含完整的恢复协议字段，供 Agent 自动决策。以下以结构化事务 prepare 阶段的失败为例：
 
 ```json
 {
@@ -352,7 +353,11 @@ python safe_edit.py edit --file path/to/file --old "missing" --new "bar" --json
   "rootCause": "indentation_difference",
   "closestMatch": {"line": 42, "similarity": 0.91},
   "recommendedAction": {"type": "retry", "confidence": 0.9},
-  "retryStrategy": {"flags": ["--ignore-indent"], "alternativeFlags": ["--auto-match"]}
+  "retryStrategy": {"flags": ["--ignore-indent"], "alternativeFlags": ["--auto-match"], "argumentsPatch": {"autoMatch": true}},
+  "phase": "prepare",
+  "failureStage": "target",
+  "writeAttempted": false,
+  "statRequired": false
 }
 ```
 
@@ -362,10 +367,20 @@ python safe_edit.py edit --file path/to/file --old "missing" --new "bar" --json
 | `failedOperation` | 失败操作的 1-based 序号、操作类型和有上限的目标片段 |
 | `failureReason` | 面向调用方的直接失败原因；匹配错误时等同于 `rootCause` |
 | `failureClass` | `RETRYABLE`（可自动重试）、`RE_READ_REQUIRED`（需重新读取文件）、`USER_INPUT`（需用户修正）、`FATAL`（不可恢复） |
-| `rootCause` | 根因分类：`indentation_difference`、`line_ending_difference`、`whitespace_difference`、`content_not_found`、`multiple_matches`、`similar_content_exists` |
+| `rootCause` | 根因分类：`indentation_difference`、`line_ending_difference`、`whitespace_difference`、`context_mismatch`、`count_mismatch`、`content_not_found`、`multiple_matches`、`similar_content_exists` |
 | `closestMatch` | 最接近匹配的位置、片段和相似度（0.0–1.0） |
 | `recommendedAction` | 推荐的恢复动作（`retry`、`re_read_file`、`ask_user`、`stop`）及其置信度 |
-| `retryStrategy` | 仅 `RETRYABLE` 时返回，包含推荐的重试参数 |
+| `retryStrategy` | 仅 `RETRYABLE` 时返回；`argumentsPatch` 是事务级参数，只能在所有 edit 均有 `expected_count` 时合并到一次 dry-run |
+| `phase` / `failureStage` | 事务匹配失败时标识 prepare 阶段及 target/context_filter；后者再由 `contextField` 指出 before/after |
+| `writeAttempted` | `false` 表示尚未进入写阶段 |
+| `statRequired` | `false` 表示可复用原 `expectedSha256`，无需重新 stat |
+| `contextField` / `contextFragment` | 上下文过滤失败时指出需要重新读取的上下文字段及有界片段 |
+| `expectedCount` / `actualCount` | 计数不符时给出期望值与实际值；实际过多为 `multiple_matches`，实际不足为 `count_mismatch` |
+
+`argumentsPatch` 可能放宽整个多文件事务。只有当每个 edit 都显式设置了
+`expected_count` 时，才可复用原哈希把 patch 合并到 `dryRun: true` 请求；
+检查预演后仅用返回的 `transactionId` 确认。缺少计数或预演不符合预期时应
+重新读取，不能直接提交放宽后的请求。
 
 ### 过期哈希恢复
 

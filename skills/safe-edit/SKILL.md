@@ -179,9 +179,10 @@ For one new file, the structured request may be exactly
 ```
 
 Pass this object directly to `safe_edit_transaction` when it is callable. The
-structured path automatically reconciles multiline target EOLs with the detected
-file line ending. For a risky request, send it once with `dryRun: true`; confirm
-with only the returned `transactionId` when bounded-cache admission succeeds. The
+structured path tries an exact match first, then automatically retries only logical
+LF/CRLF/CR differences in multiline targets or contexts. For a risky request, send
+it once with `dryRun: true`; confirm with only the returned `transactionId` when
+bounded-cache admission succeeds. The
 structured path avoids shell parsing, Base64 expansion, Windows argv limits, and
 per-call Python startup; native binding metadata is loaded lazily and cached per process, while handles, buffers, and error state remain per-call. Otherwise use `transaction --request-stdin` only with a
 native stdin field; fall back to an existing request file, then URL-safe UTF-8
@@ -449,7 +450,7 @@ regex                       ← HIGHEST EDIT RISK
 
 2. **Remove only explicitly requested files** — run `stat --json` immediately before removal, then pass its `sha256` with the exact workspace root. `remove-file` is limited to one regular file, refuses directories and symbolic links, and never accepts recursion or wildcards. Prefer `--dry-run --json` when the target is uncertain.
 
-3. **Always add `--expected-count 1` for normal text replacement** — prevents wrong matches from silently succeeding. Do not omit it unless intentionally targeting multiple matches, performing diagnosis, or using commands with their own matching semantics.
+3. **Always add `--expected-count 1` for normal text replacement** — prevents wrong matches from silently succeeding. Copy `old` verbatim from the latest read and prefer the shortest stable fragment that is unique. Add short `context_before` or `context_after` only when the target itself is duplicated. Do not omit the count unless intentionally targeting multiple matches, performing diagnosis, or using commands with their own matching semantics.
 
 4. **Keep complex content structured** — send multiline, large, or shell-sensitive values directly through `safe_edit_transaction`. On the CLI fallback, prefer `--ops-stdin` only when the execution tool provides native stdin; otherwise use URL-safe UTF-8 Base64.
 
@@ -457,7 +458,7 @@ regex                       ← HIGHEST EDIT RISK
 
 6. **Use URL-safe Base64 only for CLI fallback** — unpadded URL-safe Base64 avoids quotes, whitespace, `+`, and `/`, but expands payloads and remains subject to argv limits. Never Base64-encode data for the structured tools.
 
-7. **Use transaction EOL matching first** — structured and CLI transactions automatically tolerate only LF/CRLF/CR differences in multiline `old` values. Use `--auto-match` only when indentation or broader whitespace relaxation is also required.
+7. **Use transaction EOL matching first** — structured and CLI transactions try exact matching first, then automatically tolerate only LF/CRLF/CR differences in multiline targets or contexts, including mixed-EOL files. They do not broaden a count mismatch. Use `--auto-match` only when indentation or prose line-wrap differences require broader whitespace relaxation.
 
 8. **Use `edit` over `replace-lines`** — `edit` is safest. Use `replace-lines` only when `edit` cannot do the job.
 
@@ -478,22 +479,31 @@ edit --old X --new Y --expected-count 1
 │
 ├─ SUCCESS → Done
 │
-└─ FAIL → Check error:
+└─ FAIL → Read the structured recovery fields:
     │
-    ├─ "old text was not found"
-    │   ├─ No --auto-match? → add it
-    │   ├─ Has --auto-match? → add --fuzzy
-    │   ├─ Still failed? → --explain-match-failure
-    │   └─ Wrong old text? → fix old text, don't just switch to anchor
+    ├─ failureClass = RETRYABLE
+    │   ├─ every edit has expected_count → merge argumentsPatch into one dryRun
+    │   ├─ successful preview → review it, then confirm only its transactionId
+    │   └─ missing count or unsafe preview → re-read; do not broaden the transaction
     │
-    ├─ "text appears multiple times"
-    │   └─ Add --context-before/after "unique"
+    ├─ rootCause = count_mismatch
+    │   └─ compare expectedCount/actualCount and re-read; do not add context automatically
     │
-    └─ "expected count mismatch"
-        └─ Adjust --expected-count or use --first
+    ├─ rootCause = multiple_matches
+    │   └─ keep expected_count; add the shortest unique context_before/after
+    │
+    ├─ failureStage = context_filter
+    │   └─ use contextField, re-read that candidate window, and refresh only the stale context
+    │
+    └─ RE_READ_REQUIRED / USER_INPUT
+        └─ re-read or ask; do not jump directly to fuzzy matching
 ```
 
-Most failures are whitespace differences. Use `--explain-match-failure` before abandoning text matching.
+When `writeAttempted` is false, a prepare-stage retry does not require another stat.
+Because `argumentsPatch` is transaction-wide, merge it only when every edit operation
+has an explicit `expected_count`, force that retry to `dryRun: true`, review the preview,
+then confirm only its `transactionId`. Otherwise re-read instead of broadening the
+request. Use `--explain-match-failure` when no structured patch is available.
 
 ---
 
@@ -501,18 +511,19 @@ Most failures are whitespace differences. Use `--explain-match-failure` before a
 
 | Option | Effect | When to use |
 |--------|--------|-------------|
-| transaction `autoEolMatch` | Match multiline targets using the detected file EOL only | **Default for transactions** |
-| `--auto-match` | Auto-try: exact → ignore-eol → ignore-indent → normalize-whitespace | Indentation/whitespace drift |
-| `--fuzzy` | Fuzzy matching (≥0.6); ignores per-line boundary whitespace, EOL style, and final EOL | AI-generated approximate text |
+| transaction `autoEolMatch` | Exact first, then EOL-only matching for multiline targets and contexts | **Default for transactions** |
+| `--auto-match` | Auto-try: exact → ignore-eol → ignore-indent → normalize-whitespace | Indentation or prose line-wrap drift; pair with `expected_count` and `dryRun` |
+| `--fuzzy` | Fuzzy matching (≥0.6); ignores per-line boundary whitespace, EOL style, and final EOL | Last-resort approximate text after re-reading |
 | `--fuzzy-workers auto\|N` | Conditional low-priority fuzzy processes; `1` forces serial, `N` is 2–8 | Large CPU-heavy fuzzy searches |
-| `--normalize-whitespace` | Collapse whitespace | **JSON/YAML/Markdown** |
-| `--context-before/after` | Disambiguate matches | Multiple occurrences |
+| `--normalize-whitespace` | Collapse whitespace | Explicit prose/formatting recovery, not a structured-data default |
+| `--context-before/after` | Disambiguate matches using the active EOL strategy | Only when the target occurs more than once |
 
 | Content | Default flags |
 |---------|---------------|
-| Single line | (none) |
-| Multiline code | `--auto-match` |
-| JSON/YAML/Markdown | `--auto-match --normalize-whitespace` |
+| Unique single line | (none) |
+| Multiline code | transaction `autoEolMatch` (default) |
+| Prose with line-wrap drift | `--auto-match --dry-run --expected-count 1` |
+| JSON/YAML | exact safe-edit matching; re-read on drift and do not normalize whitespace by default |
 
 ---
 

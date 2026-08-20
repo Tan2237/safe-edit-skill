@@ -891,7 +891,12 @@ TRANSACTION_ITEM_SCHEMA = {
                 "type": "object",
                 "description": (
                     "A native safe-edit operation such as edit, regex, "
-                    "insert, prepend, append, replace-lines, or delete-lines."
+                    "insert, prepend, append, replace-lines, or delete-lines. "
+                    "Copy edit.old verbatim from the latest file and keep it "
+                    "as short and unique as practical. Add context only when "
+                    "the target itself is not unique, and set expected_count "
+                    "on every edit before enabling transaction-wide relaxed "
+                    "matching."
                 ),
                 "additionalProperties": True,
             },
@@ -1054,13 +1059,24 @@ TOOLS = [
                     "minimum": 1,
                     "maximum": MAX_FILE_BYTES,
                 },
-                "autoMatch": {"type": "boolean", "default": False},
+                "autoMatch": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "After exact and EOL-only matching fail, also try "
+                        "indentation and general-whitespace normalization. "
+                        "This affects the whole transaction: require an "
+                        "expected_count on every edit, retry with dryRun, and "
+                        "confirm only the returned transactionId."
+                    ),
+                },
                 "autoEolMatch": {
                     "type": "boolean",
                     "default": True,
                     "description": (
-                        "Match multiline targets against the detected file "
-                        "line ending without relaxing other whitespace."
+                        "Try exact matching first, then retry multiline targets "
+                        "and contexts with EOL-only normalization. Count "
+                        "mismatches never trigger a broader retry."
                     ),
                 },
                 "fuzzy": {"type": "boolean", "default": False},
@@ -1197,7 +1213,11 @@ def handle_message(message: Any) -> Optional[Dict[str, Any]]:
                     "then pass its SHA-256 values to one batched "
                     "safe_edit_transaction. Use dryRun for risky changes, "
                     "then confirm with only the returned transactionId. "
-                    "Reuse each successful file result's sha256 as the next guard."
+                    "Reuse each successful file result's sha256 as the next "
+                    "guard. On a RETRYABLE prepare error, keep the hashes and "
+                    "apply retryStrategy.argumentsPatch only in a dryRun when "
+                    "every edit has expected_count; otherwise re-read. Confirm "
+                    "a successful retry only with its transactionId."
                 ),
             },
         )

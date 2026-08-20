@@ -198,6 +198,565 @@ class SafeEditMcpTests(unittest.TestCase):
         self.assertTrue(operation["autoEolMatch"])
         self.assertEqual(target.read_bytes(), b"ALPHA\r\nBETA\r\n")
 
+    def test_transaction_auto_eol_prefers_exact_mixed_match(self):
+        target = self.root / "auto-eol-exact-first.txt"
+        target.write_bytes(b"same\r\nblock\r\nsame\nblock\n")
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        result = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "files": [
+                    {
+                        "file": str(target),
+                        "expectedSha256": expected,
+                        "operations": [
+                            {
+                                "op": "edit",
+                                "old": "same\nblock",
+                                "new": "changed",
+                                "expected_count": 1,
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        operation = result["files"][0]["operations"][0]
+        self.assertEqual(operation["matchStrategy"], "exact")
+        self.assertNotIn("autoEolMatch", operation)
+        self.assertEqual(
+            target.read_bytes(),
+            b"same\r\nblock\r\nchanged\n",
+        )
+
+    def test_transaction_auto_eol_matches_mixed_segment(self):
+        target = self.root / "auto-eol-mixed-segment.txt"
+        target.write_bytes(
+            b"head\none\ntwo\nsame\r\nblock\r\ntail\n"
+        )
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        result = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "files": [
+                    {
+                        "file": str(target),
+                        "expectedSha256": expected,
+                        "operations": [
+                            {
+                                "op": "edit",
+                                "old": "same\nblock",
+                                "new": "SAME\nBLOCK",
+                                "expected_count": 1,
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        operation = result["files"][0]["operations"][0]
+        self.assertEqual(operation["matchStrategy"], "ignore-eol")
+        self.assertTrue(operation["autoEolMatch"])
+        self.assertEqual(
+            target.read_bytes(),
+            b"head\none\ntwo\nSAME\r\nBLOCK\r\ntail\n",
+        )
+
+    def test_transaction_auto_eol_normalizes_multiline_context(self):
+        target = self.root / "auto-eol-context.txt"
+        target.write_bytes(
+            b"scope-a\r\nscope-b\r\ntarget\r\n"
+            b"other-a\r\nother-b\r\ntarget\r\n"
+        )
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        result = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "files": [
+                    {
+                        "file": str(target),
+                        "expectedSha256": expected,
+                        "operations": [
+                            {
+                                "op": "edit",
+                                "old": "target",
+                                "new": "done",
+                                "context_before": "other-a\nother-b",
+                                "expected_count": 1,
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        operation = result["files"][0]["operations"][0]
+        self.assertEqual(operation["matchStrategy"], "ignore-eol")
+        self.assertTrue(operation["autoEolMatch"])
+        self.assertEqual(
+            target.read_bytes(),
+            b"scope-a\r\nscope-b\r\ntarget\r\n"
+            b"other-a\r\nother-b\r\ndone\r\n",
+        )
+
+    def test_transaction_auto_eol_uses_local_cr_only_context_window(self):
+        target = self.root / "auto-eol-cr-context.txt"
+        target.write_bytes(
+            b"wanted-a\rwanted-b\rtarget\r"
+            b"other-a\rother-b\rtarget\r"
+        )
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        result = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "files": [
+                    {
+                        "file": str(target),
+                        "expectedSha256": expected,
+                        "operations": [
+                            {
+                                "op": "edit",
+                                "old": "target",
+                                "new": "done",
+                                "context_before": "wanted-a\nwanted-b",
+                                "expected_count": 1,
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        operation = result["files"][0]["operations"][0]
+        self.assertEqual(operation["matchStrategy"], "ignore-eol")
+        self.assertTrue(operation["autoEolMatch"])
+        self.assertEqual(
+            target.read_bytes(),
+            b"wanted-a\rwanted-b\rdone\r"
+            b"other-a\rother-b\rtarget\r",
+        )
+
+    def test_transaction_auto_eol_uses_local_cr_only_after_context(self):
+        target = self.root / "auto-eol-cr-after-context.txt"
+        target.write_bytes(
+            b"target\rother-a\rother-b\r"
+            b"target\rwanted-a\rwanted-b\r"
+        )
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        result = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "files": [
+                    {
+                        "file": str(target),
+                        "expectedSha256": expected,
+                        "operations": [
+                            {
+                                "op": "edit",
+                                "old": "target",
+                                "new": "done",
+                                "context_after": "wanted-a\nwanted-b",
+                                "expected_count": 1,
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        operation = result["files"][0]["operations"][0]
+        self.assertEqual(operation["matchStrategy"], "ignore-eol")
+        self.assertTrue(operation["autoEolMatch"])
+        self.assertEqual(
+            target.read_bytes(),
+            b"target\rother-a\rother-b\r"
+            b"done\rwanted-a\rwanted-b\r",
+        )
+
+    def test_transaction_auto_eol_runs_after_no_op_ok_exact_miss(self):
+        target = self.root / "auto-eol-no-op-ok.txt"
+        target.write_bytes(b"alpha\r\nbeta\r\n")
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        result = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "files": [
+                    {
+                        "file": str(target),
+                        "expectedSha256": expected,
+                        "operations": [
+                            {
+                                "op": "edit",
+                                "old": "alpha\nbeta",
+                                "new": "done",
+                                "expected_count": 1,
+                                "no_op_ok": True,
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        operation = result["files"][0]["operations"][0]
+        self.assertEqual(operation["changed"], 1)
+        self.assertEqual(operation["matchStrategy"], "ignore-eol")
+        self.assertTrue(operation["autoEolMatch"])
+        self.assertEqual(target.read_bytes(), b"done\r\n")
+
+    def test_transaction_auto_eol_can_be_disabled(self):
+        target = self.root / "auto-eol-disabled.txt"
+        target.write_bytes(b"alpha\r\nbeta\r\n")
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        response = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "safe_edit_transaction",
+                    "arguments": {
+                        "dryRun": True,
+                        "autoEolMatch": False,
+                        "files": [
+                            {
+                                "file": str(target),
+                                "expectedSha256": expected,
+                                "operations": [
+                                    {
+                                        "op": "edit",
+                                        "old": "alpha\nbeta",
+                                        "new": "done",
+                                        "expected_count": 1,
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+        payload = response["result"]["structuredContent"]
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(payload["rootCause"], "line_ending_difference")
+        self.assertEqual(payload["failureStage"], "target")
+        self.assertEqual(
+            payload["retryStrategy"]["argumentsPatch"],
+            {"autoEolMatch": True},
+        )
+        self.assertEqual(target.read_bytes(), b"alpha\r\nbeta\r\n")
+
+    def test_transaction_auto_match_handles_line_wrap_both_directions(self):
+        cases = (
+            ("space-to-line", b"alpha\nbeta\n", "alpha beta"),
+            ("line-to-space", b"alpha beta\n", "alpha\nbeta"),
+        )
+        for name, original, old in cases:
+            with self.subTest(name=name):
+                target = self.root / f"auto-match-{name}.txt"
+                target.write_bytes(original)
+                expected = server.execute_tool(
+                    "safe_edit_stat", {"files": [str(target)]}
+                )["files"][0]["sha256"]
+
+                result = server.execute_tool(
+                    "safe_edit_transaction",
+                    {
+                        "autoMatch": True,
+                        "files": [
+                            {
+                                "file": str(target),
+                                "expectedSha256": expected,
+                                "operations": [
+                                    {
+                                        "op": "edit",
+                                        "old": old,
+                                        "new": "done",
+                                        "expected_count": 1,
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                )
+
+                operation = result["files"][0]["operations"][0]
+                self.assertEqual(
+                    operation["matchStrategy"],
+                    "normalize-whitespace",
+                )
+                self.assertEqual(target.read_bytes(), b"done\n")
+
+    def test_transaction_auto_match_count_mismatch_fails_closed(self):
+        target = self.root / "auto-match-count-mismatch.txt"
+        target.write_bytes(b"alpha\tbeta\nalpha\nbeta\n")
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        response = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "safe_edit_transaction",
+                    "arguments": {
+                        "dryRun": True,
+                        "autoMatch": True,
+                        "files": [
+                            {
+                                "file": str(target),
+                                "expectedSha256": expected,
+                                "operations": [
+                                    {
+                                        "op": "edit",
+                                        "old": "alpha  beta",
+                                        "new": "done",
+                                        "expected_count": 1,
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+        payload = response["result"]["structuredContent"]
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(payload["error"]["type"], "match_count_mismatch")
+        self.assertEqual(payload["rootCause"], "multiple_matches")
+        self.assertEqual(payload["failureClass"], "RE_READ_REQUIRED")
+        self.assertEqual(payload["expectedCount"], 1)
+        self.assertEqual(payload["actualCount"], 2)
+        self.assertEqual(payload["failureStage"], "target")
+        self.assertFalse(payload["writeAttempted"])
+        self.assertNotIn("retryStrategy", payload)
+        self.assertEqual(
+            target.read_bytes(),
+            b"alpha\tbeta\nalpha\nbeta\n",
+        )
+
+    def test_transaction_context_count_mismatch_is_not_retryable(self):
+        target = self.root / "context-count-mismatch.txt"
+        target.write_bytes(
+            b"scope-a\r\nscope-b\r\ntarget\r\n"
+            b"scope-a\r\nscope-b\r\ntarget\r\n"
+        )
+        original = target.read_bytes()
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        response = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "safe_edit_transaction",
+                    "arguments": {
+                        "dryRun": True,
+                        "files": [
+                            {
+                                "file": str(target),
+                                "expectedSha256": expected,
+                                "operations": [
+                                    {
+                                        "op": "edit",
+                                        "old": "target",
+                                        "new": "done",
+                                        "context_before": "scope-a\nscope-b",
+                                        "expected_count": 1,
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+        payload = response["result"]["structuredContent"]
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(payload["error"]["type"], "match_count_mismatch")
+        self.assertEqual(payload["rootCause"], "multiple_matches")
+        self.assertEqual(payload["failureClass"], "RE_READ_REQUIRED")
+        self.assertEqual(payload["expectedCount"], 1)
+        self.assertEqual(payload["actualCount"], 2)
+        self.assertEqual(payload["failureStage"], "context_filter")
+        self.assertEqual(payload["contextField"], "context_before")
+        self.assertEqual(payload["matchesBeforeContext"], 2)
+        self.assertEqual(payload["matchesAfterContext"], 2)
+        self.assertNotIn("retryStrategy", payload)
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_transaction_count_shortfall_is_not_multiple_matches(self):
+        target = self.root / "count-shortfall.txt"
+        target.write_bytes(b"alpha\n")
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        response = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "safe_edit_transaction",
+                    "arguments": {
+                        "dryRun": True,
+                        "files": [
+                            {
+                                "file": str(target),
+                                "expectedSha256": expected,
+                                "operations": [
+                                    {
+                                        "op": "edit",
+                                        "old": "alpha",
+                                        "new": "done",
+                                        "expected_count": 2,
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+        payload = response["result"]["structuredContent"]
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(payload["error"]["type"], "match_count_mismatch")
+        self.assertEqual(payload["rootCause"], "count_mismatch")
+        self.assertEqual(payload["failureClass"], "RE_READ_REQUIRED")
+        self.assertEqual(payload["expectedCount"], 2)
+        self.assertEqual(payload["actualCount"], 1)
+        self.assertNotIn("retryStrategy", payload)
+        self.assertEqual(target.read_bytes(), b"alpha\n")
+
+    def test_transaction_regex_count_details_cover_excess_and_shortfall(self):
+        cases = (
+            ("excess", 1, 2, "multiple_matches"),
+            ("shortfall", 3, 2, "count_mismatch"),
+        )
+        for name, expected_count, actual_count, root_cause in cases:
+            with self.subTest(name=name):
+                target = self.root / f"regex-count-{name}.txt"
+                target.write_bytes(b"alpha alpha\n")
+                expected_sha = server.execute_tool(
+                    "safe_edit_stat", {"files": [str(target)]}
+                )["files"][0]["sha256"]
+
+                response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "safe_edit_transaction",
+                            "arguments": {
+                                "dryRun": True,
+                                "files": [
+                                    {
+                                        "file": str(target),
+                                        "expectedSha256": expected_sha,
+                                        "operations": [
+                                            {
+                                                "op": "regex",
+                                                "pattern": "alpha",
+                                                "replacement": "done",
+                                                "expected_count": expected_count,
+                                            }
+                                        ],
+                                    }
+                                ],
+                            },
+                        },
+                    }
+                )
+                payload = response["result"]["structuredContent"]
+
+                self.assertTrue(response["result"]["isError"])
+                self.assertEqual(
+                    payload["error"]["type"],
+                    "match_count_mismatch",
+                )
+                self.assertEqual(payload["rootCause"], root_cause)
+                self.assertEqual(payload["expectedCount"], expected_count)
+                self.assertEqual(payload["actualCount"], actual_count)
+                self.assertNotIn("retryStrategy", payload)
+                self.assertEqual(target.read_bytes(), b"alpha alpha\n")
+
+    def test_transaction_missing_target_is_not_reported_as_context_failure(self):
+        target = self.root / "missing-target-with-context.txt"
+        target.write_bytes(b"header\ncontext\n")
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        response = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "safe_edit_transaction",
+                    "arguments": {
+                        "dryRun": True,
+                        "files": [
+                            {
+                                "file": str(target),
+                                "expectedSha256": expected,
+                                "operations": [
+                                    {
+                                        "op": "edit",
+                                        "old": "missing",
+                                        "new": "done",
+                                        "context_before": "header\ncontext",
+                                        "expected_count": 1,
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+        payload = response["result"]["structuredContent"]
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(payload["failureStage"], "target")
+        self.assertEqual(payload["rootCause"], "content_not_found")
+        self.assertNotIn("contextField", payload)
+        self.assertEqual(target.read_bytes(), b"header\ncontext\n")
+
     def test_transaction_failure_identifies_operation_and_target(self):
         target = self.root / "diagnostic.txt"
         target.write_bytes(b"alpha\n")
@@ -248,7 +807,93 @@ class SafeEditMcpTests(unittest.TestCase):
             "missing target",
         )
         self.assertEqual(payload["failureReason"], "content_not_found")
+        self.assertTrue(payload["dryRun"])
+        self.assertEqual(payload["phase"], "prepare")
+        self.assertEqual(payload["failureStage"], "target")
+        self.assertFalse(payload["writeAttempted"])
+        self.assertFalse(payload["statRequired"])
         self.assertEqual(target.read_bytes(), b"alpha\n")
+
+    def test_multi_file_line_wrap_failure_retries_without_restat(self):
+        first = self.root / "line-wrap-first.txt"
+        second = self.root / "line-wrap-second.txt"
+        first.write_bytes(b"before\n")
+        second.write_bytes(b"alpha\nbeta\n")
+        stats = server.execute_tool(
+            "safe_edit_stat", {"files": [str(first), str(second)]}
+        )["files"]
+        first_sha = stats[0]["sha256"]
+        second_sha = stats[1]["sha256"]
+
+        files = [
+            {
+                "file": str(first),
+                "expectedSha256": first_sha,
+                "operations": [
+                    {
+                        "op": "edit",
+                        "old": "before",
+                        "new": "after",
+                        "expected_count": 1,
+                    }
+                ],
+            },
+            {
+                "file": str(second),
+                "expectedSha256": second_sha,
+                "operations": [
+                    {
+                        "op": "edit",
+                        "old": "alpha beta",
+                        "new": "ALPHA BETA",
+                        "expected_count": 1,
+                    }
+                ],
+            },
+        ]
+        response = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "safe_edit_transaction",
+                    "arguments": {"dryRun": True, "files": files},
+                },
+            }
+        )
+        payload = response["result"]["structuredContent"]
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(payload["failedFile"]["index"], 2)
+        self.assertEqual(payload["rootCause"], "whitespace_difference")
+        self.assertEqual(payload["failureClass"], "RETRYABLE")
+        self.assertEqual(
+            payload["retryStrategy"]["argumentsPatch"],
+            {"autoMatch": True},
+        )
+        self.assertTrue(payload["dryRun"])
+        self.assertEqual(payload["phase"], "prepare")
+        self.assertFalse(payload["writeAttempted"])
+        self.assertFalse(payload["statRequired"])
+        self.assertEqual(first.read_bytes(), b"before\n")
+        self.assertEqual(second.read_bytes(), b"alpha\nbeta\n")
+
+        preview = server.execute_tool(
+            "safe_edit_transaction",
+            {"dryRun": True, "files": files, "autoMatch": True},
+        )
+        self.assertFalse(preview["written"])
+        self.assertEqual(first.read_bytes(), b"before\n")
+        self.assertEqual(second.read_bytes(), b"alpha\nbeta\n")
+
+        applied = server.execute_tool(
+            "safe_edit_transaction",
+            {"transactionId": preview["transactionId"]},
+        )
+        self.assertTrue(applied["written"])
+        self.assertEqual(first.read_bytes(), b"after\n")
+        self.assertEqual(second.read_bytes(), b"ALPHA BETA\n")
 
     def test_hash_mismatch_returns_retryable_actual_sha256(self):
         target = self.root / "stale-hash.txt"
@@ -1368,7 +2013,7 @@ class SafeEditMcpTests(unittest.TestCase):
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("1.2.0", completed.stdout)
+        self.assertIn("1.2.1", completed.stdout)
         self.assertIn("exit=0", completed.stdout)
         self.assertIn("core-loaded=False", completed.stdout)
 
@@ -1776,7 +2421,7 @@ class SafeEditMcpTests(unittest.TestCase):
             encoding="utf-8",
             check=True,
         )
-        self.assertEqual(completed.stdout.strip(), "1.2.0")
+        self.assertEqual(completed.stdout.strip(), "1.2.1")
 
     def test_benchmark_validates_every_timed_result(self):
         benchmark_path = REPO_ROOT / "tests" / "perf" / "benchmark.py"

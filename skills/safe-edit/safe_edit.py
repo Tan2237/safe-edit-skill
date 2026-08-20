@@ -216,6 +216,12 @@ _DIAGNOSTIC_ATTRS = (
     "_file_already_exists",
     "_file_not_found",
     "_diagnostic_closest_match",
+    "_diagnostic_dry_run",
+    "_diagnostic_failure_stage",
+    "_diagnostic_context_field",
+    "_diagnostic_context_value",
+    "_diagnostic_matches_before_context",
+    "_diagnostic_matches_after_context",
     "_transaction_written",
     "_transaction_rolled_back",
     "_transaction_partial_write",
@@ -506,15 +512,18 @@ def _build_retry_strategy(root_cause: str) -> Optional[Dict[str, Any]]:
     strategies = {
         "indentation_difference": {
             "flags": ["--ignore-indent"],
-            "alternativeFlags": ["--auto-match"]
+            "alternativeFlags": ["--auto-match"],
+            "argumentsPatch": {"autoMatch": True},
         },
         "line_ending_difference": {
             "flags": ["--ignore-eol"],
-            "alternativeFlags": ["--auto-match"]
+            "alternativeFlags": ["--auto-match"],
+            "argumentsPatch": {"autoEolMatch": True},
         },
         "whitespace_difference": {
             "flags": ["--auto-match"],
-            "alternativeFlags": ["--normalize-whitespace"]
+            "alternativeFlags": ["--normalize-whitespace"],
+            "argumentsPatch": {"autoMatch": True},
         },
     }
 
@@ -566,18 +575,92 @@ def analyze_match_failure(
         "retryStrategy": None,
     }
 
-    # Handle multiple matches case (match_ambiguous error)
+    # Ambiguous and count-mismatch failures require fresh context. A
+    # broader matching strategy cannot safely decide which occurrence
+    # the caller intended and must never be suggested as a retry.
     if error_type == "match_ambiguous":
         result["failureClass"] = "RE_READ_REQUIRED"
         result["rootCause"] = "multiple_matches"
         confidence = _CONFIDENCE_SCORES.get("multiple_matches", 0.70)
         result["recommendedAction"] = _build_recommended_action("re_read_file", confidence)
         return result
+    if error_type == "match_count_mismatch":
+        result["failureClass"] = "RE_READ_REQUIRED"
+        result["rootCause"] = "count_mismatch"
+        confidence = _CONFIDENCE_SCORES.get("count_mismatch", 0.85)
+        result["recommendedAction"] = _build_recommended_action("re_read_file", confidence)
+        return result
 
-    # Pre-check line ending difference (before find_closest_match loses it)
-    old_has_crlf = '\r\n' in old
-    text_has_crlf = '\r\n' in text
-    line_ending_diff = old_has_crlf != text_has_crlf
+    # Detect narrow, deterministic relaxations before fuzzy matching loses
+    # the relevant boundaries. This avoids treating every single-line target
+    # in a CRLF file as an EOL mismatch and recognizes prose line reflow as a
+    # retryable whitespace difference.
+    if old not in text:
+        root_cause: Optional[str] = None
+        normalized_position = -1
+        indent_position = -1
+        whitespace_span: Optional[Tuple[int, int]] = None
+
+        if _LINE_ENDING_RE.search(old):
+            normalized_old_eol = normalize_for_match(old, ignore_eol=True)
+            normalized_text_eol = normalize_for_match(text, ignore_eol=True)
+            normalized_position = normalized_text_eol.find(normalized_old_eol)
+            if normalized_position >= 0:
+                root_cause = "line_ending_difference"
+
+        if root_cause is None:
+            normalized_old_indent = normalize_for_match(old, ignore_indent=True)
+            normalized_text_indent = normalize_for_match(text, ignore_indent=True)
+            indent_position = normalized_text_indent.find(normalized_old_indent)
+            if indent_position >= 0:
+                whitespace_span = next(_iter_whitespace_spans(text, old), None)
+                root_cause = "indentation_difference"
+
+        if root_cause is None:
+            whitespace_span = next(_iter_whitespace_spans(text, old), None)
+            if whitespace_span is not None:
+                root_cause = "whitespace_difference"
+
+        if root_cause is not None:
+            failure_class, action_type = _determine_failure_class(
+                root_cause,
+                error_type,
+                1.0,
+            )
+            result["failureClass"] = failure_class
+            result["rootCause"] = root_cause
+            result["recommendedAction"] = _build_recommended_action(
+                action_type,
+                _CONFIDENCE_SCORES.get(root_cause, 0.70),
+            )
+            result["retryStrategy"] = _build_retry_strategy(root_cause)
+            if whitespace_span is not None:
+                original_position = whitespace_span[0]
+                line_num = (
+                    text.count("\n", 0, original_position)
+                    + text.count("\r", 0, original_position)
+                    - text.count("\r\n", 0, original_position)
+                    + 1
+                )
+            elif root_cause == "indentation_difference":
+                line_num = (
+                    normalized_text_indent.count("\n", 0, indent_position)
+                    + 1
+                )
+            else:
+                line_num = (
+                    normalize_for_match(text, ignore_eol=True).count(
+                        "\n",
+                        0,
+                        normalized_position,
+                    )
+                    + 1
+                )
+            result["closestMatch"] = {
+                "line": line_num,
+                "similarity": 1.0,
+            }
+            return result
 
     # Reuse a prior search only when it is bound to this exact expected
     # fragment. Diagnostic transports may truncate the fragment before this
@@ -611,11 +694,9 @@ def analyze_match_failure(
         "similarity": round(similarity, 2),
     }
 
-    # Diagnose root cause - check line ending first (pre-detected)
-    if line_ending_diff and similarity >= 0.9:
-        root_cause = "line_ending_difference"
-    else:
-        root_cause = _diagnose_root_cause(old, fragment, similarity)
+    # Diagnose remaining approximate-content failures. Deterministic EOL
+    # and general-whitespace matches were handled above.
+    root_cause = _diagnose_root_cause(old, fragment, similarity)
     result["rootCause"] = root_cause
 
     # Determine failure class and action type
@@ -689,16 +770,51 @@ def build_error_payload(
     For create-on-existing-file errors, provides actualSha256 of a safe regular
     file when available, but requires inspecting the collision before editing.
     """
-    error_type = classify_error_type(str(exc))
+    error_message = str(exc)
+    error_type = classify_error_type(error_message)
+    match_count_details: Optional[Tuple[int, int]] = None
+    if error_type == "match_count_mismatch":
+        count_match = re.search(
+            r"expected\s+(\d+)\s+(?:occurrence\(s\)|(?:regex\s+)?match(?:\(es\)|es)?)"
+            r"(?:\s+after context filtering)?\s*,?\s*found\s+(\d+)",
+            error_message,
+            re.IGNORECASE,
+        )
+        if count_match is not None:
+            match_count_details = (
+                int(count_match.group(1)),
+                int(count_match.group(2)),
+            )
     diagnostic_operation = getattr(exc, "_diagnostic_operation", None)
     diagnostic_text = getattr(exc, "_diagnostic_text", None)
     diagnostic_file = getattr(exc, "_diagnostic_file", None)
     diagnostic_command = getattr(exc, "_diagnostic_command", None)
+    diagnostic_failure_stage = getattr(
+        exc,
+        "_diagnostic_failure_stage",
+        None,
+    )
+    diagnostic_context_field = getattr(
+        exc,
+        "_diagnostic_context_field",
+        None,
+    )
+    diagnostic_context_value = getattr(
+        exc,
+        "_diagnostic_context_value",
+        None,
+    )
     if diagnostic_file:
         file_path = str(diagnostic_file)
     if diagnostic_command:
         command = str(diagnostic_command)
-    if not old and isinstance(diagnostic_operation, dict):
+    if (
+        diagnostic_failure_stage == "context_filter"
+        and isinstance(diagnostic_context_value, str)
+        and diagnostic_context_value
+    ):
+        old = diagnostic_context_value
+    elif not old and isinstance(diagnostic_operation, dict):
         old, _target_truncated = _diagnostic_target_fragment(
             diagnostic_operation
         )
@@ -715,7 +831,9 @@ def build_error_payload(
         "command": command,
         "changed": 0,
         "operations": [],
-        "dryRun": False,
+        "dryRun": bool(
+            getattr(exc, "_diagnostic_dry_run", False)
+        ),
         "written": False,
         "skipped": False,
     }
@@ -775,6 +893,45 @@ def build_error_payload(
             "file": file_path,
         }
 
+    if diagnostic_failure_stage:
+        error_obj["failureStage"] = str(diagnostic_failure_stage)
+    if match_count_details is not None:
+        error_obj["expectedCount"] = match_count_details[0]
+        error_obj["actualCount"] = match_count_details[1]
+    if diagnostic_context_field:
+        error_obj["contextField"] = str(diagnostic_context_field)
+    if isinstance(diagnostic_context_value, str):
+        context_fragment = diagnostic_context_value[
+            :_DIAGNOSTIC_FRAGMENT_MAX_CHARS
+        ]
+        error_obj["contextFragment"] = context_fragment
+        if len(diagnostic_context_value) > len(context_fragment):
+            error_obj["contextTruncated"] = True
+    matches_before_context = getattr(
+        exc,
+        "_diagnostic_matches_before_context",
+        None,
+    )
+    matches_after_context = getattr(
+        exc,
+        "_diagnostic_matches_after_context",
+        None,
+    )
+    if isinstance(matches_before_context, int):
+        error_obj["matchesBeforeContext"] = matches_before_context
+    if isinstance(matches_after_context, int):
+        error_obj["matchesAfterContext"] = matches_after_context
+
+    if command == "transaction" and error_type in (
+        "match_not_found",
+        "match_ambiguous",
+        "match_count_mismatch",
+    ):
+        error_obj["phase"] = "prepare"
+        error_obj.setdefault("failureStage", "target")
+        error_obj["writeAttempted"] = False
+        error_obj["statRequired"] = False
+
     # Structured recovery info for match-related errors
     if error_type in ("match_not_found", "match_ambiguous", "match_count_mismatch"):
         if old and text:
@@ -788,16 +945,42 @@ def build_error_payload(
                     _FUZZY_MATCH_UNSET,
                 ),
             )
-            error_obj["failureClass"] = analysis["failureClass"]
-            error_obj["rootCause"] = analysis["rootCause"]
-            error_obj["failureReason"] = analysis["rootCause"]
-            error_obj["error"]["reason"] = analysis["rootCause"]
+            failure_class = analysis["failureClass"]
+            root_cause = analysis["rootCause"]
+            recommended_action = analysis["recommendedAction"]
+            retry_strategy = analysis["retryStrategy"]
+            if error_type == "match_count_mismatch":
+                failure_class = "RE_READ_REQUIRED"
+                retry_strategy = None
+                recommended_action = {
+                    "type": "re_read_file",
+                    "confidence": 0.90,
+                }
+                if match_count_details is not None:
+                    expected_count, actual_count = match_count_details
+                    if actual_count > expected_count:
+                        root_cause = "multiple_matches"
+                    else:
+                        root_cause = "count_mismatch"
+            if diagnostic_failure_stage == "context_filter":
+                failure_class = "RE_READ_REQUIRED"
+                recommended_action = {
+                    "type": "re_read_candidate_window",
+                    "confidence": 0.95,
+                }
+                retry_strategy = None
+                if error_type != "match_count_mismatch":
+                    root_cause = "context_mismatch"
+            error_obj["failureClass"] = failure_class
+            error_obj["rootCause"] = root_cause
+            error_obj["failureReason"] = root_cause
+            error_obj["error"]["reason"] = root_cause
             if analysis["closestMatch"]:
                 error_obj["closestMatch"] = analysis["closestMatch"]
-            if analysis["recommendedAction"]:
-                error_obj["recommendedAction"] = analysis["recommendedAction"]
-            if analysis["retryStrategy"]:
-                error_obj["retryStrategy"] = analysis["retryStrategy"]
+            if recommended_action:
+                error_obj["recommendedAction"] = recommended_action
+            if retry_strategy:
+                error_obj["retryStrategy"] = retry_strategy
 
     # Structured recovery info for lock errors
     if error_type == "lock_error" and lock_info:
@@ -3053,11 +3236,20 @@ def _context_before_window(text: str, pos: int, line_count: int) -> str:
     search_end = pos
     start = 0
     for _ in range(line_count):
-        newline_pos = text.rfind("\n", 0, search_end)
-        if newline_pos < 0:
+        lf_pos = text.rfind("\n", 0, search_end)
+        cr_pos = text.rfind("\r", 0, search_end)
+        ending_pos = max(lf_pos, cr_pos)
+        if ending_pos < 0:
             return text[:pos]
-        start = newline_pos + 1
-        search_end = newline_pos
+        start = ending_pos + 1
+        if (
+            text[ending_pos] == "\n"
+            and ending_pos > 0
+            and text[ending_pos - 1] == "\r"
+        ):
+            search_end = ending_pos - 1
+        else:
+            search_end = ending_pos
     return text[start:pos]
 
 
@@ -3066,11 +3258,23 @@ def _context_after_window(text: str, pos: int, line_count: int) -> str:
     search_start = start
     end = len(text)
     for _ in range(line_count):
-        newline_pos = text.find("\n", search_start)
-        if newline_pos < 0:
+        lf_pos = text.find("\n", search_start)
+        cr_pos = text.find("\r", search_start)
+        candidates = tuple(
+            item for item in (lf_pos, cr_pos) if item >= 0
+        )
+        if not candidates:
             return text[start:]
-        end = newline_pos
-        search_start = newline_pos + 1
+        ending_pos = min(candidates)
+        end = ending_pos
+        if (
+            text[ending_pos] == "\r"
+            and ending_pos + 1 < len(text)
+            and text[ending_pos + 1] == "\n"
+        ):
+            search_start = ending_pos + 2
+        else:
+            search_start = ending_pos + 1
     return text[start:end]
 
 
@@ -3079,6 +3283,7 @@ def _replace_spans(
     spans: List[Tuple[int, int]],
     new: str,
     ignore_indent: bool,
+    ignore_eol: bool = False,
 ) -> str:
     chunks: List[str] = []
     cursor = 0
@@ -3087,8 +3292,25 @@ def _replace_spans(
             fail("internal error: overlapping replacement spans")
         chunks.append(text[cursor:pos])
         original_matched = text[pos:pos + length]
+        replacement = new
+        if (
+            ignore_eol
+            and _LINE_ENDING_RE.search(original_matched)
+            and _LINE_ENDING_RE.search(replacement)
+        ):
+            local_style, _counts, _mixed = detect_line_ending(
+                original_matched
+            )
+            replacement = normalize_user_newlines(
+                replacement,
+                line_sep(local_style),
+            )
         chunks.append(
-            adjust_replacement_for_indent(original_matched, new, ignore_indent)
+            adjust_replacement_for_indent(
+                original_matched,
+                replacement,
+                ignore_indent,
+            )
         )
         cursor = pos + length
     chunks.append(text[cursor:])
@@ -3152,26 +3374,70 @@ def _apply_edit_with_context(
             start = pos + len(old)
             yield pos, len(old)
 
-    old_line_count = max(1, old.count("\n") + 1)
-    context_line_count = max(old_line_count, 2)
+    old_line_count = max(
+        1,
+        len(_LINE_ENDING_RE.findall(old)) + 1,
+    )
+    before_context_line_count = max(
+        old_line_count,
+        len(_LINE_ENDING_RE.findall(context_before)) + 2,
+        2,
+    )
+    after_context_line_count = max(
+        old_line_count,
+        len(_LINE_ENDING_RE.findall(context_after)) + 2,
+        2,
+    )
+    normalized_context_before = normalize_for_match(
+        context_before,
+        ignore_indent,
+        ignore_eol,
+        normalize_whitespace,
+    )
+    normalized_context_after = normalize_for_match(
+        context_after,
+        ignore_indent,
+        ignore_eol,
+        normalize_whitespace,
+    )
     expected = operation.get("expected_count")
     first_only = bool(operation.get("first", False))
     first_span: Optional[Tuple[int, int]] = None
     filtered: List[Tuple[int, int]] = []
+    candidate_count = 0
+    matches_after_before = 0
     filtered_count = 0
 
     for pos, length in iter_positions():
+        candidate_count += 1
         if context_before:
-            window = _context_before_window(text, pos, context_line_count)
-            if context_before not in window:
+            window = _context_before_window(
+                text,
+                pos,
+                before_context_line_count,
+            )
+            normalized_window = normalize_for_match(
+                window,
+                ignore_indent,
+                ignore_eol,
+                normalize_whitespace,
+            )
+            if normalized_context_before not in normalized_window:
                 continue
+        matches_after_before += 1
         if context_after:
             window = _context_after_window(
                 text,
                 pos + length,
-                context_line_count,
+                after_context_line_count,
             )
-            if context_after not in window:
+            normalized_window = normalize_for_match(
+                window,
+                ignore_indent,
+                ignore_eol,
+                normalize_whitespace,
+            )
+            if normalized_context_after not in normalized_window:
                 continue
 
         filtered_count += 1
@@ -3179,7 +3445,13 @@ def _apply_edit_with_context(
             first_span = (pos, length)
         if first_only and expected is None:
             return (
-                _replace_spans(text, [(pos, length)], new, ignore_indent),
+                _replace_spans(
+                    text,
+                    [(pos, length)],
+                    new,
+                    ignore_indent,
+                    ignore_eol,
+                ),
                 1,
                 effective_strategy,
             )
@@ -3187,20 +3459,73 @@ def _apply_edit_with_context(
             filtered.append((pos, length))
 
     if filtered_count == 0 and not bool(operation.get("no_op_ok", False)):
-        message = (
-            "old text was not found (after context filtering); "
-            "refusing a silent no-op"
-        )
+        if candidate_count == 0:
+            message = "old text was not found; refusing a silent no-op"
+        else:
+            message = (
+                "old text was not found (after context filtering); "
+                "refusing a silent no-op"
+            )
         if explain:
-            raise _explained_match_error(message, old, text)
-        fail(message)
+            exc = _explained_match_error(message, old, text)
+        else:
+            exc = SafeEditError(message)
+        if candidate_count == 0:
+            setattr(exc, "_diagnostic_failure_stage", "target")
+        else:
+            if context_before and matches_after_before == 0:
+                context_field = "context_before"
+                context_value = context_before
+            elif context_after:
+                context_field = "context_after"
+                context_value = context_after
+            else:
+                context_field = "context_filter"
+                context_value = context_before or context_after
+            setattr(exc, "_diagnostic_failure_stage", "context_filter")
+            setattr(exc, "_diagnostic_context_field", context_field)
+            setattr(exc, "_diagnostic_context_value", context_value)
+            setattr(
+                exc,
+                "_diagnostic_matches_before_context",
+                candidate_count,
+            )
+            setattr(
+                exc,
+                "_diagnostic_matches_after_context",
+                filtered_count,
+            )
+        raise exc
     if filtered_count == 0:
         return (text, 0, effective_strategy)
     if expected is not None and filtered_count != int(expected):
-        fail(
+        exc = SafeEditError(
             f"expected {expected} occurrence(s) after context filtering, "
             f"found {filtered_count}"
         )
+        setattr(exc, "_diagnostic_failure_stage", "context_filter")
+        if context_before and context_after:
+            context_field = "context_before+context_after"
+            context_value = context_before + "\n" + context_after
+        elif context_before:
+            context_field = "context_before"
+            context_value = context_before
+        else:
+            context_field = "context_after"
+            context_value = context_after
+        setattr(exc, "_diagnostic_context_field", context_field)
+        setattr(exc, "_diagnostic_context_value", context_value)
+        setattr(
+            exc,
+            "_diagnostic_matches_before_context",
+            candidate_count,
+        )
+        setattr(
+            exc,
+            "_diagnostic_matches_after_context",
+            filtered_count,
+        )
+        raise exc
 
     if first_only:
         assert first_span is not None
@@ -3208,7 +3533,13 @@ def _apply_edit_with_context(
     else:
         matches = filtered
     return (
-        _replace_spans(text, matches, new, ignore_indent),
+        _replace_spans(
+            text,
+            matches,
+            new,
+            ignore_indent,
+            ignore_eol,
+        ),
         len(matches),
         effective_strategy,
     )
@@ -3267,7 +3598,13 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
                     raise _explained_match_error(message, old, text)
                 fail(message)
             return (
-                _replace_spans(text, [first_span], new, ignore_indent),
+                _replace_spans(
+                    text,
+                    [first_span],
+                    new,
+                    ignore_indent,
+                    ignore_eol,
+                ),
                 1,
                 effective_strategy,
             )
@@ -3411,7 +3748,13 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
                 search_start = norm_pos + len(normalized_old)
 
         return (
-            _replace_spans(text, spans, new, ignore_indent),
+            _replace_spans(
+                text,
+                spans,
+                new,
+                ignore_indent,
+                ignore_eol,
+            ),
             len(spans),
             effective_strategy,
         )
@@ -4034,18 +4377,26 @@ def apply_operation(text: str, operation: Dict[str, Any], newline: str, explain:
 def _operation_needs_eol_compat(
     operation: Dict[str, Any],
     newline: str,
+    context_before: Optional[str] = None,
+    context_after: Optional[str] = None,
 ) -> bool:
-    """Return whether a literal target uses a different newline style."""
+    """Return whether a literal target or context spans logical lines."""
+    del newline  # EOL fallback is exact-first, not dominant-style prediction.
     op_name = str(
         operation.get("op") or operation.get("command") or ""
     ).replace("_", "-")
     if op_name != "edit":
         return False
-    old = operation.get("old")
-    if old is None:
-        return False
-    styles = set(_LINE_ENDING_RE.findall(str(old)))
-    return bool(styles) and styles != {newline}
+    values = (
+        operation.get("old"),
+        operation.get("context_before", context_before),
+        operation.get("context_after", context_after),
+    )
+    return any(
+        value is not None
+        and _LINE_ENDING_RE.search(str(value)) is not None
+        for value in values
+    )
 
 
 def _try_apply_exact_literal_batch(
@@ -4294,14 +4645,20 @@ def apply_operations(
 
         operation_ignore_eol = ignore_eol
         auto_eol_applied = False
-        if (
+        op_ctx_before = operation.get("context_before", context_before)
+        op_ctx_after = operation.get("context_after", context_after)
+        can_auto_eol_retry = (
             auto_eol_match
             and not auto_match
             and not ignore_eol
-            and _operation_needs_eol_compat(operation, newline)
-        ):
-            operation_ignore_eol = True
-            auto_eol_applied = True
+            and not normalize_whitespace
+            and _operation_needs_eol_compat(
+                operation,
+                newline,
+                op_ctx_before,
+                op_ctx_after,
+            )
+        )
 
         try:
             can_buffer = (
@@ -4323,22 +4680,70 @@ def apply_operations(
                 op = op_name
                 match_strategy = "line-based"
             else:
-                op_ctx_before = operation.get("context_before", context_before)
-                op_ctx_after = operation.get("context_after", context_after)
-                updated, changed, op, match_strategy = apply_operation(
-                    buffer.as_text(),
-                    operation,
-                    newline,
-                    explain,
-                    ignore_indent,
-                    operation_ignore_eol,
-                    normalize_whitespace,
-                    auto_match=auto_match,
-                    fuzzy=fuzzy,
-                    context_before=op_ctx_before,
-                    context_after=op_ctx_after,
-                    fuzzy_workers=fuzzy_workers,
-                )
+                try:
+                    updated, changed, op, match_strategy = apply_operation(
+                        buffer.as_text(),
+                        operation,
+                        newline,
+                        explain,
+                        ignore_indent,
+                        operation_ignore_eol,
+                        normalize_whitespace,
+                        auto_match=auto_match,
+                        fuzzy=fuzzy,
+                        context_before=op_ctx_before,
+                        context_after=op_ctx_after,
+                        fuzzy_workers=fuzzy_workers,
+                    )
+                except SafeEditError as exact_exc:
+                    if (
+                        not can_auto_eol_retry
+                        or classify_error_type(str(exact_exc))
+                        != "match_not_found"
+                    ):
+                        raise
+                    updated, changed, op, match_strategy = apply_operation(
+                        buffer.as_text(),
+                        operation,
+                        newline,
+                        explain,
+                        ignore_indent,
+                        True,
+                        normalize_whitespace,
+                        auto_match=False,
+                        fuzzy=False,
+                        context_before=op_ctx_before,
+                        context_after=op_ctx_after,
+                        fuzzy_workers=fuzzy_workers,
+                    )
+                    auto_eol_applied = True
+                else:
+                    if can_auto_eol_retry and changed == 0:
+                        (
+                            retry_updated,
+                            retry_changed,
+                            retry_op,
+                            retry_strategy,
+                        ) = apply_operation(
+                            buffer.as_text(),
+                            operation,
+                            newline,
+                            explain,
+                            ignore_indent,
+                            True,
+                            normalize_whitespace,
+                            auto_match=False,
+                            fuzzy=False,
+                            context_before=op_ctx_before,
+                            context_after=op_ctx_after,
+                            fuzzy_workers=fuzzy_workers,
+                        )
+                        if retry_changed:
+                            updated = retry_updated
+                            changed = retry_changed
+                            op = retry_op
+                            match_strategy = retry_strategy
+                            auto_eol_applied = True
                 buffer.set_text(updated)
         except SafeEditError as exc:
             setattr(exc, "_diagnostic_operation_index", index)
@@ -10405,7 +10810,15 @@ def run_transaction_payload(
     payload: Any,
 ) -> Dict[str, Any]:
     args._prepared_transaction = None
-    prepared = prepare_transaction(args, payload)
+    try:
+        prepared = prepare_transaction(args, payload)
+    except SafeEditError as exc:
+        setattr(
+            exc,
+            "_diagnostic_dry_run",
+            bool(getattr(args, "dry_run", False)),
+        )
+        raise
     if args.dry_run:
         args._prepared_transaction = prepared
         return _prepared_preview_summary(prepared)
@@ -10927,6 +11340,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             setattr(exc, "_diagnostic_text", text)
             setattr(exc, "_diagnostic_file", str(path))
             setattr(exc, "_diagnostic_command", args.command)
+            setattr(
+                exc,
+                "_diagnostic_dry_run",
+                bool(getattr(args, "dry_run", False)),
+            )
             if (
                 len(operations) == 1
                 and not hasattr(exc, "_diagnostic_operation")

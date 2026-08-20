@@ -2386,6 +2386,18 @@ class SafeEditTests(unittest.TestCase):
         self.assertTrue(payload2["ok"])
         self.assertEqual(payload2["changed"], 1)
 
+    def test_error_recovery_indent_location_without_whitespace_span(self):
+        """Indent-only diagnostics report the real line without a regex span."""
+        module = self._import_safe_edit()
+
+        payload = module.analyze_match_failure(
+            "    foo",
+            "foo\nbar\nbaz\n",
+        )
+
+        self.assertEqual(payload["rootCause"], "indentation_difference")
+        self.assertEqual(payload["closestMatch"]["line"], 1)
+
     def test_error_recovery_line_ending_difference(self):
         """Test line_ending_difference is diagnosed and --ignore-eol is recommended."""
         path = self.tmpdir / "eol_diff.txt"
@@ -2404,6 +2416,70 @@ class SafeEditTests(unittest.TestCase):
         self.assertEqual(payload["rootCause"], "line_ending_difference")
         self.assertEqual(payload["recommendedAction"]["type"], "retry")
         self.assertIn("--ignore-eol", payload["retryStrategy"]["flags"])
+        self.assertEqual(
+            payload["retryStrategy"]["argumentsPatch"],
+            {"autoEolMatch": True},
+        )
+
+    def test_error_recovery_logical_line_wrap_is_retryable(self):
+        """Prose reflow should recommend structured autoMatch recovery."""
+        path = self.tmpdir / "logical_wrap.txt"
+        path.write_bytes(b"alpha\nbeta\n")
+
+        result = self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "alpha beta",
+            "--new",
+            "done",
+            "--json",
+            expect=2,
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["failureClass"], "RETRYABLE")
+        self.assertEqual(payload["rootCause"], "whitespace_difference")
+        self.assertEqual(
+            payload["retryStrategy"]["argumentsPatch"],
+            {"autoMatch": True},
+        )
+
+    def test_context_failure_reports_context_without_false_eol_diagnosis(self):
+        """A single-line target in a CRLF file is not itself an EOL mismatch."""
+        path = self.tmpdir / "context_diagnostic.txt"
+        path.write_bytes(b"header\r\ntarget\r\n")
+
+        result = self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "target",
+            "--new",
+            "done",
+            "--context-before",
+            "missing\ncontext",
+            "--json",
+            expect=2,
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["failureStage"], "context_filter")
+        self.assertEqual(payload["contextField"], "context_before")
+        self.assertEqual(payload["matchesBeforeContext"], 1)
+        self.assertEqual(payload["matchesAfterContext"], 0)
+        self.assertEqual(payload["rootCause"], "context_mismatch")
+        self.assertEqual(payload["failureClass"], "RE_READ_REQUIRED")
+        self.assertEqual(
+            payload["recommendedAction"]["type"],
+            "re_read_candidate_window",
+        )
+        self.assertNotEqual(
+            payload["rootCause"],
+            "line_ending_difference",
+        )
 
     def test_error_recovery_content_not_found(self):
         """Test content_not_found results in USER_INPUT failure class."""
@@ -2732,6 +2808,35 @@ class SafeEditTests(unittest.TestCase):
         
         content = path.read_bytes()
         self.assertIn(b"replaced", content)
+
+    def test_multiline_context_uses_active_eol_match_strategy(self):
+        """Multiline LF context can disambiguate targets in a CRLF file."""
+        path = self.tmpdir / "ctx_multiline_eol.txt"
+        path.write_bytes(
+            b"scope_a\r\nscope_b\r\ntarget\r\n"
+            b"other_a\r\nother_b\r\ntarget\r\n"
+        )
+
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            "target",
+            "--new",
+            "replaced",
+            "--context-before",
+            "other_a\nother_b",
+            "--auto-match",
+            "--expected-count",
+            "1",
+        )
+
+        self.assertEqual(
+            path.read_bytes(),
+            b"scope_a\r\nscope_b\r\ntarget\r\n"
+            b"other_a\r\nother_b\r\nreplaced\r\n",
+        )
 
     # =========================================================================
     # diff-input tests
