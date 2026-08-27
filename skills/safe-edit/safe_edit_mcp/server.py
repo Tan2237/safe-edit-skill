@@ -475,12 +475,23 @@ def _json_bytes(value: Any) -> bytes:
 
 def _json_string_size_with_limit(value: str, limit: int) -> Optional[int]:
     """Return an ensure-ASCII JSON string-size upper bound without copying it."""
+    minimum_size = len(value) + 2
+    if minimum_size > limit:
+        return None
+    if (
+        value.isascii()
+        and value.isprintable()
+        and '"' not in value
+        and "\\" not in value
+    ):
+        return minimum_size
+
     size = 2
     for character in value:
         codepoint = ord(character)
         if character in ('"', "\\") or character in "\b\f\n\r\t":
             increment = 2
-        elif codepoint < 0x20 or codepoint <= 0xFFFF and codepoint >= 0x80:
+        elif codepoint < 0x20 or 0x7F <= codepoint <= 0xFFFF:
             increment = 6
         elif codepoint > 0xFFFF:
             increment = 12

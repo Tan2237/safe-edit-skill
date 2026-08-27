@@ -2712,6 +2712,50 @@ class SafeEditMcpTests(unittest.TestCase):
             result["structuredContent"],
         )
 
+    def test_json_string_size_fast_path_matches_json_encoding(self):
+        values = (
+            "",
+            "plain ASCII metadata",
+            'quote: "',
+            "backslash: \\",
+            "controls: \b\f\n\r\t",
+            "boundary: \x00\x1f\x20\x7f",
+            "兼容",
+            "emoji: \U0001f680",
+            "surrogate: \ud800",
+        )
+        for value in values:
+            with self.subTest(value=repr(value)):
+                expected = len(
+                    json.dumps(
+                        value,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    ).encode("ascii")
+                )
+                self.assertEqual(
+                    implementation._json_string_size_with_limit(
+                        value, expected
+                    ),
+                    expected,
+                )
+                self.assertIsNone(
+                    implementation._json_string_size_with_limit(
+                        value, expected - 1
+                    )
+                )
+
+    def test_json_string_size_plain_ascii_fast_path_does_not_iterate(self):
+        class NonIterableAscii(str):
+            def __iter__(self):
+                raise AssertionError("plain ASCII fast path iterated")
+
+        value = NonIterableAscii("serverInstanceId-0123456789abcdef")
+        self.assertEqual(
+            implementation._json_string_size_with_limit(value, 100),
+            len(value) + 2,
+        )
+
     def test_large_structured_result_uses_bounded_compatibility_text(self):
         marker = "large-diff-marker-"
         summary = {
