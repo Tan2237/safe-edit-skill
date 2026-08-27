@@ -4,10 +4,12 @@
 import copy
 import json
 import math
+import os
 import re
 import secrets
 import sys
 import time
+import traceback
 from typing import Any, Dict, List, Optional
 
 import safe_edit as core
@@ -37,6 +39,7 @@ MAX_PENDING_PREPARED_OUTPUT_BYTES = 16 * 1024 * 1024
 PENDING_TRANSACTION_OVERHEAD_BYTES = 512
 MAX_LOCK_TIMEOUT_SECONDS = 60 * 60
 MAX_COMPAT_TEXT_BYTES = 256 * 1024
+SERVER_INSTANCE_ID = secrets.token_hex(8)
 _PENDING_TRANSACTIONS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -46,6 +49,55 @@ class ToolInputError(Exception):
 
 class ToolExecutionError(Exception):
     """A valid tool request that cannot execute in the current server state."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str = "execution_error",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.details = dict(details or {})
+
+
+class ToolInternalError(Exception):
+    """An unexpected failure with a safe, structured execution context."""
+
+    def __init__(
+        self,
+        cause: Exception,
+        *,
+        failure_stage: str,
+        write_attempted: Optional[bool],
+        transaction_id_consumed: Optional[bool] = False,
+    ) -> None:
+        super().__init__("unexpected internal tool failure")
+        self.cause = cause
+        self.failure_stage = failure_stage
+        self.write_attempted = write_attempted
+        self.transaction_id_consumed = transaction_id_consumed
+
+
+def _run_tool_stage(
+    operation: Any,
+    *,
+    failure_stage: str,
+    write_attempted: Optional[bool],
+    transaction_id_consumed: Optional[bool] = False,
+) -> Any:
+    try:
+        return operation()
+    except (ToolInputError, ToolExecutionError, core.SafeEditError):
+        raise
+    except Exception as error:
+        raise ToolInternalError(
+            error,
+            failure_stage=failure_stage,
+            write_attempted=write_attempted,
+            transaction_id_consumed=transaction_id_consumed,
+        ) from error
 
 
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -571,7 +623,9 @@ def _remember_pending_transaction(
             "pending confirmation cache is full; confirm or wait for an "
             "existing transactionId before retrying dryRun"
         )
-    transaction_id = "tx_" + secrets.token_urlsafe(24)
+    transaction_id = (
+        "tx_" + SERVER_INSTANCE_ID + "_" + secrets.token_urlsafe(24)
+    )
     _PENDING_TRANSACTIONS[transaction_id] = {
         "expiresAt": now + PENDING_TRANSACTION_TTL_SECONDS,
         "argumentsJson": cached_arguments_json,
@@ -585,6 +639,28 @@ def _consume_pending_transaction(transaction_id: str) -> Dict[str, Any]:
     _prune_pending_transactions()
     pending = _PENDING_TRANSACTIONS.pop(transaction_id, None)
     if pending is None:
+        parts = transaction_id.split("_", 2)
+        if (
+            len(parts) == 3
+            and parts[0] == "tx"
+            and re.fullmatch(r"[0-9a-f]{16}", parts[1])
+            and parts[1] != SERVER_INSTANCE_ID
+        ):
+            raise ToolExecutionError(
+                "transactionId belongs to a different MCP server "
+                "instance; run dryRun again in this tool session",
+                reason="transaction_server_instance_mismatch",
+                details={
+                    "transactionServerInstanceId": parts[1],
+                    "serverInstanceId": SERVER_INSTANCE_ID,
+                    "transactionIdConsumed": False,
+                    "statRequired": False,
+                    "recommendedAction": {
+                        "type": "run_new_dry_run",
+                        "confidence": 0.99,
+                    },
+                },
+            )
         raise ToolExecutionError(
             "unknown or expired transactionId; run dryRun again"
         )
@@ -710,7 +786,11 @@ def execute_tool(name: str, raw_arguments: Any) -> Dict[str, Any]:
         ):
             raise ToolInputError("file must be a non-empty string")
         args.file = file_value
-        summary = core.run_preflight(args)
+        summary = _run_tool_stage(
+            lambda: core.run_preflight(args),
+            failure_stage="preflight_execution",
+            write_attempted=False,
+        )
     elif name == "safe_edit_stat":
         _validate_stat_arguments(arguments)
         args = _fresh_args("stat-many")
@@ -721,7 +801,11 @@ def execute_tool(name: str, raw_arguments: Any) -> Dict[str, Any]:
             if not isinstance(encoding, str) or not encoding:
                 raise ToolInputError("encoding must be a non-empty string")
             payload["encoding"] = encoding
-        summary = core.run_stat_many_payload(args, payload)
+        summary = _run_tool_stage(
+            lambda: core.run_stat_many_payload(args, payload),
+            failure_stage="stat_execution",
+            write_attempted=False,
+        )
     elif name == "safe_edit_transaction":
         _validate_transaction_arguments(arguments)
         confirmation_id = arguments.get("transactionId")
@@ -739,19 +823,41 @@ def execute_tool(name: str, raw_arguments: Any) -> Dict[str, Any]:
                 raise ToolInputError(
                     "confirm with transactionId only; do not resend files or options"
                 )
-            pending = _consume_pending_transaction(confirmation_id)
+            pending = _run_tool_stage(
+                lambda: _consume_pending_transaction(confirmation_id),
+                failure_stage="confirmation_cache_lookup",
+                write_attempted=False,
+            )
             prepared = pending.get("prepared")
             if prepared is None:
                 arguments_json = pending.get("argumentsJson")
                 if not isinstance(arguments_json, bytes):
-                    raise RuntimeError(
-                        "cached transaction is invalid; run dryRun again"
+                    raise ToolInternalError(
+                        RuntimeError("cached transaction is invalid"),
+                        failure_stage="confirmation_cache_restore",
+                        write_attempted=False,
+                        transaction_id_consumed=True,
                     )
-                arguments = _require_arguments(json.loads(arguments_json))
-                _validate_transaction_arguments(arguments)
+                arguments = _run_tool_stage(
+                    lambda: _require_arguments(json.loads(arguments_json)),
+                    failure_stage="confirmation_cache_restore",
+                    write_attempted=False,
+                    transaction_id_consumed=True,
+                )
+                _run_tool_stage(
+                    lambda: _validate_transaction_arguments(arguments),
+                    failure_stage="confirmation_cache_restore",
+                    write_attempted=False,
+                    transaction_id_consumed=True,
+                )
 
         if prepared is not None:
-            summary = core.commit_prepared_transaction(prepared)
+            summary = _run_tool_stage(
+                lambda: core.commit_prepared_transaction(prepared),
+                failure_stage="transaction_commit",
+                write_attempted=None,
+                transaction_id_consumed=True,
+            )
         else:
             args = _fresh_args("transaction")
             _configure_common(args, arguments)
@@ -760,13 +866,28 @@ def execute_tool(name: str, raw_arguments: Any) -> Dict[str, Any]:
             if not isinstance(dry_run, bool):
                 raise ToolInputError("dryRun must be a boolean")
             args.dry_run = dry_run
-            summary = core.run_transaction_payload(
-                args, {"files": _require_files(arguments)}
+            summary = _run_tool_stage(
+                lambda: core.run_transaction_payload(
+                    args, {"files": _require_files(arguments)}
+                ),
+                failure_stage=(
+                    "transaction_preview"
+                    if dry_run
+                    else "transaction_commit"
+                ),
+                write_attempted=False if dry_run else None,
+                transaction_id_consumed=(
+                    True if confirmation_id is not None else False
+                ),
             )
             if dry_run:
-                transaction_id = _remember_pending_transaction(
-                    arguments,
-                    getattr(args, "_prepared_transaction", None),
+                transaction_id = _run_tool_stage(
+                    lambda: _remember_pending_transaction(
+                        arguments,
+                        getattr(args, "_prepared_transaction", None),
+                    ),
+                    failure_stage="confirmation_cache_store",
+                    write_attempted=False,
                 )
                 summary["transactionId"] = transaction_id
                 summary["transactionExpiresInSeconds"] = (
@@ -781,6 +902,7 @@ def execute_tool(name: str, raw_arguments: Any) -> Dict[str, Any]:
 
     result = dict(summary)
     result["transport"] = "mcp-structured"
+    result["serverInstanceId"] = SERVER_INSTANCE_ID
     result["elapsedMs"] = round(
         (time.perf_counter_ns() - started) / 1_000_000, 3
     )
@@ -799,6 +921,7 @@ def _tool_result(summary: Dict[str, Any]) -> Dict[str, Any]:
             "command": summary.get("command"),
             "fileCount": summary.get("fileCount"),
             "written": summary.get("written"),
+            "serverInstanceId": summary.get("serverInstanceId"),
             "truncated": True,
             "compatibilityTextLimitBytes": MAX_COMPAT_TEXT_BYTES,
         }
@@ -823,7 +946,7 @@ def _tool_failure(error: Exception, command: str) -> Dict[str, Any]:
         payload = core.build_error_payload(error, command=command)
     else:
         failure_reason = (
-            "execution_error"
+            getattr(error, "reason", "execution_error")
             if isinstance(error, ToolExecutionError)
             else "validation_error"
         )
@@ -838,10 +961,208 @@ def _tool_failure(error: Exception, command: str) -> Dict[str, Any]:
             "failureReason": failure_reason,
             "written": False,
         }
+        if isinstance(error, ToolExecutionError):
+            payload.update(error.details)
     payload["transport"] = "mcp-structured"
+    payload["serverInstanceId"] = SERVER_INSTANCE_ID
     result = _tool_result(payload)
     result["isError"] = True
     return result
+
+
+def _write_state_from_core_error(error: Exception) -> Optional[bool]:
+    written = getattr(error, "_transaction_written", None)
+    partial_write = getattr(error, "_transaction_partial_write", None)
+    if written is True or partial_write is True:
+        return True
+    if written is False and partial_write is False:
+        return False
+    return None
+
+
+def _write_state_from_summary(summary: Any) -> Optional[bool]:
+    if not isinstance(summary, dict):
+        return None
+    written = summary.get("written")
+    if isinstance(written, bool):
+        return written
+    return None
+
+
+def _infer_internal_failure_context(
+    command: str, arguments: Any
+) -> Dict[str, Any]:
+    if command == "safe_edit_preflight":
+        return {
+            "failure_stage": "preflight_execution",
+            "write_attempted": False,
+            "transaction_id_consumed": False,
+        }
+    if command == "safe_edit_stat":
+        return {
+            "failure_stage": "stat_execution",
+            "write_attempted": False,
+            "transaction_id_consumed": False,
+        }
+    if isinstance(arguments, dict) and arguments.get("dryRun") is True:
+        return {
+            "failure_stage": "transaction_preview",
+            "write_attempted": False,
+            "transaction_id_consumed": False,
+        }
+    if isinstance(arguments, dict) and "transactionId" in arguments:
+        return {
+            "failure_stage": "transaction_confirmation",
+            "write_attempted": None,
+            "transaction_id_consumed": None,
+        }
+    return {
+        "failure_stage": "transaction_commit",
+        "write_attempted": None,
+        "transaction_id_consumed": False,
+    }
+
+
+def _safe_exception_metadata(error: Exception) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {"type": type(error).__name__}
+    if isinstance(error, OSError):
+        if isinstance(error.errno, int):
+            metadata["errno"] = error.errno
+        winerror = getattr(error, "winerror", None)
+        if isinstance(winerror, int):
+            metadata["winerror"] = winerror
+        if isinstance(error.strerror, str) and error.strerror:
+            safe_strerror = error.strerror[:256]
+            metadata["strerror"] = safe_strerror.replace(
+                "\r", " "
+            ).replace("\n", " ")
+    return metadata
+
+
+def _log_internal_failure(
+    error: Exception,
+    *,
+    incident_id: str,
+    command: str,
+    failure_stage: str,
+    write_attempted: Optional[bool],
+    transaction_id_consumed: Optional[bool],
+) -> None:
+    try:
+        frames = [
+            {
+                "file": os.path.basename(frame.filename),
+                "line": frame.lineno,
+                "function": frame.name,
+            }
+            for frame in traceback.extract_tb(error.__traceback__)[-8:]
+        ]
+        event = {
+            "level": "error",
+            "event": "safe_edit_internal_failure",
+            "incidentId": incident_id,
+            "serverInstanceId": SERVER_INSTANCE_ID,
+            "command": command,
+            "failureStage": failure_stage,
+            "writeAttempted": write_attempted,
+            "transactionIdConsumed": transaction_id_consumed,
+            "exception": _safe_exception_metadata(error),
+            "frames": frames,
+        }
+        sys.stderr.write(
+            json.dumps(
+                event,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _internal_tool_failure(
+    error: Exception,
+    command: str,
+    *,
+    failure_stage: Optional[str] = None,
+    write_attempted: Optional[bool] = None,
+    transaction_id_consumed: Optional[bool] = False,
+) -> Dict[str, Any]:
+    if isinstance(error, ToolInternalError):
+        cause = error.cause
+        failure_stage = error.failure_stage
+        write_attempted = error.write_attempted
+        transaction_id_consumed = error.transaction_id_consumed
+    else:
+        cause = error
+    stage = failure_stage or "tool_execution"
+    incident_id = "se_" + secrets.token_hex(12)
+    outcome_uncertain = write_attempted is not False
+    if outcome_uncertain:
+        recommended_action = {
+            "type": "re_stat_and_retry_with_fresh_dry_run",
+            "confidence": 0.95,
+        }
+        failure_class = "RE_READ_REQUIRED"
+    else:
+        recommended_action = {
+            "type": "retry_with_fresh_request",
+            "confidence": 0.85,
+        }
+        failure_class = "RETRYABLE"
+    exception_metadata = _safe_exception_metadata(cause)
+    payload: Dict[str, Any] = {
+        "ok": False,
+        "command": command,
+        "error": {
+            "type": "internal_execution_error",
+            "message": (
+                "unexpected internal failure during "
+                f"{stage}; incidentId={incident_id}"
+            ),
+            "reason": "internal_execution_error",
+            "incidentId": incident_id,
+            "exceptionType": exception_metadata["type"],
+            "failureStage": stage,
+        },
+        "failureReason": "internal_execution_error",
+        "failureClass": failure_class,
+        "failureStage": stage,
+        "incidentId": incident_id,
+        "exception": exception_metadata,
+        "writeAttempted": write_attempted,
+        "written": False if write_attempted is False else None,
+        "rolledBack": False if write_attempted is False else None,
+        "partialWrite": False if write_attempted is False else None,
+        "outcomeUncertain": outcome_uncertain,
+        "transactionIdConsumed": transaction_id_consumed,
+        "statRequired": outcome_uncertain,
+        "recommendedAction": recommended_action,
+        "transport": "mcp-structured",
+        "serverInstanceId": SERVER_INSTANCE_ID,
+    }
+    _log_internal_failure(
+        cause,
+        incident_id=incident_id,
+        command=command,
+        failure_stage=stage,
+        write_attempted=write_attempted,
+        transaction_id_consumed=transaction_id_consumed,
+    )
+    content_text = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    return {
+        "content": [{"type": "text", "text": content_text}],
+        "structuredContent": payload,
+        "isError": True,
+    }
 
 
 FILE_ITEM_SCHEMA = {
@@ -1233,20 +1554,38 @@ def handle_message(message: Any) -> Optional[Dict[str, Any]]:
             params["arguments"], dict
         ):
             return _rpc_error(request_id, -32602, "Invalid params")
+        arguments = params.get("arguments")
         try:
-            summary = execute_tool(name, params.get("arguments"))
-            result = _tool_result(summary)
+            summary = execute_tool(name, arguments)
         except ToolInputError as error:
             result = _tool_failure(error, name)
         except ToolExecutionError as error:
             result = _tool_failure(error, name)
+        except ToolInternalError as error:
+            result = _internal_tool_failure(error, name)
         except core.SafeEditError as error:
             try:
                 result = _tool_failure(error, name)
-            except Exception:
-                return _rpc_error(request_id, -32603, "Internal error")
-        except Exception:
-            return _rpc_error(request_id, -32603, "Internal error")
+            except Exception as formatting_error:
+                result = _internal_tool_failure(
+                    formatting_error,
+                    name,
+                    failure_stage="error_serialization",
+                    write_attempted=_write_state_from_core_error(error),
+                )
+        except Exception as error:
+            context = _infer_internal_failure_context(name, arguments)
+            result = _internal_tool_failure(error, name, **context)
+        else:
+            try:
+                result = _tool_result(summary)
+            except Exception as error:
+                result = _internal_tool_failure(
+                    error,
+                    name,
+                    failure_stage="result_serialization",
+                    write_attempted=_write_state_from_summary(summary),
+                )
         return _rpc_result(request_id, result)
     return _rpc_error(request_id, -32601, f"Method not found: {method}")
 

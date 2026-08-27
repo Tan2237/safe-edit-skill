@@ -1790,6 +1790,162 @@ class SafeEditMcpTests(unittest.TestCase):
         self.assertIn("unknown or expired", retry_payload["error"]["message"])
         self.assertFalse(retry_payload["written"])
 
+    def test_confirmation_internal_failure_reports_uncertain_write_state(self):
+        target = self.root / "internal-confirmation.txt"
+        target.write_bytes(b"before\n")
+        expected = hashlib.sha256(b"before\n").hexdigest()
+        preview = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "dryRun": True,
+                "files": [
+                    {
+                        "file": str(target),
+                        "expectedSha256": expected,
+                        "operations": [
+                            {
+                                "op": "edit",
+                                "old": "before",
+                                "new": "after",
+                                "expected_count": 1,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        transaction_id = preview["transactionId"]
+        stderr = io.StringIO()
+
+        with patch.object(
+            implementation.core,
+            "commit_prepared_transaction",
+            side_effect=RuntimeError("sensitive commit detail"),
+        ), patch.object(implementation.sys, "stderr", stderr):
+            response = server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 411,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "safe_edit_transaction",
+                        "arguments": {"transactionId": transaction_id},
+                    },
+                }
+            )
+
+        self.assertNotIn("error", response)
+        self.assertTrue(response["result"]["isError"])
+        payload = response["result"]["structuredContent"]
+        self.assertEqual(payload["failureStage"], "transaction_commit")
+        self.assertIsNone(payload["writeAttempted"])
+        self.assertIsNone(payload["written"])
+        self.assertIsNone(payload["partialWrite"])
+        self.assertTrue(payload["outcomeUncertain"])
+        self.assertTrue(payload["statRequired"])
+        self.assertTrue(payload["transactionIdConsumed"])
+        self.assertEqual(payload["failureClass"], "RE_READ_REQUIRED")
+        self.assertEqual(
+            payload["recommendedAction"]["type"],
+            "re_stat_and_retry_with_fresh_dry_run",
+        )
+        self.assertEqual(
+            payload["serverInstanceId"], preview["serverInstanceId"]
+        )
+        self.assertNotIn(transaction_id, implementation._PENDING_TRANSACTIONS)
+        self.assertEqual(target.read_bytes(), b"before\n")
+        self.assertNotIn("sensitive commit detail", json.dumps(payload))
+        log_event = json.loads(stderr.getvalue())
+        self.assertEqual(log_event["failureStage"], "transaction_commit")
+        self.assertTrue(log_event["transactionIdConsumed"])
+        self.assertTrue(log_event["frames"])
+        self.assertNotIn("sensitive commit detail", stderr.getvalue())
+
+    def test_direct_transaction_internal_failure_requires_restat(self):
+        target = self.root / "internal-direct.txt"
+        target.write_bytes(b"before\n")
+        expected = hashlib.sha256(b"before\n").hexdigest()
+        stderr = io.StringIO()
+        with patch.object(
+            implementation.core,
+            "run_transaction_payload",
+            side_effect=RuntimeError("sensitive direct detail"),
+        ), patch.object(implementation.sys, "stderr", stderr):
+            response = server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 413,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "safe_edit_transaction",
+                        "arguments": {
+                            "files": [
+                                {
+                                    "file": str(target),
+                                    "expectedSha256": expected,
+                                    "operations": [
+                                        {
+                                            "op": "edit",
+                                            "old": "before",
+                                            "new": "after",
+                                            "expected_count": 1,
+                                        }
+                                    ],
+                                }
+                            ]
+                        },
+                    },
+                }
+            )
+
+        payload = response["result"]["structuredContent"]
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(payload["failureStage"], "transaction_commit")
+        self.assertIsNone(payload["writeAttempted"])
+        self.assertTrue(payload["outcomeUncertain"])
+        self.assertTrue(payload["statRequired"])
+        self.assertFalse(payload["transactionIdConsumed"])
+        self.assertEqual(target.read_bytes(), b"before\n")
+        self.assertNotIn("sensitive direct detail", json.dumps(payload))
+        self.assertNotIn("sensitive direct detail", stderr.getvalue())
+
+    def test_foreign_server_transaction_id_has_specific_recovery_feedback(self):
+        foreign_instance = "0" * 16
+        if foreign_instance == implementation.SERVER_INSTANCE_ID:
+            foreign_instance = "f" * 16
+        transaction_id = f"tx_{foreign_instance}_example"
+
+        response = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 412,
+                "method": "tools/call",
+                "params": {
+                    "name": "safe_edit_transaction",
+                    "arguments": {"transactionId": transaction_id},
+                },
+            }
+        )
+
+        self.assertNotIn("error", response)
+        self.assertTrue(response["result"]["isError"])
+        payload = response["result"]["structuredContent"]
+        self.assertEqual(
+            payload["failureReason"],
+            "transaction_server_instance_mismatch",
+        )
+        self.assertEqual(
+            payload["transactionServerInstanceId"], foreign_instance
+        )
+        self.assertEqual(
+            payload["serverInstanceId"], implementation.SERVER_INSTANCE_ID
+        )
+        self.assertFalse(payload["transactionIdConsumed"])
+        self.assertFalse(payload["statRequired"])
+        self.assertEqual(
+            payload["recommendedAction"]["type"], "run_new_dry_run"
+        )
+
     def test_symlink_target_change_rejects_confirmation(self):
         first = self.root / "symlink-first.txt"
         second = self.root / "symlink-second.txt"
@@ -2052,6 +2208,111 @@ class SafeEditMcpTests(unittest.TestCase):
         )
         self.assertEqual(len(responses[1]["result"]["tools"]), 3)
 
+    def test_stdio_dry_run_and_confirmation_share_server_instance(self):
+        target = self.root / "stdio-confirmation.txt"
+        target.write_bytes(b"before\n")
+        expected = hashlib.sha256(b"before\n").hexdigest()
+        process = subprocess.Popen(
+            [sys.executable, str(SERVER_PATH)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        self.assertIsNotNone(process.stdin)
+        self.assertIsNotNone(process.stdout)
+        self.assertIsNotNone(process.stderr)
+        stderr_output = ""
+
+        def exchange(message):
+            process.stdin.write(json.dumps(message) + "\n")
+            process.stdin.flush()
+            response_line = process.stdout.readline()
+            if not response_line:
+                self.fail(process.stderr.read())
+            return json.loads(response_line)
+
+        try:
+            initialized = exchange(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": _initialize_params(),
+                }
+            )
+            self.assertEqual(
+                initialized["result"]["serverInfo"]["name"], "safe-edit"
+            )
+            preview = exchange(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "safe_edit_transaction",
+                        "arguments": {
+                            "dryRun": True,
+                            "files": [
+                                {
+                                    "file": str(target),
+                                    "expectedSha256": expected,
+                                    "operations": [
+                                        {
+                                            "op": "edit",
+                                            "old": "before",
+                                            "new": "after",
+                                            "expected_count": 1,
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    },
+                }
+            )
+            preview_payload = preview["result"]["structuredContent"]
+            self.assertFalse(preview_payload["written"])
+            transaction_id = preview_payload["transactionId"]
+            server_instance_id = preview_payload["serverInstanceId"]
+            self.assertTrue(
+                transaction_id.startswith(f"tx_{server_instance_id}_")
+            )
+
+            confirmed = exchange(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "safe_edit_transaction",
+                        "arguments": {"transactionId": transaction_id},
+                    },
+                }
+            )
+            confirmed_payload = confirmed["result"]["structuredContent"]
+            self.assertFalse(confirmed["result"].get("isError", False))
+            self.assertTrue(confirmed_payload["written"])
+            self.assertTrue(confirmed_payload["confirmed"])
+            self.assertEqual(
+                confirmed_payload["serverInstanceId"], server_instance_id
+            )
+            self.assertEqual(target.read_bytes(), b"after\n")
+        finally:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+            stderr_output = process.stderr.read()
+            process.stdout.close()
+            process.stderr.close()
+
+        self.assertEqual(process.returncode, 0, stderr_output)
+
     def test_initialize_negotiates_supported_protocol_version(self):
         supported = server.handle_message(
             {
@@ -2289,12 +2550,13 @@ class SafeEditMcpTests(unittest.TestCase):
         self.assertIn(marker, result["structuredContent"]["error"]["message"])
         self.assertLess(len(result["content"][0]["text"]), 1024)
 
-    def test_unexpected_tool_exception_is_internal_error(self):
+    def test_unexpected_tool_exception_is_diagnostic_tool_failure(self):
+        stderr = io.StringIO()
         with patch.object(
             implementation,
             "execute_tool",
             side_effect=RuntimeError("sensitive detail"),
-        ):
+        ), patch.object(implementation.sys, "stderr", stderr):
             response = server.handle_message(
                 {
                     "jsonrpc": "2.0",
@@ -2307,9 +2569,86 @@ class SafeEditMcpTests(unittest.TestCase):
                 }
             )
 
-        self.assertEqual(response["error"]["code"], -32603)
-        self.assertEqual(response["error"]["message"], "Internal error")
-        self.assertNotIn("result", response)
+        self.assertNotIn("error", response)
+        self.assertTrue(response["result"]["isError"])
+        payload = response["result"]["structuredContent"]
+        self.assertEqual(payload["failureReason"], "internal_execution_error")
+        self.assertEqual(payload["failureStage"], "preflight_execution")
+        self.assertEqual(payload["exception"]["type"], "RuntimeError")
+        self.assertFalse(payload["writeAttempted"])
+        self.assertFalse(payload["outcomeUncertain"])
+        self.assertFalse(payload["statRequired"])
+        self.assertEqual(
+            payload["serverInstanceId"], implementation.SERVER_INSTANCE_ID
+        )
+        self.assertNotIn("sensitive detail", json.dumps(payload))
+        log_event = json.loads(stderr.getvalue())
+        self.assertEqual(log_event["incidentId"], payload["incidentId"])
+        self.assertEqual(log_event["exception"]["type"], "RuntimeError")
+        self.assertNotIn("sensitive detail", stderr.getvalue())
+
+    def test_result_serialization_failure_keeps_write_state(self):
+        stderr = io.StringIO()
+        summary = {
+            "ok": True,
+            "command": "preflight",
+            "written": False,
+        }
+        with patch.object(
+            implementation, "execute_tool", return_value=summary
+        ), patch.object(
+            implementation,
+            "_tool_result",
+            side_effect=RuntimeError("sensitive result detail"),
+        ), patch.object(implementation.sys, "stderr", stderr):
+            response = server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 91,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "safe_edit_preflight",
+                        "arguments": {},
+                    },
+                }
+            )
+
+        payload = response["result"]["structuredContent"]
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(payload["failureStage"], "result_serialization")
+        self.assertFalse(payload["writeAttempted"])
+        self.assertFalse(payload["written"])
+        self.assertNotIn("sensitive result detail", json.dumps(payload))
+        self.assertNotIn("sensitive result detail", stderr.getvalue())
+
+    def test_internal_os_error_reports_safe_metadata_without_filename(self):
+        stderr = io.StringIO()
+        error = PermissionError(13, "permission denied", "sensitive-name.txt")
+        with patch.object(
+            implementation,
+            "execute_tool",
+            side_effect=error,
+        ), patch.object(implementation.sys, "stderr", stderr):
+            response = server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 92,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "safe_edit_stat",
+                        "arguments": {"files": ["target.txt"]},
+                    },
+                }
+            )
+
+        payload = response["result"]["structuredContent"]
+        self.assertEqual(payload["exception"]["type"], "PermissionError")
+        self.assertEqual(payload["exception"]["errno"], 13)
+        self.assertEqual(payload["exception"]["strerror"], "permission denied")
+        self.assertNotIn("sensitive-name.txt", json.dumps(payload))
+        log_event = json.loads(stderr.getvalue())
+        self.assertEqual(log_event["exception"], payload["exception"])
+        self.assertNotIn("sensitive-name.txt", stderr.getvalue())
 
     def test_valid_request_execution_state_error_is_tool_result(self):
         with patch.object(

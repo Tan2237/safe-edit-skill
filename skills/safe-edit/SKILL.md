@@ -93,6 +93,22 @@ state for a recognized tool return a normal `tools/call` result with
 `isError: true`. Malformed JSON-RPC envelopes, invalid request IDs, unknown tool
 names, and non-object `params` or `arguments` return JSON-RPC errors instead.
 
+Every structured result includes a random per-process `serverInstanceId`, and new
+confirmation tokens bind their issuer instance into the `transactionId`. A
+confirmation routed to another MCP process returns
+`failureReason: transaction_server_instance_mismatch` with
+`transactionIdConsumed: false`; run a new dry-run in that tool session.
+Unexpected recognized-tool failures remain normal `isError: true` tool results
+instead of opaque JSON-RPC `-32603` responses. They report a content-safe
+`incidentId`, `failureStage`, exception type, `writeAttempted`, `written`,
+`partialWrite`, `outcomeUncertain`, `transactionIdConsumed`,
+`statRequired`, and `recommendedAction`. When `statRequired` is true, stat
+every target before retrying; when `transactionIdConsumed` is true, never reuse
+that token. The matching stderr diagnostic uses the same incident and server
+instance IDs and includes code locations plus safe OS error metadata, but omits
+request payloads, file contents, transaction tokens, and arbitrary exception
+messages.
+
 The CLI sections below are the fallback when the structured tools are not
 available.
 
