@@ -11439,5 +11439,105 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
                 )
             )
 
+class StdioEncodingTests(unittest.TestCase):
+    """CLI stdio must stay UTF-8 even when the host codepage differs."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="safe-edit-test-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    @staticmethod
+    def _b64(text):
+        return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
+
+    def _run_raw(self, args, env=None, input_bytes=None):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *map(str, args)],
+            input=input_bytes,
+            capture_output=True,
+            env=env,
+        )
+
+    def test_diff_output_is_utf8_under_legacy_stdio_encoding(self):
+        target = self.tmpdir / "utf8.txt"
+        target.write_bytes(("alpha" + chr(10)).encode("ascii"))
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "gbk"
+        result = self._run_raw(
+            [
+                "edit", "--file", target,
+                "--old-base64", self._b64("alpha"),
+                "--new-base64", self._b64("中文内容"),
+                "--dry-run", "--diff",
+            ],
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = result.stdout.decode("utf-8")
+        self.assertIn("中文内容", out)
+
+    def test_json_error_echo_is_utf8_under_legacy_stdio_encoding(self):
+        target = self.tmpdir / "utf8.txt"
+        target.write_bytes(("alpha" + chr(10)).encode("ascii"))
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "gbk"
+        result = self._run_raw(
+            [
+                "edit", "--file", target,
+                "--old-base64", self._b64("中文旧文本"),
+                "--new-base64", self._b64("x"),
+                "--expected-count", "1", "--json",
+            ],
+            env=env,
+        )
+        self.assertEqual(result.returncode, 2, result.stdout)
+        payload = json.loads(result.stdout.decode("utf-8"))
+        self.assertEqual(payload["failureReason"], "content_not_found")
+        self.assertIn("中文旧文本", json.dumps(payload, ensure_ascii=False))
+
+    def test_stdin_json_is_utf8_under_legacy_stdio_encoding(self):
+        target = self.tmpdir / "utf8.txt"
+        target.write_bytes(("alpha" + chr(10)).encode("ascii"))
+        ops = json.dumps(
+            [{"op": "edit", "old": "alpha", "new": "中文内容", "expected_count": 1}],
+            ensure_ascii=False,
+        ).encode("utf-8")
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "gbk"
+        result = self._run_raw(
+            ["batch", "--file", target, "--ops-stdin", "--json"],
+            env=env,
+            input_bytes=ops,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target.read_bytes(), ("中文内容" + chr(10)).encode("utf-8"))
+
+    def test_write_json_line_falls_back_to_ascii_escapes(self):
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "safe-edit"))
+        try:
+            import safe_edit
+        finally:
+            sys.path.pop(0)
+
+        safe_edit._configure_stdio_for_json_transport()
+
+        buffer = io.BytesIO()
+        stream = io.TextIOWrapper(buffer, encoding="utf-8")
+        safe_edit._write_json_line(stream, {"text": "中文"})
+        stream.flush()
+        expected = ("{" + chr(34) + "text" + chr(34) + ": " + chr(34) + "中文" + chr(34) + "}" + chr(10)).encode("utf-8")
+        self.assertEqual(buffer.getvalue(), expected)
+
+        payload = {"text": "A" + chr(0xD800) + "B"}
+        ascii_buffer = io.BytesIO()
+        ascii_stream = io.TextIOWrapper(ascii_buffer, encoding="ascii")
+        safe_edit._write_json_line(ascii_stream, payload)
+        ascii_stream.flush()
+        line = ascii_buffer.getvalue()
+        self.assertLessEqual(max(line), 0x7F)
+        self.assertEqual(json.loads(line.decode("ascii"))["text"], payload["text"])
+
 if __name__ == "__main__":
     unittest.main()

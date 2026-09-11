@@ -330,6 +330,8 @@ python safe_edit.py edit --file path/to/file --old "missing" --new "bar" --json
 
 错误类型包括：`match_not_found`、`match_ambiguous`、`match_count_mismatch`、`hash_mismatch`、`encoding_error`、`file_error`、`lock_error`、`validation_error`、`format_error`、`unknown`。
 
+stdout/stderr 契约：CLI 把 stdio 固定为 UTF-8——`--json` 结果行经 `sys.stdout.buffer` 以 UTF-8 字节写出（非 ASCII 内容不转义），仅当内容无法以 UTF-8 编码时整行退回 `ensure_ascii=True`；stderr 诊断同样为 UTF-8。宿主经 Git Bash、cmd 或管道捕获时按 UTF-8 解码即可，无需 `PYTHONIOENCODING`。
+
 ### Agent Recovery Protocol
 
 匹配失败时，JSON 错误输出包含完整的恢复协议字段，供 Agent 自动决策。以下以结构化事务 prepare 阶段的失败为例：

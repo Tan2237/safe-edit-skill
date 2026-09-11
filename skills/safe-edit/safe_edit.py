@@ -1068,6 +1068,42 @@ def build_error_payload(
     return error_obj
 
 
+def _configure_stdio_for_json_transport() -> None:
+    """Pin piped stdio to UTF-8 so JSON payloads survive legacy codepages."""
+    stdin = sys.stdin
+    if stdin is not None and hasattr(stdin, "reconfigure"):
+        try:
+            if not stdin.isatty():
+                stdin.reconfigure(encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
+def _write_json_line(stream: Any, payload: Dict[str, Any]) -> None:
+    """Write one JSON line: UTF-8 bytes, ASCII-escaping only the unencodable."""
+    line = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    try:
+        wire = line + chr(10)
+        data = wire.encode("utf-8")
+    except UnicodeEncodeError:
+        wire = json.dumps(payload, ensure_ascii=True, sort_keys=True) + chr(10)
+        data = wire.encode("ascii")
+    buffer = getattr(stream, "buffer", None)
+    if buffer is not None:
+        buffer.write(data)
+        buffer.flush()
+    else:
+        stream.write(wire)
+        stream.flush()
+
+
 def emit_json_error(
     exc: SafeEditError,
     file_path: str = "",
@@ -1086,7 +1122,7 @@ def emit_json_error(
         text=text,
         lock_info=lock_info,
     )
-    print(json.dumps(error_obj, ensure_ascii=False, sort_keys=True))
+    _write_json_line(sys.stdout, error_obj)
 
 
 def visualize_whitespace(text: str) -> str:
@@ -11449,7 +11485,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
 def emit_summary(summary: Dict[str, Any], as_json: bool) -> None:
     if as_json:
-        print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+        _write_json_line(sys.stdout, summary)
         return
     if "diff" in summary and summary["diff"]:
         print(summary["diff"])
@@ -11572,6 +11608,7 @@ def _match_error_context(
 
 
 def main(argv: List[str]) -> int:
+    _configure_stdio_for_json_transport()
     parser = build_parser()
     args = parser.parse_args(argv)
 
