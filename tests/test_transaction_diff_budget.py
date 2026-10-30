@@ -78,6 +78,18 @@ class TransactionDiffBudgetTests(unittest.TestCase):
         self.assertTrue(truncated)
         self.assertIn("[compact diff truncated]", text)
 
+    def test_transaction_limiter_keeps_partial_nonfirst_line(self):
+        text = "short\n" + "y" * 200 + "\ntail"
+        bounded, cut = se._bound_transaction_diff(text, 80, 200)
+        self.assertTrue(cut)
+        self.assertTrue(bounded.startswith("short\n"))
+        self.assertIn("y" * 154, bounded)
+        self.assertNotIn("tail", bounded)
+        self.assertTrue(
+            bounded.endswith("... [transaction diff budget exhausted]")
+        )
+        self.assertEqual(len(bounded), 200)
+
 
 if __name__ == "__main__":
     unittest.main()

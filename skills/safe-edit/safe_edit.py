@@ -7279,7 +7279,7 @@ def _bound_transaction_diff(
             break
         if used + separator + len(line) > body_chars:
             available = body_chars - used - separator
-            if available > 0 and not kept:
+            if available > 0:
                 kept.append(line[:available])
                 used += available
             break
