@@ -50,6 +50,7 @@ def measure(
     validate: Callable[[Any], None],
     trace_memory: bool,
     setup: Optional[Callable[[], None]] = None,
+    output_size: Optional[Callable[[Any], int]] = None,
 ) -> Dict[str, Any]:
     for _ in range(warmups):
         if setup is not None:
@@ -59,6 +60,7 @@ def measure(
         del output
 
     samples: List[float] = []
+    output_sizes: List[int] = []
     for _ in range(iterations):
         gc.collect()
         if setup is not None:
@@ -68,6 +70,8 @@ def measure(
         elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
         samples.append(elapsed_ms)
         validate(output)
+        if output_size is not None:
+            output_sizes.append(output_size(output))
         del output
     median_ms = statistics.median(samples)
     result: Dict[str, Any] = {
@@ -85,6 +89,9 @@ def measure(
             else None
         ),
     }
+    if output_sizes:
+        result["outputBytesMedian"] = statistics.median(output_sizes)
+        result["outputBytesMax"] = max(output_sizes)
 
     if trace_memory:
         gc.collect()
@@ -827,6 +834,218 @@ def add_size_cases(
     )
 
 
+class McpSession:
+    def __init__(self) -> None:
+        self.process = subprocess.Popen(
+            [sys.executable, str(REPO_ROOT / "mcp" / "safe_edit_server.py")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+        )
+        self.next_id = 0
+
+    def request(
+        self, method: str, params: Optional[Dict[str, Any]] = None
+    ) -> tuple:
+        self.next_id += 1
+        message: Dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "id": self.next_id,
+            "method": method,
+        }
+        if params is not None:
+            message["params"] = params
+        assert self.process.stdin is not None
+        assert self.process.stdout is not None
+        self.process.stdin.write(
+            json.dumps(message, ensure_ascii=False) + chr(10)
+        )
+        self.process.stdin.flush()
+        line = self.process.stdout.readline()
+        if not line:
+            raise RuntimeError(f"MCP server closed during {method}")
+        return json.loads(line), len(line.encode("utf-8"))
+
+    def initialize(self) -> tuple:
+        return self.request(
+            "initialize",
+            {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "benchmark", "version": "1"},
+            },
+        )
+
+    def call(
+        self, name: str, arguments: Dict[str, Any]
+    ) -> tuple:
+        response, wire_bytes = self.request(
+            "tools/call", {"name": name, "arguments": arguments}
+        )
+        if "error" in response:
+            raise RuntimeError(response["error"])
+        result = response.get("result") or {}
+        return result.get("structuredContent") or {}, wire_bytes
+
+    def close(self) -> None:
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+
+
+def add_mcp_cases(results: List[Dict[str, Any]], temp_dir: Path, args: Any) -> None:
+    if args.skip_mcp:
+        return
+    newline = chr(10)
+    base_text = "alpha" + newline + "beta" + newline + "gamma" + newline
+    fixture = temp_dir / "mcp-fixture.txt"
+    fixture.write_text(base_text, encoding="utf-8")
+    fixture_bytes = len(base_text.encode("utf-8"))
+    stat_files: List[str] = []
+    stat_input = 0
+    for index in range(args.mcp_files):
+        path = temp_dir / f"mcp-{index}.txt"
+        content = f"item {index}" + newline
+        path.write_text(content, encoding="utf-8")
+        stat_files.append(str(path))
+        stat_input += len(content.encode("utf-8"))
+
+    def start_once() -> int:
+        session = McpSession()
+        try:
+            _, wire_bytes = session.initialize()
+            return wire_bytes
+        finally:
+            session.close()
+
+    def validate_start(value: int) -> None:
+        if value <= 0:
+            raise AssertionError(value)
+
+    results.append(
+        measure(
+            "mcp.startup-initialize",
+            start_once,
+            input_bytes=0,
+            iterations=args.iterations,
+            warmups=0,
+            validate=validate_start,
+            trace_memory=False,
+            output_size=lambda value: value,
+        )
+    )
+
+    session = McpSession()
+    try:
+        session.initialize()
+
+        def validate_stat(value: tuple) -> None:
+            summary = value[0]
+            if not summary.get("ok") or summary.get("fileCount") != len(stat_files):
+                raise AssertionError(summary)
+
+        results.append(
+            measure(
+                "mcp.stat-batch",
+                lambda: session.call("safe_edit_stat", {"files": stat_files}),
+                input_bytes=stat_input,
+                iterations=args.iterations,
+                warmups=args.warmups,
+                validate=validate_stat,
+                trace_memory=False,
+                output_size=lambda value: value[1],
+            )
+        )
+
+        expected = hashlib.sha256(fixture.read_bytes()).hexdigest()
+        dry_request = {
+            "dryRun": True,
+            "files": [
+                {
+                    "file": str(fixture),
+                    "expectedSha256": expected,
+                    "operations": [
+                        {"op": "append", "text": "dry" + newline}
+                    ],
+                }
+            ],
+        }
+
+        def validate_dry_run(value: tuple) -> None:
+            summary = value[0]
+            if not summary.get("dryRun") or not summary.get("transactionId"):
+                raise AssertionError(summary)
+            if not isinstance(summary.get("diffBudget"), dict):
+                raise AssertionError(summary)
+
+        results.append(
+            measure(
+                "mcp.transaction-dry-run",
+                lambda: session.call("safe_edit_transaction", dry_request),
+                input_bytes=fixture_bytes,
+                iterations=args.iterations,
+                warmups=args.warmups,
+                validate=validate_dry_run,
+                trace_memory=False,
+                output_size=lambda value: value[1],
+            )
+        )
+
+        state: Dict[str, str] = {}
+
+        def prepare_confirm() -> None:
+            fixture.write_text(base_text, encoding="utf-8")
+            sha = hashlib.sha256(fixture.read_bytes()).hexdigest()
+            preview, _ = session.call(
+                "safe_edit_transaction",
+                {
+                    "dryRun": True,
+                    "files": [
+                        {
+                            "file": str(fixture),
+                            "expectedSha256": sha,
+                            "operations": [
+                                {"op": "append", "text": "confirmed" + newline}
+                            ],
+                        }
+                    ],
+                },
+            )
+            token = preview.get("transactionId")
+            if not isinstance(token, str):
+                raise AssertionError(preview)
+            state["token"] = token
+
+        def validate_confirm(value: tuple) -> None:
+            summary = value[0]
+            if summary.get("dryRun") or not summary.get("written"):
+                raise AssertionError(summary)
+
+        results.append(
+            measure(
+                "mcp.transaction-confirm-by-id",
+                lambda: session.call(
+                    "safe_edit_transaction", {"transactionId": state["token"]}
+                ),
+                input_bytes=fixture_bytes,
+                iterations=args.iterations,
+                warmups=args.warmups,
+                validate=validate_confirm,
+                trace_memory=False,
+                setup=prepare_confirm,
+                output_size=lambda value: value[1],
+            )
+        )
+    finally:
+        session.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sizes-mib", default="1,10")
@@ -835,6 +1054,8 @@ def main() -> int:
     parser.add_argument("--context-matches", type=int, default=1000)
     parser.add_argument("--batch-operations", type=int, default=16)
     parser.add_argument("--trace-memory", action="store_true")
+    parser.add_argument("--mcp-files", type=int, default=8)
+    parser.add_argument("--skip-mcp", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     if (
@@ -842,6 +1063,7 @@ def main() -> int:
         or args.warmups < 0
         or args.context_matches < 1
         or args.batch_operations < 1
+        or args.mcp_files < 1
     ):
         parser.error(
             "iterations/context-matches/batch-operations must be positive "
@@ -898,8 +1120,10 @@ def main() -> int:
             if path.read_bytes() != before:
                 raise AssertionError("benchmark modified its input fixture")
 
+        add_mcp_cases(results, temp_dir, args)
+
     document = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "python": sys.version.split()[0],
         "throughputBasis": "input-bytes-per-median-wall-time",
         "platform": platform.platform(),
