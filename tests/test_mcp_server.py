@@ -230,6 +230,45 @@ class SafeEditMcpTests(unittest.TestCase):
                 {"transactionId": preview["transactionId"]},
             )
 
+    def test_dry_run_can_be_cancelled(self):
+        target = self.root / "cancellable.txt"
+        target.write_bytes(b"before\n")
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+        preview = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "file": str(target),
+                "expectedSha256": expected,
+                "operations": [
+                    {
+                        "op": "edit",
+                        "old": "before",
+                        "new": "after",
+                        "expected_count": 1,
+                    }
+                ],
+                "dryRun": True,
+            },
+        )
+
+        cancelled = server.execute_tool(
+            "safe_edit_transaction",
+            {"cancelTransactionId": preview["transactionId"]},
+        )
+        self.assertTrue(cancelled["cancelled"])
+        self.assertTrue(cancelled["transactionIdConsumed"])
+        self.assertFalse(cancelled["written"])
+        self.assertEqual(target.read_bytes(), b"before\n")
+        with self.assertRaisesRegex(
+            ToolExecutionError, "unknown or expired transactionId"
+        ):
+            server.execute_tool(
+                "safe_edit_transaction",
+                {"transactionId": preview["transactionId"]},
+            )
+
     def test_transaction_auto_matches_detected_crlf(self):
         target = self.root / "auto-eol.txt"
         target.write_bytes(b"alpha\r\nbeta\r\n")
@@ -2878,13 +2917,15 @@ class SafeEditMcpTests(unittest.TestCase):
             len(value) + 2,
         )
 
-    def test_large_structured_result_uses_bounded_compatibility_text(self):
+    def test_large_structured_result_uses_compact_compatibility_preview(self):
         marker = "large-diff-marker-"
         summary = {
             "ok": True,
             "command": "transaction",
             "fileCount": 1,
             "written": False,
+            "dryRun": True,
+            "transactionId": "tx_test",
             "files": [
                 {
                     "file": "large.txt",
@@ -2915,8 +2956,16 @@ class SafeEditMcpTests(unittest.TestCase):
             compatibility["compatibilityTextLimitBytes"],
             implementation.MAX_COMPAT_TEXT_BYTES,
         )
-        self.assertNotIn(marker, result["content"][0]["text"])
-        self.assertLess(len(result["content"][0]["text"]), 1024)
+        self.assertEqual(compatibility["transactionId"], "tx_test")
+        preview = compatibility["files"][0]
+        self.assertEqual(preview["diffMode"], "compact")
+        self.assertIn(marker, preview["diff"])
+        self.assertTrue(preview["diffTruncated"])
+        self.assertTrue(compatibility["diffBudget"]["truncated"])
+        self.assertLess(
+            len(result["content"][0]["text"]),
+            implementation.MAX_COMPAT_TEXT_BYTES,
+        )
 
     def test_repository_launcher_reports_package_version(self):
         completed = subprocess.run(

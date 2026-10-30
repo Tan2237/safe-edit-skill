@@ -125,6 +125,7 @@ _TRANSACTION_ARGUMENT_KEYS = frozenset(
     {
         "files",
         "transactionId",
+        "cancelTransactionId",
         "dryRun",
         "maxBytes",
         "autoMatch",
@@ -383,10 +384,13 @@ def _normalize_transaction_arguments(
 ) -> Dict[str, Any]:
     if "file" not in arguments:
         return arguments
-    if "files" in arguments or "transactionId" in arguments:
+    if any(
+        key in arguments
+        for key in ("files", "transactionId", "cancelTransactionId")
+    ):
         raise ToolInputError(
-            "single-file shorthand cannot be combined with files or "
-            "transactionId"
+            "single-file shorthand cannot be combined with files, "
+            "transactionId, or cancelTransactionId"
         )
     _reject_unknown_keys(
         arguments,
@@ -414,9 +418,11 @@ def _validate_transaction_arguments(arguments: Dict[str, Any]) -> None:
     )
     has_files = "files" in arguments
     has_transaction_id = "transactionId" in arguments
-    if has_files == has_transaction_id:
+    has_cancellation_id = "cancelTransactionId" in arguments
+    if sum((has_files, has_transaction_id, has_cancellation_id)) != 1:
         raise ToolInputError(
-            "provide exactly one of files or transactionId"
+            "provide exactly one of files, transactionId, or "
+            "cancelTransactionId"
         )
     if has_transaction_id:
         _require_non_empty_string(
@@ -425,6 +431,15 @@ def _validate_transaction_arguments(arguments: Dict[str, Any]) -> None:
         if set(arguments) != {"transactionId"}:
             raise ToolInputError(
                 "confirm with transactionId only; do not resend files or options"
+            )
+        return
+    if has_cancellation_id:
+        _require_non_empty_string(
+            arguments, "cancelTransactionId", "arguments", required=True
+        )
+        if set(arguments) != {"cancelTransactionId"}:
+            raise ToolInputError(
+                "cancel with cancelTransactionId only"
             )
         return
 
@@ -850,6 +865,27 @@ def execute_tool(name: str, raw_arguments: Any) -> Dict[str, Any]:
     elif name == "safe_edit_transaction":
         arguments = _normalize_transaction_arguments(arguments)
         _validate_transaction_arguments(arguments)
+        cancellation_id = arguments.get("cancelTransactionId")
+        if cancellation_id is not None:
+            _run_tool_stage(
+                lambda: _consume_pending_transaction(cancellation_id),
+                failure_stage="cancellation_cache_lookup",
+                write_attempted=False,
+                transaction_id_consumed=None,
+            )
+            return {
+                "ok": True,
+                "command": "transaction",
+                "cancelled": True,
+                "transactionId": cancellation_id,
+                "transactionIdConsumed": True,
+                "written": False,
+                "transport": "mcp-structured",
+                "serverInstanceId": SERVER_INSTANCE_ID,
+                "elapsedMs": round(
+                    (time.perf_counter_ns() - started) / 1_000_000, 3
+                ),
+            }
         confirmation_id = arguments.get("transactionId")
         pending = None
         prepared = None
@@ -951,6 +987,39 @@ def execute_tool(name: str, raw_arguments: Any) -> Dict[str, Any]:
     return result
 
 
+def _compact_compatibility_preview(
+    summary: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    files = summary.get("files")
+    if summary.get("command") != "transaction" or not isinstance(files, list):
+        return None
+    previews = []
+    for item in files:
+        if not isinstance(item, dict):
+            return None
+        preview = {
+            key: item[key]
+            for key in (
+                "file",
+                "written",
+                "skipped",
+                "sha256",
+                "resultSha256",
+            )
+            if key in item
+        }
+        diff = item.get("diff")
+        if isinstance(diff, str) and diff:
+            preview["diff"] = diff
+            preview["diffMode"] = "compact"
+            preview["diffTruncated"] = bool(item.get("diffTruncated"))
+        previews.append(preview)
+    return {
+        "files": previews,
+        "diffBudget": core._apply_transaction_diff_budget(previews),
+    }
+
+
 def _tool_result(summary: Dict[str, Any]) -> Dict[str, Any]:
     compatibility_size = _json_size_with_limit(
         summary, MAX_COMPAT_TEXT_BYTES
@@ -971,6 +1040,9 @@ def _tool_result(summary: Dict[str, Any]) -> Dict[str, Any]:
             compatibility_summary["transactionId"] = summary[
                 "transactionId"
             ]
+        preview = _compact_compatibility_preview(summary)
+        if preview is not None:
+            compatibility_summary.update(preview)
         content_text = _json_bytes(compatibility_summary).decode("utf-8")
     return {
         "content": [
@@ -1045,6 +1117,12 @@ def _infer_internal_failure_context(
             "failure_stage": "stat_execution",
             "write_attempted": False,
             "transaction_id_consumed": False,
+        }
+    if isinstance(arguments, dict) and "cancelTransactionId" in arguments:
+        return {
+            "failure_stage": "transaction_cancellation",
+            "write_attempted": False,
+            "transaction_id_consumed": None,
         }
     if isinstance(arguments, dict) and arguments.get("dryRun") is True:
         return {
@@ -1428,7 +1506,7 @@ TOOLS = [
             "are prevalidated; later write failures trigger conflict-safe "
             "best-effort rollback and may require recovery. An admitted dryRun "
             "returns a transactionId that can be confirmed without resending "
-            "the payload."
+            "the payload. Cancel an abandoned preview with cancelTransactionId."
         ),
         "inputSchema": {
             "type": "object",
@@ -1449,6 +1527,14 @@ TOOLS = [
                     "description": (
                         "Returned by dryRun. Call again with only this field "
                         "to apply the cached, SHA-guarded request."
+                    ),
+                },
+                "cancelTransactionId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": (
+                        "Cancel and release a pending dry-run without writing. "
+                        "Call with only this field."
                     ),
                 },
                 "dryRun": {"type": "boolean", "default": False},
@@ -1507,6 +1593,7 @@ TOOLS = [
                         "anyOf": [
                             {"required": ["file"]},
                             {"required": ["transactionId"]},
+                            {"required": ["cancelTransactionId"]},
                         ]
                     },
                 },
@@ -1516,11 +1603,16 @@ TOOLS = [
                         "anyOf": [
                             {"required": ["files"]},
                             {"required": ["transactionId"]},
+                            {"required": ["cancelTransactionId"]},
                         ]
                     },
                 },
                 {
                     "required": ["transactionId"],
+                    "maxProperties": 1,
+                },
+                {
+                    "required": ["cancelTransactionId"],
                     "maxProperties": 1,
                 },
             ],
