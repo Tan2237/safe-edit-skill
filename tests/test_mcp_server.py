@@ -112,6 +112,38 @@ class SafeEditMcpTests(unittest.TestCase):
         )
         self.assertEqual(result["transport"], "mcp-structured")
 
+    def test_replace_lines_preserves_indent_by_default(self):
+        target = self.root / "replace-lines-indent.txt"
+        target.write_bytes(b"void foo()\n{\n    bar();\n}\n")
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        result = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "files": [
+                    {
+                        "file": str(target),
+                        "expectedSha256": expected,
+                        "operations": [
+                            {
+                                "op": "replace-lines",
+                                "start": 3,
+                                "end": 3,
+                                "text": "baz();",
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        self.assertTrue(result["written"])
+        self.assertEqual(
+            target.read_bytes(), b"void foo()\n{\n    baz();\n}\n"
+        )
+
     def test_dry_run_can_be_confirmed_without_resending_payload(self):
         target = self.root / "confirmable.txt"
         target.write_bytes(b"before\n")

@@ -4247,7 +4247,7 @@ def _apply_line_operation_to_records(
         return end - start
 
     if op_name == "replace-lines":
-        preserve_indent = bool(operation.get("preserve_indent", False))
+        preserve_indent = bool(operation.get("preserve_indent", True))
         replacement_text = str(operation["text"])
         if preserve_indent and start < len(records):
             original_indent = _extract_indent(
