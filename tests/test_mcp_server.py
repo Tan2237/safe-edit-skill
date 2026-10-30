@@ -2150,6 +2150,53 @@ class SafeEditMcpTests(unittest.TestCase):
 
         self.assertEqual(capability_mock.call_count, 1)
 
+    def test_transaction_preview_exposes_diff_budget(self):
+        paths = []
+        for index in range(6):
+            path = self.root / f"budget-{index}.txt"
+            path.write_text(
+                "\n".join(f"line {line}" for line in range(140)) + "\n",
+                encoding="utf-8",
+            )
+            paths.append(path)
+        stat = server.execute_tool(
+            "safe_edit_stat", {"files": [str(path) for path in paths]}
+        )
+        hashes = {
+            Path(item["file"]).name: item["sha256"]
+            for item in stat["files"]
+        }
+        added = "\n".join(f"added {line}" for line in range(100))
+        request = {
+            "dryRun": True,
+            "files": [
+                {
+                    "file": str(path),
+                    "expectedSha256": hashes[path.name],
+                    "operations": [{"op": "append", "text": added}],
+                }
+                for path in paths
+            ],
+        }
+        preview = server.execute_tool("safe_edit_transaction", request)
+        budget = preview["diffBudget"]
+
+        self.assertEqual(budget["scope"], "transaction")
+        self.assertLessEqual(
+            budget["compactLinesUsed"], budget["compactMaxLines"]
+        )
+        self.assertLessEqual(
+            budget["compactCharsUsed"], budget["compactMaxChars"]
+        )
+        self.assertTrue(budget["truncated"])
+        self.assertTrue(
+            all(
+                "diffTruncatedBy" in item
+                for item in preview["files"]
+                if item.get("diff")
+            )
+        )
+
     def test_repository_version_entry_does_not_import_editing_core(self):
         code = (
             "import runpy,sys\n"
@@ -2169,7 +2216,7 @@ class SafeEditMcpTests(unittest.TestCase):
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("1.2.1", completed.stdout)
+        self.assertIn(implementation.SERVER_VERSION, completed.stdout)
         self.assertIn("exit=0", completed.stdout)
         self.assertIn("core-loaded=False", completed.stdout)
 
@@ -2804,7 +2851,7 @@ class SafeEditMcpTests(unittest.TestCase):
             encoding="utf-8",
             check=True,
         )
-        self.assertEqual(completed.stdout.strip(), "1.2.1")
+        self.assertEqual(completed.stdout.strip(), implementation.SERVER_VERSION)
 
     def test_benchmark_validates_every_timed_result(self):
         benchmark_path = REPO_ROOT / "tests" / "perf" / "benchmark.py"

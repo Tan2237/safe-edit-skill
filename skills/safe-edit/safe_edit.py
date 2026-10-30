@@ -167,6 +167,10 @@ _SPLITLINE_SEPARATOR_CHARS = frozenset(
 )
 _COMPACT_DIFF_MAX_LINES = 80
 _COMPACT_DIFF_MAX_CHARS = 12_000
+_TRANSACTION_DIFF_MAX_LINES = 240
+_TRANSACTION_DIFF_MAX_CHARS = 32_000
+_TRANSACTION_DIFF_MIN_FILE_LINES = 16
+_TRANSACTION_DIFF_MIN_FILE_CHARS = 1_024
 _COMPACT_DIFF_MAX_INPUT_LINES = 512
 _COMPACT_DIFF_MAX_INPUT_CHARS = 256_000
 _COMPACT_DIFF_SCAN_CHUNK = 64 * 1024
@@ -5078,14 +5082,19 @@ def _adjust_unified_hunk_header(
     )
 
 
-def _limit_compact_diff(lines: Iterable[str]) -> Tuple[str, bool]:
+def _limit_diff_lines(
+    lines: Iterable[str],
+    max_lines: int,
+    max_chars: int,
+    marker: str = "... [compact diff truncated]",
+) -> Tuple[str, bool]:
     kept: List[str] = []
     char_count = 0
     truncated = False
     for line in lines:
         separator_size = 1 if kept else 0
-        available = _COMPACT_DIFF_MAX_CHARS - char_count - separator_size
-        if len(kept) >= _COMPACT_DIFF_MAX_LINES or available <= 0:
+        available = max_chars - char_count - separator_size
+        if len(kept) >= max_lines or available <= 0:
             truncated = True
             break
         if len(line) > available:
@@ -5094,11 +5103,17 @@ def _limit_compact_diff(lines: Iterable[str]) -> Tuple[str, bool]:
             break
         kept.append(line)
         char_count += len(line) + separator_size
-    if truncated:
-        marker = "... [compact diff truncated]"
-        if len(kept) < _COMPACT_DIFF_MAX_LINES:
-            kept.append(marker)
+    if truncated and len(kept) < max_lines:
+        kept.append(marker)
     return "\n".join(kept), truncated
+
+
+def _limit_compact_diff(lines: Iterable[str]) -> Tuple[str, bool]:
+    return _limit_diff_lines(
+        lines,
+        _COMPACT_DIFF_MAX_LINES,
+        _COMPACT_DIFF_MAX_CHARS,
+    )
 
 
 def _line_content_end(text: str, start: int, line_end: int) -> int:
@@ -5261,8 +5276,7 @@ def _manual_compact_hunk(
     diff_text, limit_truncated = _limit_compact_diff(rendered)
     return (
         diff_text,
-        True
-        or prefix_truncated
+        prefix_truncated
         or removed_truncated
         or added_truncated
         or suffix_truncated
@@ -7239,6 +7253,135 @@ def _prepared_file_summary(plan: PreparedFilePlan) -> Dict[str, Any]:
     return summary
 
 
+def _diff_line_count(text: str) -> int:
+    if not text:
+        return 0
+    return text.count(chr(10)) + 1
+
+
+def _bound_transaction_diff(
+    text: str, max_lines: int, max_chars: int
+) -> Tuple[str, bool]:
+    marker = "... [transaction diff budget exhausted]"
+    if max_lines <= 0 or max_chars <= 0:
+        return "", True
+    if _diff_line_count(text) <= max_lines and len(text) <= max_chars:
+        return text, False
+    if max_lines < 2 or max_chars <= len(marker) + 1:
+        return "", True
+    body_lines = max_lines - 1
+    body_chars = max_chars - len(marker) - 1
+    kept: List[str] = []
+    used = 0
+    for line in text.split(chr(10)):
+        separator = 1 if kept else 0
+        if len(kept) >= body_lines:
+            break
+        if used + separator + len(line) > body_chars:
+            available = body_chars - used - separator
+            if available > 0 and not kept:
+                kept.append(line[:available])
+                used += available
+            break
+        kept.append(line)
+        used += separator + len(line)
+    body = chr(10).join(kept)
+    bounded = (body + chr(10) + marker) if body else marker
+    if len(bounded) > max_chars:
+        bounded = bounded[:max_chars]
+    return bounded, True
+
+
+def _apply_transaction_diff_budget(
+    files: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    compact: List[int] = []
+    full: List[int] = []
+    with_diff = 0
+    for index, item in enumerate(files, start=1):
+        if not isinstance(item, dict):
+            continue
+        diff = item.get("diff")
+        if not isinstance(diff, str) or not diff:
+            continue
+        with_diff += 1
+        mode = item.get("diffMode")
+        if mode == "full":
+            full.append(index)
+        elif mode == "compact":
+            compact.append(index)
+    remaining_lines = _TRANSACTION_DIFF_MAX_LINES
+    remaining_chars = _TRANSACTION_DIFF_MAX_CHARS
+    used_lines = 0
+    used_chars = 0
+    truncated_files: List[int] = []
+    omitted_files: List[int] = []
+    for position, index in enumerate(compact):
+        item = files[index - 1]
+        remaining_files = len(compact) - position
+        share_lines = min(
+            _COMPACT_DIFF_MAX_LINES,
+            max(
+                _TRANSACTION_DIFF_MIN_FILE_LINES,
+                remaining_lines // max(1, remaining_files),
+            ),
+        )
+        share_chars = min(
+            _COMPACT_DIFF_MAX_CHARS,
+            max(
+                _TRANSACTION_DIFF_MIN_FILE_CHARS,
+                remaining_chars // max(1, remaining_files),
+            ),
+        )
+        share_lines = max(0, min(share_lines, remaining_lines))
+        share_chars = max(0, min(share_chars, remaining_chars))
+        text = item.get("diff")
+        if not isinstance(text, str) or not text:
+            continue
+        bounded, cut = _bound_transaction_diff(text, share_lines, share_chars)
+        file_truncated = bool(item.get("diffTruncated"))
+        if not bounded:
+            item.pop("diff", None)
+            item["diffOmitted"] = True
+            item["diffTruncated"] = True
+            item["diffTruncatedBy"] = "transaction"
+            item["diffLines"] = 0
+            item["diffChars"] = 0
+            omitted_files.append(index)
+            truncated_files.append(index)
+            continue
+        item["diff"] = bounded
+        item["diffLines"] = _diff_line_count(bounded)
+        item["diffChars"] = len(bounded)
+        if cut:
+            item["diffTruncated"] = True
+            item["diffTruncatedBy"] = (
+                "file+transaction" if file_truncated else "transaction"
+            )
+            truncated_files.append(index)
+        elif file_truncated:
+            item["diffTruncatedBy"] = "file"
+        else:
+            item["diffTruncated"] = False
+            item["diffTruncatedBy"] = None
+        used_lines += item["diffLines"]
+        used_chars += item["diffChars"]
+        remaining_lines = max(0, remaining_lines - item["diffLines"])
+        remaining_chars = max(0, remaining_chars - item["diffChars"])
+    return {
+        "scope": "transaction",
+        "compactMaxLines": _TRANSACTION_DIFF_MAX_LINES,
+        "compactMaxChars": _TRANSACTION_DIFF_MAX_CHARS,
+        "compactLinesUsed": used_lines,
+        "compactCharsUsed": used_chars,
+        "truncated": bool(truncated_files),
+        "filesWithDiff": with_diff,
+        "truncatedFiles": truncated_files,
+        "omittedFiles": omitted_files,
+        "fullDiffFiles": full,
+    }
+
+
 def _prepared_preview_summary(
     prepared: PreparedTransaction,
 ) -> Dict[str, Any]:
@@ -7246,6 +7389,7 @@ def _prepared_preview_summary(
         _prepared_file_summary(plan)
         for plan in prepared.plans
     ]
+    diff_budget = _apply_transaction_diff_budget(previews)
     return {
         "ok": True,
         "command": "transaction",
@@ -7256,6 +7400,7 @@ def _prepared_preview_summary(
         "written": False,
         "rolledBack": False,
         "atomicity": "prevalidated",
+        "diffBudget": diff_budget,
     }
 
 
@@ -10810,6 +10955,7 @@ def commit_prepared_transaction(
 
     try:
         _transaction_before_response()
+        diff_budget = _apply_transaction_diff_budget(results)
         response: Dict[str, Any] = {
             "ok": True,
             "command": "transaction",
@@ -10828,6 +10974,7 @@ def commit_prepared_transaction(
             "rolledBack": False,
             "atomicity": "prevalidated-with-rollback",
             "crashAtomic": False,
+            "diffBudget": diff_budget,
         }
         cleanup_warnings = (
             commit_cleanup_warnings
