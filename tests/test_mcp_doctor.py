@@ -176,8 +176,8 @@ class DoctorTests(unittest.TestCase):
         self.assertTrue(report["handshake"]["ok"])
         self.assertEqual(report["handshake"]["serverName"], "safe-edit")
         self.assertEqual(
-            report["handshake"]["tools"],
-            list(doctor.EXPECTED_TOOLS),
+            sorted(report["handshake"]["tools"]),
+            sorted(doctor.EXPECTED_TOOLS),
         )
 
     def test_server_module_dispatches_doctor(self):

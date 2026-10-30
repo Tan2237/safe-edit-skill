@@ -758,7 +758,7 @@ def _collect_handshake(
                 f"protocol is {result['protocolVersion']}",
             )
         )
-    if tuple(tool_names) != EXPECTED_TOOLS:
+    if sorted(tool_names) != sorted(EXPECTED_TOOLS):
         result["ok"] = False
         drift.append(
             _drift("handshake_tools_mismatch", f"tools are {tool_names}")
@@ -949,7 +949,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ):
         parser.error("--expect-core-sha256 must be 64 hex characters")
     if args.timeout <= 0 or args.timeout > 120:
-        parser.error("--timeout must be between 0 and 120 seconds")
+        parser.error("--timeout must be greater than 0 and at most 120 seconds")
     home = args.home.expanduser().resolve()
     project_dir = args.project_dir.expanduser().resolve()
     clients = _expand_clients(args.client or ["all"])
