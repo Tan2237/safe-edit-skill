@@ -54,6 +54,29 @@ Do NOT:
 
 Completing the task is lower priority than following this protocol.
 
+## Reference Files
+
+Read only when needed; these files are part of the protocol:
+
+- `references/protocol.md` — prepared plans, locks, staging, rollback, MCP limits, multi-block format.
+- `references/recovery.md` — match failure escalation, stale hashes, match options.
+- `references/windows.md` — Windows/PowerShell/MSYS2 payload transport.
+- `references/git-conflicts.md` — merge-conflict resolution checklist.
+
+## Batching and Confirmation Rules
+
+1. Call `safe_edit_stat` once with all related existing files; cache each `sha256`.
+2. After a confirmed successful write, reuse the returned `sha256`. Re-run stat only when the file is recreated without a hash, a failed write phase may have changed state, or the outcome is uncertain.
+3. For a risky change, send one `dryRun`; when admitted, confirm with only `{"transactionId":"..."}`. Never resend files or options.
+4. Do not run the same dry-run or preview twice. If the token expired or was consumed, stat again and start a new preview.
+5. Compact diffs are transaction-budgeted. Inspect `diffBudget`, `diffTruncatedBy`, and `diffOmitted`; request per-file `diff: true` only when a full diff is required.
+
+| Path | Calls |
+|------|-------|
+| Simple single-file edit | 2: stat + transaction |
+| Risky edit with preview | 3: stat + dryRun + transactionId confirm |
+| After a confirmed write | 0 additional stat |
+
 ## Direct Structured Tool Fast Path
 
 When `safe_edit_preflight`, `safe_edit_stat`, and `safe_edit_transaction` are
@@ -204,71 +227,6 @@ per-call Python startup; native binding metadata is loaded lazily and cached per
 native stdin field; fall back to an existing request file, then URL-safe UTF-8
 Base64.
 
-Both paths build an immutable prepared plan before commit. Confirmation acquires
-cooperative locks in stable order, then jointly revalidates canonical paths,
-parent/target identities, and input hashes. A retained prepared plan does not
-repeat decoding or matching; bounded JSON fallback is prepared again.
-
-Each output is first written to a random hidden sibling stage under its pinned
-parent, completely written, file-fsynced, and verified. An edit then no-replace
-claims the current basename into a random quarantine, verifies identity, SHA-256,
-mode, size, and mtime, and no-replace installs the complete stage. A create only
-installs a complete verified stage. Original quarantines remain until all
-planned mutations complete post-install verification and every pinned parent
-passes the final validation sweep. The target basename can therefore be briefly
-absent between the two no-replace operations.
-
-Rollback no-replace claims the transaction output into another quarantine,
-verifies that generation, and only then no-replace restores the original or
-removes an owned create. It never overwrites an unknown or external target. This
-requires Linux `renameat2(RENAME_NOREPLACE)`, macOS
-`renameatx_np(RENAME_EXCL)`, or non-replacing Windows `MoveFileExW`, plus
-filesystem support. Missing primitives fail closed instead of falling back to an
-unsafe replacement.
-
-For each file that will mutate, an in-memory journal entry (not a persistent WAL)
-is created before the first staging syscall for that file. It preallocates random
-stage and rollback-quarantine basenames, plus an original-quarantine basename for
-an edit. Before each syscall that may change file or directory state, the journal
-advances to the corresponding `ATTEMPT_*` phase. If the call outcome is ambiguous,
-a preserved in-process control-flow exception occurs, or later verification
-fails, recovery probes the relevant endpoints, reconciles stage, target, and
-quarantine against recorded markers, and rolls proven mutations back in reverse
-order. Cleanup or restore is attempted only after identity, SHA-256, mode, size,
-and mtime prove ownership of the observed generation; the same-permission race
-boundaries below still apply.
-
-Original quarantines enter `ATTEMPT_FINALIZE` only after all planned mutations
-complete post-install verification and every pinned parent passes the final
-validation sweep. Cleanup or directory-sync problems on an otherwise successful
-commit appear in `cleanupWarnings`. If finalization is interrupted, an absent,
-replaced, or unknown original generation is not reported as rolled back; the
-status fields and `rollbackErrors` report the observed partial or uncertain
-outcome.
-
-When publish, inspection, rollback, or finalization state cannot be proven,
-recovery retains stage and quarantine artifacts and does not intentionally delete
-unverified or unknown objects. A `rollbackErrors` item that names a recovery
-artifact uses the fixed label `artifact basename=...; pinned parent
-identity=(device=..., inode=..., file_type=...); best-effort path=...`. Recovery
-uses the pinned parent plus basename; the path is only a locator and can be stale
-after parent rebinding. Inspect `written`, `rolledBack`, `partialWrite`,
-`rollbackConflict`, and `rollbackErrors` for the real result. `crashAtomic` is
-`false`: no multi-file commit is guaranteed across process crashes, power loss,
-or filesystems.
-
-No-replace publication and generation verification safely conflict with ordinary
-concurrent target-basename writers. They do not promise isolation from deliberate
-same-permission hijacking of random internal transaction names, mutation through
-an already-open writable descriptor, or mutation through another hardlink. POSIX
-has no portable unlink-by-inode CAS, so uncertain internal-name cleanup must retain
-and report the artifact. Direct single-file atomic replacement uses cooperative
-locking, not strict basename CAS; use `transaction` / `safe_edit_transaction` for
-the strongest concurrency checks and conflict-safe rollback.
-
-Protocol 2 retains kernel stripes for the whole edit lifetime and keeps legacy
-markers in the protocol-1 namespace. New participants are mutually exclusive, but
-mixed protocol-1 operation retains the old protocol's narrow race window.
 
 The latest trusted hash is authoritative for the lifetime of the file. Initially it
 comes from stat; after a successful transaction, replace it with that file result's
@@ -485,127 +443,6 @@ regex                       ← HIGHEST EDIT RISK
 11. **Re-read and validate after edits** — direct create/edit uses strict 1 MiB-chunk byte/EOF comparison; success still confirms only the payload received by the safe-edit core. Re-read or compile/test to verify intent.
 
 12. **Protect the hot path** — prefer one batched stat and one batched transaction. For previews, confirm the returned transaction ID when successful cache admission issues one instead of resending the payload. Do not split related files into repeated tool calls, rebuild the parser, spawn helper processes, or serialize an already-structured request again.
-
----
-
-## Match Failure Escalation
-
-```
-edit --old X --new Y --expected-count 1
-│
-├─ SUCCESS → Done
-│
-└─ FAIL → Read the structured recovery fields:
-    │
-    ├─ failureClass = RETRYABLE
-    │   ├─ every edit has expected_count → merge argumentsPatch into one dryRun
-    │   ├─ successful preview → review it, then confirm only its transactionId
-    │   └─ missing count or unsafe preview → re-read; do not broaden the transaction
-    │
-    ├─ rootCause = count_mismatch
-    │   └─ compare expectedCount/actualCount and re-read; do not add context automatically
-    │
-    ├─ rootCause = multiple_matches
-    │   └─ keep expected_count; add the shortest unique context_before/after
-    │
-    ├─ failureStage = context_filter
-    │   └─ use contextField, re-read that candidate window, and refresh only the stale context
-    │
-    └─ RE_READ_REQUIRED / USER_INPUT
-        └─ re-read or ask; do not jump directly to fuzzy matching
-```
-
-When `writeAttempted` is false, a prepare-stage retry does not require another stat.
-Because `argumentsPatch` is transaction-wide, merge it only when every edit operation
-has an explicit `expected_count`, force that retry to `dryRun: true`, review the preview,
-then confirm only its `transactionId`. Otherwise re-read instead of broadening the
-request. Use `--explain-match-failure` when no structured patch is available.
-
----
-
-## Match Options
-
-| Option | Effect | When to use |
-|--------|--------|-------------|
-| transaction `autoEolMatch` | Exact first, then EOL-only matching for multiline targets and contexts | **Default for transactions** |
-| `--auto-match` | Auto-try: exact → ignore-eol → ignore-indent → normalize-whitespace | Indentation or prose line-wrap drift; pair with `expected_count` and `dryRun` |
-| `--fuzzy` | Fuzzy matching (≥0.6); ignores per-line boundary whitespace, EOL style, and final EOL | Last-resort approximate text after re-reading |
-| `--fuzzy-workers auto\|N` | Conditional low-priority fuzzy processes; `1` forces serial, `N` is 2–8 | Large CPU-heavy fuzzy searches |
-| `--normalize-whitespace` | Collapse whitespace | Explicit prose/formatting recovery, not a structured-data default |
-| `--context-before/after` | Disambiguate matches using the active EOL strategy | Only when the target occurs more than once |
-
-| Content | Default flags |
-|---------|---------------|
-| Unique single line | (none) |
-| Multiline code | transaction `autoEolMatch` (default) |
-| Prose with line-wrap drift | `--auto-match --dry-run --expected-count 1` |
-| JSON/YAML | exact safe-edit matching; re-read on drift and do not normalize whitespace by default |
-
----
-
-## Multi-Block Edits
-
-For 2+ edits in one file, use diff-input:
-
-```
-------- SEARCH
-old text
-=======
-new text
-+++++++ REPLACE
-------- SEARCH
-another old
-=======
-another new
-+++++++ REPLACE
-```
-
-```bash
-# Preferred when native stdin is available
-python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-stdin
-
-# Preferred argv fallback
-python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-base64 B64
-
-# Use only when diff.txt already exists
-python "SAFE_EDIT_SCRIPT" edit --file F --diff-input-file diff.txt
-```
-
----
-
-## Windows Payload Transport
-
-PowerShell and the Windows native argv layer can rewrite quotes before Python receives them. MSYS2/Git Bash can additionally convert leading `/` and `//` as paths. `safe_edit.py` cannot reconstruct the caller's original intent after that transformation.
-
-Windows kernel locking assumes that `TEMP` is protected by a user-private ACL.
-Treat a weakly protected or shared `TEMP` directory as a known locking boundary.
-
-Use this order:
-
-1. `safe_edit_stat` and `safe_edit_transaction` with raw structured arguments.
-2. Native execution-tool stdin with `--request-stdin`, `--ops-stdin`, `--diff-input-stdin`, or `--text-stdin`.
-3. An existing payload file through `--request-file` or another `--*-file`.
-4. Unpadded URL-safe UTF-8 Base64 with `--request-base64`, `--ops-base64`, `--diff-input-base64`, or a field-specific `--*-base64`.
-5. Literal `--old`/`--new`/`--text` only for short, shell-insensitive text.
-
-For exact replacement, one stdin stream cannot carry both `old` and `new` independently. Use a batch JSON envelope:
-
-```json
-[
-  {
-    "op": "edit",
-    "old": "original text",
-    "new": "replacement text",
-    "expected_count": 1
-  }
-]
-```
-
-Pass that JSON through `batch --ops-stdin`, or encode the entire JSON document as URL-safe UTF-8 Base64 and pass it through `batch --ops-base64 B64`.
-
-Do not put a PowerShell here-string or quoted source literal into the command merely to feed stdin; that still relies on shell parsing. When the execution tool has no native stdin field, use Base64.
-
-For short literal arguments under MSYS2, `MSYS2_ARG_CONV_EXCL="*"` remains a fallback. `safe-edit` emits a `"warnings"` field in JSON output when it detects likely MSYS2 path corruption.
 
 ---
 

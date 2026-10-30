@@ -150,7 +150,7 @@ MCP 单次请求的 `maxBytes` 上限为 128 MiB；每次最多 128 个文件、
 
 CLI 保留为未加载插件时的兼容回退。
 
-## Claude Code、Cursor、OpenCode 与 VS Code
+## Claude Code、Cursor、OpenCode、VS Code 与 Kimi Code
 
 这些客户端都连接同一个 `safe-edit-mcp` stdio 进程；每个客户端或工作区
 只启动一个常驻进程，工具调用不会重复启动 Python。统一安装器只合并
@@ -173,12 +173,33 @@ safe-edit-mcp install --client cursor --scope user --dry-run --json
 | 客户端 | 用户级 | 项目级 |
 |---|---|---|
 | Claude Code | `~/.claude.json` | `.mcp.json` |
+| Kimi Code | `~/.kimi-code/mcp.json` | `.mcp.json`（共享） |
 | Cursor | `~/.cursor/mcp.json` | `.cursor/mcp.json` |
 | OpenCode | `~/.config/opencode/opencode.json` | `opencode.json` |
 | VS Code | 通过 `code --add-mcp` | `.vscode/mcp.json` |
 
+项目级 `.mcp.json` 由 Claude Code、Kimi Code（读取 git 根目录）和 Codex
+插件共用，安装器按真实路径去重，只写一次。Kimi 的用户级配置独立；Codex CLI
+的用户级配置是 `~/.codex/config.toml` 的 TOML 表，安装器不写 TOML，Codex
+继续使用插件 marketplace。
+
 如果目标配置不是有效 JSON（例如含 JSONC 注释），安装器会拒绝重写并保持
 原文件不变；此时使用 `--dry-run --json` 获取配置片段后手工合并。
+
+## 安装诊断（doctor）
+
+`doctor` 报告包/模块版本、核心脚本 SHA-256、已知 MCP 配置、skill 副本哈希，
+并发起一次真实 stdio 握手：
+
+```bash
+safe-edit-mcp doctor
+safe-edit-mcp doctor --json
+safe-edit-mcp doctor --json --skill-dir ~/.agents/skills/safe-edit
+```
+
+退出码：0 无漂移（warning 允许），1 发现版本/核心哈希/配置/握手漂移，
+2 用法或内部错误。`--core-sha256` 只输出当前核心哈希，`--no-handshake`
+跳过握手。
 
 ## Recommended Workflow
 
@@ -211,6 +232,20 @@ python safe_edit.py stat-many --request-stdin --json
 | `safe-edit` | 必须用 safe-edit（文件有 BOM、非 UTF-8 编码、CRLF 行尾等） |
 
 如果 `editStrategy` 是 `safe-edit`，后续对该文件的所有编辑都应使用 safe-edit。
+
+### 工作流硬规则
+
+1. 相关文件一次批量 `safe_edit_stat`，缓存每个 `sha256`。
+2. 成功写入后直接复用返回的 `sha256`；仅在重建无哈希、写阶段可能失败或结果不确定时重新 stat。
+3. 风险修改只做一次 `dryRun`；确认只发 `{"transactionId":"..."}`，不重传 files/options。
+4. 同一请求不重复 preview；token 过期或已消费时重新 stat 并开启新预演。
+5. compact diff 有事务总预算（240 行 / 32,000 字符），检查 `diffBudget`、`diffTruncatedBy`、`diffOmitted`；需要完整 diff 时只对指定文件设 `diff: true`。
+
+| 场景 | 调用次数 |
+|---|---|
+| 普通单文件编辑 | 2：stat + transaction |
+| 需要预演的修改 | 3：stat + dryRun + transactionId 确认 |
+| 成功写入后的重复 stat | 0 |
 
 ## 基本用法
 
@@ -730,8 +765,10 @@ python safe_edit.py transaction --request-stdin --json
 事务先生成不可变 prepared plan；提交阶段取得协作锁后统一重验 canonical path、
 parent/target identity 和输入哈希，再直接写入计划字节，不重跑解码、匹配或编辑计算。
 结构化 MCP 优先缓存该计划；超过 prepared 保留阈值时才缓存有界 JSON 请求并在
-确认时重新 prepare。dry-run 未显式设置 `diff` 时返回最多 80 行、12,000 字符的
-精简 diff；显式 `diff: true` 仍返回完整 diff。
+确认时重新 prepare。dry-run 未显式设置 `diff` 时返回精简 diff：单文件最多 80 行、12,000 字符；
+整个 transaction 的 compact diff 另受 240 行、32,000 字符总预算约束，超限时
+通过 `diffBudget`、`diffTruncatedBy`、`diffOmitted` 显式标记。显式
+`diff: true` 的文件返回完整 diff，不消耗 compact 总预算。
 
 每个输出先在已 pin 的父目录内写入随机隐藏 sibling stage，完成全部字节写入、文件
 `fsync` 和内容复验后才进入发布步骤。编辑已有文件时，事务先用 no-replace 操作把
