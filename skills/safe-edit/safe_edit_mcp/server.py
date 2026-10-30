@@ -1541,15 +1541,18 @@ def handle_message(message: Any) -> Optional[Dict[str, Any]]:
                     "version": SERVER_VERSION,
                 },
                 "instructions": (
-                    "Call safe_edit_stat before modifying existing files, "
-                    "then pass its SHA-256 values to one batched "
-                    "safe_edit_transaction. Use dryRun for risky changes, "
-                    "then confirm with only the returned transactionId. "
-                    "Reuse each successful file result's sha256 as the next "
-                    "guard. On a RETRYABLE prepare error, keep the hashes and "
-                    "apply retryStrategy.argumentsPatch only in a dryRun when "
-                    "every edit has expected_count; otherwise re-read. Confirm "
-                    "a successful retry only with its transactionId."
+                    "Call safe_edit_stat once for all related files before "
+                    "modifying, then pass its SHA-256 values to one batched "
+                    "safe_edit_transaction. Use dryRun for risky changes and "
+                    "confirm only with the returned transactionId; never "
+                    "resend the payload or repeat the same preview. Reuse each "
+                    "successful file result's sha256 as the next guard. "
+                    "Compact diffs are transaction-budgeted; set per-file "
+                    "diff:true only when a full diff is needed. On a RETRYABLE "
+                    "prepare error, keep the hashes and apply "
+                    "retryStrategy.argumentsPatch only in a dryRun when every "
+                    "edit has expected_count; otherwise re-read. Confirm a "
+                    "successful retry only with its transactionId."
                 ),
             },
         )
@@ -1691,12 +1694,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             from .installer import main as install_main
 
             return install_main(args[1:])
+        if args[0] == "doctor":
+            from .doctor import main as doctor_main
+
+            return doctor_main(args[1:])
         if args == ["--version"]:
             print(SERVER_VERSION)
             return 0
         print(
             "usage: safe-edit-mcp [--version] | "
-            "safe-edit-mcp install [options]",
+            "safe-edit-mcp install [options] | "
+            "safe-edit-mcp doctor [options]",
             file=sys.stderr,
         )
         return 2

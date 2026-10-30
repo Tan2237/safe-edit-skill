@@ -63,6 +63,14 @@ class SafeEditMcpInstallerTests(unittest.TestCase):
             claude["mcpServers"]["safe-edit"]["command"],
             "safe-edit-mcp",
         )
+        self.assertFalse((self.project / ".kimi-code" / "mcp.json").exists())
+        shared = [
+            item
+            for item in summary["results"]
+            if item["path"] == str(self.project / ".mcp.json")
+        ]
+        self.assertEqual(len(shared), 1)
+        self.assertEqual(shared[0]["clients"], ["claude-code", "kimi-code"])
         self.assertIn("other", cursor["mcpServers"])
         self.assertEqual(
             opencode["mcp"]["safe-edit"]["command"],
@@ -93,12 +101,74 @@ class SafeEditMcpInstallerTests(unittest.TestCase):
                 / "opencode.json"
             ).is_file()
         )
+        kimi = json.loads(
+            (self.home / ".kimi-code" / "mcp.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            kimi["mcpServers"]["safe-edit"]["command"], "safe-edit-mcp"
+        )
+        self.assertNotIn("type", kimi["mcpServers"]["safe-edit"])
         run_mock.assert_called_once()
         argv = run_mock.call_args.args[0]
         self.assertEqual(argv[:2], ["code-test", "--add-mcp"])
         payload = json.loads(argv[2])
         self.assertEqual(payload["name"], "safe-edit")
-        self.assertEqual(len(summary["results"]), 4)
+        self.assertEqual(len(summary["results"]), 5)
+
+    def test_kimi_project_uses_shared_mcp_json(self):
+        summary = installer.install_configs(
+            clients=["kimi-code"],
+            scope="project",
+            home=self.home,
+            project_dir=self.project,
+            invocation=self.invocation,
+        )
+
+        self.assertFalse((self.project / ".kimi-code" / "mcp.json").exists())
+        shared = json.loads(
+            (self.project / ".mcp.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            shared["mcpServers"]["safe-edit"]["command"], "safe-edit-mcp"
+        )
+        self.assertEqual(summary["results"][0]["clients"], ["kimi-code"])
+
+    def test_kimi_user_uses_dedicated_path(self):
+        installer.install_configs(
+            clients=["kimi-code"],
+            scope="user",
+            home=self.home,
+            project_dir=self.project,
+            invocation=self.invocation,
+        )
+
+        path = self.home / ".kimi-code" / "mcp.json"
+        self.assertTrue(path.is_file())
+        config = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            config["mcpServers"]["safe-edit"]["command"], "safe-edit-mcp"
+        )
+
+    def test_config_targets_marks_shared_project_file(self):
+        targets = installer.config_targets(self.home, self.project)
+        kimi_user = [
+            item
+            for item in targets
+            if item["client"] == "kimi-code" and item["scope"] == "user"
+        ]
+        kimi_project = [
+            item
+            for item in targets
+            if item["client"] == "kimi-code"
+            and item["scope"] == "project"
+        ]
+        self.assertEqual(
+            kimi_user[0]["path"], self.home / ".kimi-code" / "mcp.json"
+        )
+        self.assertEqual(kimi_project[0]["path"], self.project / ".mcp.json")
+        self.assertTrue(kimi_project[0]["shared"])
 
     def test_dry_run_does_not_write(self):
         summary = installer.install_configs(

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-CLIENTS = ("claude-code", "cursor", "opencode", "vscode")
+CLIENTS = ("claude-code", "cursor", "kimi-code", "opencode", "vscode")
 SERVER_KEY = "safe-edit"
 
 
@@ -83,6 +83,7 @@ def _target_path(
         return {
             "claude-code": project_dir / ".mcp.json",
             "cursor": project_dir / ".cursor" / "mcp.json",
+            "kimi-code": project_dir / ".mcp.json",
             "opencode": project_dir / "opencode.json",
             "vscode": project_dir / ".vscode" / "mcp.json",
         }[client]
@@ -91,6 +92,7 @@ def _target_path(
     return {
         "claude-code": home / ".claude.json",
         "cursor": home / ".cursor" / "mcp.json",
+        "kimi-code": home / ".kimi-code" / "mcp.json",
         "opencode": home / ".config" / "opencode" / "opencode.json",
     }[client]
 
@@ -101,6 +103,28 @@ def _section_name(client: str) -> str:
     if client == "vscode":
         return "servers"
     return "mcpServers"
+
+
+def config_targets(
+    home: Path, project_dir: Path
+) -> List[Dict[str, Any]]:
+    targets: List[Dict[str, Any]] = []
+    for client in CLIENTS:
+        for scope in ("user", "project"):
+            path = _target_path(client, scope, home, project_dir)
+            if path is None:
+                continue
+            targets.append(
+                {
+                    "client": client,
+                    "scope": scope,
+                    "path": path,
+                    "section": _section_name(client),
+                    "shared": client in ("claude-code", "kimi-code")
+                    and scope == "project",
+                }
+            )
+    return targets
 
 
 def _load_object(path: Path) -> Tuple[Dict[str, Any], Optional[bytes]]:
@@ -246,7 +270,8 @@ def install_configs(
 ) -> Dict[str, Any]:
     selected = _expand_clients(clients)
     server = invocation or _server_invocation()
-    files: List[FileAction] = []
+    files_by_path: Dict[str, FileAction] = {}
+    clients_by_path: Dict[str, List[str]] = {}
     commands: List[CommandAction] = []
 
     for client in selected:
@@ -255,8 +280,14 @@ def install_configs(
         target = _target_path(client, scope, home, project_dir)
         if target is None:
             commands.append(_vscode_user_action(server, code_cli))
-        else:
-            files.append(_render_config(client, target, server))
+            continue
+        key = str(target.resolve(strict=False))
+        if key not in files_by_path:
+            files_by_path[key] = _render_config(client, target, server)
+            clients_by_path[key] = []
+        clients_by_path[key].append(client)
+
+    files = list(files_by_path.values())
 
     results: List[Dict[str, Any]] = []
     applied: List[FileAction] = []
@@ -268,6 +299,10 @@ def install_configs(
             results.append(
                 {
                     "client": action.client,
+                    "clients": clients_by_path.get(
+                        str(action.path.resolve(strict=False)),
+                        [action.client],
+                    ),
                     "kind": "file",
                     "path": str(action.path),
                     "changed": action.changed,
@@ -282,6 +317,7 @@ def install_configs(
             results.append(
                 {
                     "client": action.client,
+                    "clients": [action.client],
                     "kind": "command",
                     "argv": list(action.argv),
                     "changed": not dry_run,

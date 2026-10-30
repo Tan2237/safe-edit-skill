@@ -31,10 +31,15 @@ def mcp_main(argv=None):
         from .installer import main as install_main
 
         return install_main(args[1:])
+    if args and args[0] == "doctor":
+        from .doctor import main as doctor_main
+
+        return doctor_main(args[1:])
     if args:
         print(
             "usage: safe-edit-mcp [--version] | "
-            "safe-edit-mcp install [options]",
+            "safe-edit-mcp install [options] | "
+            "safe-edit-mcp doctor [options]",
             file=sys.stderr,
         )
         return 2
