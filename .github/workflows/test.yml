@@ -37,10 +37,12 @@ jobs:
         run: |
           safe-edit --version
           safe-edit preflight --json
+      - name: safe-edit-mcp doctor smoke
+        run: safe-edit-mcp doctor --json --skill-dir skills/safe-edit
       - name: safe-edit-mcp stdio initialize smoke
         run: >-
           python -c "import json, subprocess; request = {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2025-11-25', 'capabilities': {}, 'clientInfo': {'name': 'ci', 'version': '1.0'}}}; completed = subprocess.run(['safe-edit-mcp'], input=json.dumps(request) + '\n', text=True, encoding='utf-8', capture_output=True, check=True, timeout=15); response = json.loads(completed.stdout); assert response['result']['serverInfo']['name'] == 'safe-edit'; assert response['result']['protocolVersion'] == '2025-11-25'"
       - name: Performance smoke
         if: ${{ matrix.python-version == '3.x' }}
         timeout-minutes: 2
-        run: python tests/perf/benchmark.py --sizes-mib 0.02 --iterations 1 --warmups 0 --context-matches 20 --batch-operations 8 --json
+        run: python tests/perf/benchmark.py --sizes-mib 0.02 --iterations 1 --warmups 0 --context-matches 20 --batch-operations 8 --mcp-files 2 --json
