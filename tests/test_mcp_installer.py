@@ -243,6 +243,37 @@ class SafeEditMcpInstallerTests(unittest.TestCase):
 
         self.assertFalse((self.project / ".mcp.json").exists())
 
+    def test_rollback_failure_is_reported(self):
+        real_write = installer._write_atomic
+
+        def fail_on_cursor(action):
+            if action.client == "cursor":
+                raise OSError("simulated write failure")
+            return real_write(action)
+
+        with patch.object(
+            installer, "_write_atomic", side_effect=fail_on_cursor
+        ), patch.object(
+            installer,
+            "_restore_file",
+            side_effect=OSError("simulated rollback failure"),
+        ), self.assertRaises(
+            installer.InstallError
+        ) as caught:
+            installer.install_configs(
+                clients=["claude-code", "cursor"],
+                scope="project",
+                home=self.home,
+                project_dir=self.project,
+                invocation=self.invocation,
+            )
+
+        message = str(caught.exception)
+        self.assertIn("rollback incomplete", message)
+        self.assertIn("simulated rollback failure", message)
+        self.assertIn("simulated write failure", message)
+        self.assertIn(str(self.project / ".mcp.json"), message)
+
 
 if __name__ == "__main__":
     unittest.main()

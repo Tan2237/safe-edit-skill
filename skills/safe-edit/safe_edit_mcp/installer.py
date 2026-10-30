@@ -325,11 +325,18 @@ def install_configs(
                 }
             )
     except (OSError, subprocess.CalledProcessError) as error:
+        rollback_errors = []
         for action in reversed(applied):
             try:
                 _restore_file(action)
-            except OSError:
-                pass
+            except OSError as rollback_error:
+                rollback_errors.append(f"{action.path}: {rollback_error}")
+        if rollback_errors:
+            details = "; ".join(rollback_errors)
+            raise InstallError(
+                f"configuration failed; rollback incomplete ({details}); "
+                f"original error: {error}"
+            ) from error
         raise InstallError(
             f"configuration failed; completed file writes were rolled back: "
             f"{error}"
