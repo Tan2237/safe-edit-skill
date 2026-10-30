@@ -19,6 +19,7 @@ from . import __version__
 
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_FILE_BYTES = 128 * 1024 * 1024
+DEFAULT_FILE_BYTES = 50 * 1024 * 1024
 MAX_FILES = 128
 MAX_OPERATIONS_PER_FILE = 256
 MAX_TOTAL_OPERATIONS = 1024
@@ -1475,6 +1476,8 @@ TOOLS = [
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_FILE_BYTES,
+                    "default": DEFAULT_FILE_BYTES,
+                    "description": "Per-file input/output byte limit.",
                 },
                 "lockTimeout": {
                     "type": "number",
@@ -1542,6 +1545,8 @@ TOOLS = [
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_FILE_BYTES,
+                    "default": DEFAULT_FILE_BYTES,
+                    "description": "Per-file input/output byte limit.",
                 },
                 "autoMatch": {
                     "type": "boolean",
@@ -1721,7 +1726,10 @@ def handle_message(message: Any) -> Optional[Dict[str, Any]]:
                     "resend the payload or repeat the same preview. Reuse each "
                     "successful file result's sha256 as the next guard. "
                     "Compact diffs are transaction-budgeted; set per-file "
-                    "diff:true only when a full diff is needed. On a RETRYABLE "
+                    "diff:true only when a full structured diff is needed. "
+                    "Large compatibility text results retain a compact diff. "
+                    "Cancel an abandoned preview with only cancelTransactionId. "
+                    "On a RETRYABLE "
                     "prepare error, keep the hashes and apply "
                     "retryStrategy.argumentsPatch only in a dryRun when every "
                     "edit has expected_count; otherwise re-read. Confirm a "

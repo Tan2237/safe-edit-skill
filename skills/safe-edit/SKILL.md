@@ -4,9 +4,9 @@ description: |
   MANDATORY: File editing MUST follow this protocol. No exceptions.
 
   The ONLY allowed edit mechanisms:
-  - safe_edit_stat and safe_edit_transaction (preferred when available)
-  - safe_edit.py (CLI fallback for editStrategy="safe-edit")
-  - host-provided built-in file-editing tool, regardless of its actual name (for editStrategy="edit-tool")
+  - safe_edit_stat for inspection, then safe_edit_transaction for all edits when MCP tools are available
+  - safe_edit.py when MCP is unavailable and editStrategy="safe-edit"
+  - host-provided built-in file-editing tool when MCP is unavailable and editStrategy="edit-tool"
 
   Before modifying an existing file, inspect it once and cache editStrategy
   plus sha256. Batch related files in one stat and one transaction. Use
@@ -38,7 +38,7 @@ Never violate a higher priority to satisfy a lower priority.
 - Do NOT replace `safe_edit.py` with inline Python, regex scripts, or ad-hoc file writes.
 - Do NOT write files using shell redirection (`>`, `>>`, `cat <<EOF`, `echo > file`).
 - Do NOT invent alternative edit workflows.
-- Do NOT infer, generate, or invent `safe_edit.py` commands not listed in Allowed Commands.
+- Do NOT infer, generate, or invent unsupported `safe_edit.py` commands or options; use Allowed Commands and options documented by `--help`.
 
 ## Failure Policy
 
@@ -67,7 +67,7 @@ Read only when needed; these files are part of the protocol:
 
 1. Call `safe_edit_stat` once with all related existing files; cache each `sha256`.
 2. After a confirmed successful write, reuse the returned `sha256`. Re-run stat only when the file is recreated without a hash, a failed write phase may have changed state, or the outcome is uncertain.
-3. For a risky change, send one `dryRun`; when admitted, confirm with only `{"transactionId":"..."}`. Never resend files or options.
+3. For a risky change, send one `dryRun`; when admitted, confirm with only `{"transactionId":"..."}`. Never resend files or options. To abandon it, send only `{"cancelTransactionId":"..."}`; cancellation consumes the token without writing.
 4. Do not run the same dry-run or preview twice. If the token expired or was consumed, stat again and start a new preview.
 5. Compact diffs are transaction-budgeted. Inspect `diffBudget`, `diffTruncatedBy`, and `diffOmitted`; request per-file `diff: true` only when a full diff is required.
 
@@ -80,8 +80,9 @@ Read only when needed; these files are part of the protocol:
 ## Direct Structured Tool Fast Path
 
 When `safe_edit_preflight`, `safe_edit_stat`, and `safe_edit_transaction` are
-callable, use them instead of transporting source text through a shell command.
-They are part of the allowed safe-edit protocol.
+callable, use `safe_edit_transaction` for every existing-file edit, regardless
+of `editStrategy`. The strategy selects the host or CLI fallback only when MCP
+is unavailable. These tools are part of the allowed safe-edit protocol.
 
 1. Call `safe_edit_preflight` once when runtime or target-directory capability
    is uncertain.
@@ -96,20 +97,24 @@ They are part of the allowed safe-edit protocol.
 
 The server is long-lived: it imports the editing core and builds its parser only
 once. Successfully admitted dry-runs receive single-use transaction IDs valid for
-up to 10 minutes. Admission is bounded: a full cache rejects a new dry-run rather
-than evicting any unexpired issued token. The cache normally retains an immutable
-prepared plan; requests above the MCP prepared-retention threshold use bounded JSON
-fallback storage and are prepared again at confirmation. Batch related files so
+up to 10 minutes. Admission is bounded to 32 tokens, 128 MiB total, and 64 MiB
+per token; a full cache rejects a new dry-run rather than evicting an unexpired
+token. Cancel abandoned previews with `cancelTransactionId`. The cache normally
+retains an immutable prepared plan; plans above 16 MiB of prepared output use
+bounded JSON fallback storage and are prepared again at confirmation. Batch related files so
 random per-parent short-lived best-effort capability observations, request validation, and lock coordination are shared. Do not
 JSON-stringify, Base64-encode, or create payload files for these tool calls.
 Dry-runs include compact diffs by default; set per-file `diff: true` only when a
-full diff is needed. Large batches of independent exact replacements use a single
+full structured diff is needed. Above 256 KiB, compatibility `content` retains a
+transaction-budgeted compact diff while `structuredContent` keeps the full result. Large batches of independent exact replacements use a single
 scan only when equivalence to ordered per-operation semantics is strictly proven;
 otherwise they automatically fall back to the ordinary path. ASCII space/tab trim uses staged short-run passes, with regex for long or residual patterns.
 
-The MCP boundary is explicit: `maxBytes` is at most 128 MiB; a call may contain
-at most 128 files, 256 operations per file, 1,024 operations total, and 128 JSON
-nesting levels. The current stable protocol is `2025-11-25`; the server also
+The MCP boundary is explicit: a JSON-RPC wire request is at most 64 MiB.
+`maxBytes` is a per-file input/output limit, defaulting to 50 MiB and capped at
+128 MiB. Transaction input and output each total at most 128 MiB, with at most
+160 MiB retained by a prepared plan. A call may contain at most 128 files, 256
+operations per file, 1,024 operations total, and 128 JSON nesting levels. The current stable protocol is `2025-11-25`; the server also
 supports `2025-06-18` and `2024-11-05`, but does not claim the transitional
 `2025-03-26` batch protocol. Invalid fields, types, hashes, limits, or execution
 state for a recognized tool return a normal `tools/call` result with
@@ -247,8 +252,10 @@ an edit; inspect the existing file first.
 
 The selected editStrategy is locked for the lifetime of the file. Do NOT switch to another edit mechanism after a command failure. Continue using the cached editStrategy.
 
-- `editStrategy: "safe-edit"` → Use `safe_edit_transaction` when callable; otherwise ALL edits on this file MUST use `safe_edit.py`. Do not switch back to the host-provided built-in file-editing tool, whatever it is named.
-- `editStrategy: "edit-tool"` → Use the host-provided built-in file-editing tool available in the current environment; its actual name may vary.
+- `editStrategy: "safe-edit"` → When MCP is unavailable, ALL edits on this file MUST use `safe_edit.py`. Do not switch back to the host-provided built-in file-editing tool, whatever it is named.
+- `editStrategy: "edit-tool"` → When MCP is unavailable, use the host-provided built-in file-editing tool available in the current environment; its actual name may vary.
+
+When all three structured tools are callable, both strategies use `safe_edit_transaction`.
 
 Resolve the Python executable before editing: prefer a runtime path supplied by
 the host, then `python`, then `py -3` on Windows. Run `preflight --json`
@@ -260,10 +267,14 @@ Python runtime can execute the script, stop before modifying any file.
 ## Allowed Commands
 
 `safe_edit_preflight`, `safe_edit_stat`, and `safe_edit_transaction` are the
-preferred permitted tool calls. The commands below are the ONLY CLI fallback
-invocations; any unlisted CLI invocation is prohibited.
+preferred permitted tool calls. The commands below are allowed CLI fallback
+patterns. Options documented by `--help` may be combined when applicable and
+consistent with the payload rules; unsupported commands or options are prohibited.
 
 ```bash
+# List supported commands and options
+python "SAFE_EDIT_SCRIPT" --help
+
 # Check runtime, stdin/Base64 support, temp storage, locks, and target writability
 python "SAFE_EDIT_SCRIPT" preflight --json
 python "SAFE_EDIT_SCRIPT" preflight --file F --json

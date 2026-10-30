@@ -1138,6 +1138,18 @@ class SafeEditMcpTests(unittest.TestCase):
             transaction_schema["properties"]["maxBytes"]["maximum"],
             implementation.MAX_FILE_BYTES,
         )
+        self.assertEqual(
+            stat_schema["properties"]["maxBytes"]["default"],
+            implementation.DEFAULT_FILE_BYTES,
+        )
+        self.assertEqual(
+            transaction_schema["properties"]["maxBytes"]["default"],
+            implementation.DEFAULT_FILE_BYTES,
+        )
+        self.assertEqual(
+            implementation.ARG_TEMPLATES["transaction"].max_bytes,
+            implementation.DEFAULT_FILE_BYTES,
+        )
         stat_item_max = stat_files["items"]["oneOf"][1]["properties"][
             "maxBytes"
         ]["maximum"]

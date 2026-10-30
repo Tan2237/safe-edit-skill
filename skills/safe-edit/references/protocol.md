@@ -6,8 +6,11 @@ MCP limits, or error envelopes. It does not replace the hard rules in
 
 ## MCP boundary
 
-- `maxBytes` is at most 128 MiB; at most 128 files, 256 operations per file,
-  1,024 operations total, and 128 JSON nesting levels.
+- A JSON-RPC wire request is at most 64 MiB. `maxBytes` is a per-file
+  input/output limit, defaulting to 50 MiB and capped at 128 MiB.
+- Transaction input and output each total at most 128 MiB; a prepared plan
+  retains at most 160 MiB. A call has at most 128 files, 256 operations per
+  file, 1,024 operations total, and 128 JSON nesting levels.
 - The current stable protocol is `2025-11-25`; the server also supports
   `2025-06-18` and `2024-11-05`, but not the transitional `2025-03-26` batch
   protocol.
@@ -29,13 +32,16 @@ MCP limits, or error envelopes. It does not replace the hard rules in
 
 - Both structured and CLI paths build an immutable prepared plan before commit.
 - A successful dry-run may return a single-use `transactionId` valid for up to
-  10 minutes. Admission is bounded; a full cache rejects a new dry-run rather
-  than evicting an unexpired token.
+  10 minutes. Admission is bounded to 32 tokens, 128 MiB total, and 64 MiB per
+  token; a full cache rejects rather than evicting an unexpired token. Send only
+  `cancelTransactionId` to release an abandoned preview without writing.
 - Confirmation acquires cooperative locks in stable order, then jointly
   revalidates canonical paths, parent/target identities, and input hashes.
-- A retained prepared plan does not repeat decoding or matching. Requests above
-  the prepared-retention threshold use bounded JSON fallback storage and are
-  prepared again at confirmation.
+- A retained prepared plan does not repeat decoding or matching. Plans above
+  16 MiB of prepared output use bounded JSON fallback storage and are prepared
+  again at confirmation.
+- Full diffs remain in `structuredContent`. Above 256 KiB, compatibility
+  `content` retains a transaction-budgeted compact diff and truncation markers.
 
 ## Staging and rollback
 

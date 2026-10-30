@@ -57,6 +57,37 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("同一请求不重复 preview", text)
         self.assertIn('{"transactionId":"..."}', text)
 
+    def test_mcp_limits_and_preview_contract_are_explicit(self):
+        documents = (
+            SKILL.read_text(encoding="utf-8"),
+            README.read_text(encoding="utf-8"),
+            (SKILL_DIR / "references" / "protocol.md").read_text(
+                encoding="utf-8"
+            ),
+        )
+        for text in documents:
+            for value in (
+                "64 MiB",
+                "160 MiB",
+                "256 KiB",
+                "cancelTransactionId",
+            ):
+                self.assertIn(value, text)
+
+    def test_readme_cli_examples_resolve_from_repository_root(self):
+        text = README.read_text(encoding="utf-8")
+        self.assertNotRegex(
+            text, r"(?:python3?|py -3) safe_edit\.py"
+        )
+        self.assertIn("python skills/safe-edit/safe_edit.py", text)
+        self.assertIn("创建成功后直接复用结果中的 `sha256`", text)
+
+    def test_skill_route_and_cli_option_rules_are_unambiguous(self):
+        text = SKILL.read_text(encoding="utf-8")
+        self.assertIn("regardless\nof `editStrategy`", text)
+        self.assertIn("Options documented by `--help`", text)
+        self.assertIn('python "SAFE_EDIT_SCRIPT" --help', text)
+
     def test_git_conflict_checklist_has_semantic_steps(self):
         text = (SKILL_DIR / "references" / "git-conflicts.md").read_text(
             encoding="utf-8"

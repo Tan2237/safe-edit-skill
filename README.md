@@ -120,6 +120,8 @@ codex plugin add safe-edit-skill@safe-edit
 dry-run 会先生成不可变 prepared plan，并为每个文件返回精简 `diff` 与
 `resultSha256`。只有计划成功进入有界缓存时，顶层才会返回一次性事务 ID；
 缓存已满时会拒绝新的 dry-run admission，不会逐出尚未过期的已签发 token。
+确认缓存最多保留 32 个 token、合计 128 MiB，单项最多 64 MiB；不再需要的
+预演可只传 `{"cancelTransactionId":"..."}` 取消并释放，不会写入文件。
 正式执行只需：
 
 ```json
@@ -138,8 +140,10 @@ canonical path、parent/target identity 与原始哈希。缓存的是 prepared 
 同时避免把原本唯一的精确目标放宽成多匹配。计数不符时不会继续放宽；如需
 严格 EOL 匹配可显式设为 `false`。
 
-MCP 单次请求的 `maxBytes` 上限为 128 MiB；每次最多 128 个文件、每个文件
-最多 256 个操作、合计最多 1,024 个操作，JSON 最大嵌套深度为 128。服务端
+MCP 每条 JSON-RPC wire request 上限为 64 MiB。`maxBytes` 是逐文件输入/输出
+限制，默认 50 MiB、最大 128 MiB；事务总输入和总输出分别最多 128 MiB，
+prepared plan 最多保留 160 MiB。每次最多 128 个文件、每个文件最多 256 个
+操作、合计最多 1,024 个操作，JSON 最大嵌套深度为 128。服务端
 以 `2025-11-25` 为当前稳定协议版本，同时兼容 `2025-06-18` 和
 `2024-11-05`；不宣称支持 `2025-03-26` 的 batch 过渡版本。
 
@@ -207,8 +211,8 @@ safe-edit-mcp doctor --json --skill-dir ~/.agents/skills/safe-edit
 放进一次 `safe_edit_stat` 调用。CLI 回退流程如下：
 
 ```bash
-python safe_edit.py preflight --file foo.cpp --json
-python safe_edit.py stat --file foo.cpp --json
+python skills/safe-edit/safe_edit.py preflight --file foo.cpp --json
+python skills/safe-edit/safe_edit.py stat --file foo.cpp --json
 ```
 
 多个相关文件优先在一个进程内检查。请求可以是路径字符串或带编码选项的对象：
@@ -218,26 +222,27 @@ python safe_edit.py stat --file foo.cpp --json
 ```
 
 ```bash
-python safe_edit.py stat-many --request-stdin --json
+python skills/safe-edit/safe_edit.py stat-many --request-stdin --json
 ```
 
 如果 `python` 和 `py -3` 都不可用，应优先使用宿主提供的 Python
 运行时绝对路径；仍无法执行时，在修改任何文件前停止。
 
-返回的 `editStrategy` 告诉你该用什么工具编辑这个文件：
+MCP 结构化工具可用时，所有已有文件编辑都使用 `safe_edit_transaction`。
+只有 MCP 不可用时，才按返回的 `editStrategy` 选择回退工具：
 
 | editStrategy | 含义 |
 |---|---|
 | `edit-tool` | 使用宿主提供的内置文件编辑工具即可（实际工具名称可能不同） |
 | `safe-edit` | 必须用 safe-edit（文件有 BOM、非 UTF-8 编码、CRLF 行尾等） |
 
-如果 `editStrategy` 是 `safe-edit`，后续对该文件的所有编辑都应使用 safe-edit。
+如果回退策略是 `safe-edit`，后续对该文件的所有回退编辑都应使用 safe-edit。
 
 ### 工作流硬规则
 
 1. 相关文件一次批量 `safe_edit_stat`，缓存每个 `sha256`。
 2. 成功写入后直接复用返回的 `sha256`；仅在重建无哈希、写阶段可能失败或结果不确定时重新 stat。
-3. 风险修改只做一次 `dryRun`；确认只发 `{"transactionId":"..."}`，不重传 files/options。
+3. 风险修改只做一次 `dryRun`；确认只发 `{"transactionId":"..."}`，不重传 files/options；放弃时只发 `{"cancelTransactionId":"..."}`，不会写入。
 4. 同一请求不重复 preview；token 过期或已消费时重新 stat 并开启新预演。
 5. compact diff 有事务总预算（240 行 / 32,000 字符），检查 `diffBudget`、`diffTruncatedBy`、`diffOmitted`；需要完整 diff 时只对指定文件设 `diff: true`。
 
@@ -249,33 +254,35 @@ python safe_edit.py stat-many --request-stdin --json
 
 ## 基本用法
 
-直接运行 Python 脚本即可。Windows 上如果 `python` 不在 `PATH`，可以用 `py -3` 替代。
+以下示例假设从源码仓库根目录运行；通过 pipx/uv 安装后，也可把
+`python skills/safe-edit/safe_edit.py` 换成 `safe-edit`。Windows 上如果
+`python` 不在 `PATH`，可以用 `py -3` 替代。
 
 ```bash
-python safe_edit.py preflight --json
-python safe_edit.py stat --file path/to/file --json
-python safe_edit.py stat-many --request-stdin --json
-python safe_edit.py transaction --request-stdin --json
-python safe_edit.py create --file path/to/new.txt --to-encoding utf-8 --to-line-ending lf --text-base64 B64
-python safe_edit.py remove-file --file path/to/obsolete.txt --workspace-root path/to/workspace --expected-sha256 SHA256
-python safe_edit.py convert --file path/to/file --to-encoding utf-8-bom --to-line-ending crlf --final-newline ensure
-python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --expected-count 1
-python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --expected-count 1
-python safe_edit.py edit --file path/to/file --diff-input "------- SEARCH
+python skills/safe-edit/safe_edit.py preflight --json
+python skills/safe-edit/safe_edit.py stat --file path/to/file --json
+python skills/safe-edit/safe_edit.py stat-many --request-stdin --json
+python skills/safe-edit/safe_edit.py transaction --request-stdin --json
+python skills/safe-edit/safe_edit.py create --file path/to/new.txt --to-encoding utf-8 --to-line-ending lf --text-base64 B64
+python skills/safe-edit/safe_edit.py remove-file --file path/to/obsolete.txt --workspace-root path/to/workspace --expected-sha256 SHA256
+python skills/safe-edit/safe_edit.py convert --file path/to/file --to-encoding utf-8-bom --to-line-ending crlf --final-newline ensure
+python skills/safe-edit/safe_edit.py edit --file path/to/file --old "foo" --new "bar" --expected-count 1
+python skills/safe-edit/safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --expected-count 1
+python skills/safe-edit/safe_edit.py edit --file path/to/file --diff-input "------- SEARCH
 foo
 =======
 bar
 +++++++ REPLACE"
-python safe_edit.py regex --file path/to/file --pattern "foo\\d+" --replacement "bar" --expected-count 1
-python safe_edit.py insert --file path/to/file --line 10 --text "new line"
-python safe_edit.py prepend --file path/to/file --text-file header.txt
-python safe_edit.py append --file path/to/file --text-file footer.txt
-python safe_edit.py delete --file path/to/file --line 10
-python safe_edit.py replace-lines --file path/to/file --start 10 --end 20 --text-file block.txt
-python safe_edit.py replace-lines --file path/to/file --anchor-pattern "keyword" --offset-start +2 --offset-end +4 --text "new line"
-python safe_edit.py delete-lines --file path/to/file --start 10 --end 20
-python safe_edit.py edit --file path/to/file --old "foo" --new "bar" -i
-python safe_edit.py batch --file path/to/file --ops-file ops.json
+python skills/safe-edit/safe_edit.py regex --file path/to/file --pattern "foo\\d+" --replacement "bar" --expected-count 1
+python skills/safe-edit/safe_edit.py insert --file path/to/file --line 10 --text "new line"
+python skills/safe-edit/safe_edit.py prepend --file path/to/file --text-file header.txt
+python skills/safe-edit/safe_edit.py append --file path/to/file --text-file footer.txt
+python skills/safe-edit/safe_edit.py delete --file path/to/file --line 10
+python skills/safe-edit/safe_edit.py replace-lines --file path/to/file --start 10 --end 20 --text-file block.txt
+python skills/safe-edit/safe_edit.py replace-lines --file path/to/file --anchor-pattern "keyword" --offset-start +2 --offset-end +4 --text "new line"
+python skills/safe-edit/safe_edit.py delete-lines --file path/to/file --start 10 --end 20
+python skills/safe-edit/safe_edit.py edit --file path/to/file --old "foo" --new "bar" -i
+python skills/safe-edit/safe_edit.py batch --file path/to/file --ops-file ops.json
 ```
 
 ## 受控新建文件
@@ -283,7 +290,7 @@ python safe_edit.py batch --file path/to/file --ops-file ops.json
 新文件不能先执行 `stat`。当任务确实需要新增源码、测试、配置或文档时，使用 `create`：
 
 ```bash
-python safe_edit.py create \
+python skills/safe-edit/safe_edit.py create \
   --file path/to/new-file.txt \
   --to-encoding utf-8 \
   --to-line-ending lf \
@@ -297,7 +304,7 @@ python safe_edit.py create \
 - 必须显式指定 `--to-encoding` 和 `--to-line-ending`。
 - 支持 `--text`、`--text-file`、`--text-stdin`、`--text-base64`。
 - 支持 `--dry-run --diff`，预览时不会落盘。
-- 创建完成后，如需继续修改该文件，先执行一次 `stat` 并遵循返回的 `editStrategy`。
+- 创建成功后直接复用结果中的 `sha256`；仅在没有返回哈希或结果不确定时重新 `stat`。
 
 `create` 只用于任务成果文件，不用于临时脚本、补丁工具或为了绕过载荷传输规则而生成的中转文件。
 
@@ -307,14 +314,14 @@ python safe_edit.py create \
 取得当前内容的 SHA-256，再把工作区根目录和哈希一并传入：
 
 ```bash
-python safe_edit.py stat --file path/to/obsolete.txt --json
-python safe_edit.py remove-file \
+python skills/safe-edit/safe_edit.py stat --file path/to/obsolete.txt --json
+python skills/safe-edit/safe_edit.py remove-file \
   --file path/to/obsolete.txt \
   --workspace-root path/to/workspace \
   --expected-sha256 SHA256 \
   --dry-run \
   --json
-python safe_edit.py remove-file \
+python skills/safe-edit/safe_edit.py remove-file \
   --file path/to/obsolete.txt \
   --workspace-root path/to/workspace \
   --expected-sha256 SHA256
@@ -336,13 +343,13 @@ python safe_edit.py remove-file \
 
 ```bash
 # 自动尝试: exact → ignore-eol → ignore-indent → normalize-whitespace
-python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --expected-count 1
+python skills/safe-edit/safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --expected-count 1
 ```
 
 启用模糊匹配作为最后手段（相似度 ≥ 0.6）：
 
 ```bash
-python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --fuzzy --expected-count 1
+python skills/safe-edit/safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --fuzzy --expected-count 1
 ```
 
 模糊比较会忽略每行开头和结尾的空白、CRLF/LF/CR 差异，以及文件末尾是否有换行；行内空白仍然有意义，不会被折叠。
@@ -357,10 +364,10 @@ python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-matc
 
 ```bash
 # 成功时包含 matchStrategy
-python safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --expected-count 1 --json
+python skills/safe-edit/safe_edit.py edit --file path/to/file --old "foo" --new "bar" --auto-match --expected-count 1 --json
 
 # 失败时输出错误类型、诊断和恢复建议
-python safe_edit.py edit --file path/to/file --old "missing" --new "bar" --json
+python skills/safe-edit/safe_edit.py edit --file path/to/file --old "missing" --new "bar" --json
 ```
 
 错误类型包括：`match_not_found`、`match_ambiguous`、`match_count_mismatch`、`hash_mismatch`、`encoding_error`、`file_error`、`lock_error`、`validation_error`、`format_error`、`unknown`。
@@ -451,11 +458,11 @@ stdout/stderr 契约：CLI 把 stdio 固定为 UTF-8——`--json` 结果行经 
 
 ```bash
 # 只替换 "target" 前面有 "middle" 的那次
-python safe_edit.py edit --file path/to/file --old "target" --new "replaced" \
+python skills/safe-edit/safe_edit.py edit --file path/to/file --old "target" --new "replaced" \
   --context-before "middle" --expected-count 1
 
 # 只替换 "target" 后面有 "suffix" 的那次
-python safe_edit.py edit --file path/to/file --old "target" --new "replaced" \
+python skills/safe-edit/safe_edit.py edit --file path/to/file --old "target" --new "replaced" \
   --context-after "suffix" --expected-count 1
 ```
 
@@ -466,7 +473,7 @@ python safe_edit.py edit --file path/to/file --old "target" --new "replaced" \
 Agent 友好的 diff 格式，一个字符串包含所有编辑信息：
 
 ```bash
-python safe_edit.py edit --file path/to/file --diff-input "------- SEARCH
+python skills/safe-edit/safe_edit.py edit --file path/to/file --diff-input "------- SEARCH
 old text
 =======
 new text
@@ -476,7 +483,7 @@ new text
 支持多块编辑：
 
 ```bash
-python safe_edit.py edit --file path/to/file --diff-input "------- SEARCH
+python skills/safe-edit/safe_edit.py edit --file path/to/file --diff-input "------- SEARCH
 first_old
 =======
 first_new
@@ -500,9 +507,9 @@ second_new
 建议在风险较高的修改前使用：
 
 ```bash
-python safe_edit.py inspect --file src/main.cpp --json
+python skills/safe-edit/safe_edit.py inspect --file src/main.cpp --json
 
-python safe_edit.py edit \
+python skills/safe-edit/safe_edit.py edit \
   --file src/main.cpp \
   --old "oldName" \
   --new "newName" \
@@ -518,10 +525,10 @@ python safe_edit.py edit \
 普通编辑默认保留原编码和行尾。只有明确需要规范化时才使用 `convert` 或后处理选项：
 
 ```bash
-python safe_edit.py convert --file a.cpp --to-encoding utf-8-bom
-python safe_edit.py convert --file a.cpp --to-line-ending crlf
-python safe_edit.py convert --file a.cpp --final-newline ensure
-python safe_edit.py convert --file a.cpp --trim-trailing-whitespace
+python skills/safe-edit/safe_edit.py convert --file a.cpp --to-encoding utf-8-bom
+python skills/safe-edit/safe_edit.py convert --file a.cpp --to-line-ending crlf
+python skills/safe-edit/safe_edit.py convert --file a.cpp --final-newline ensure
+python skills/safe-edit/safe_edit.py convert --file a.cpp --trim-trailing-whitespace
 ```
 
 这些后处理选项也可以和 `edit`、`regex`、`batch` 等写入命令组合，做到一次读写内完成内容修改和格式规范化。
@@ -531,7 +538,7 @@ python safe_edit.py convert --file a.cpp --trim-trailing-whitespace
 使用 `--anchor-pattern` 替代绝对行号，防止文件变动后改错位置：
 
 ```bash
-python safe_edit.py replace-lines \
+python skills/safe-edit/safe_edit.py replace-lines \
   --file a.cpp \
   --anchor-pattern "AcGePoint3d ptCenter" \
   --offset-start +2 \
@@ -549,9 +556,9 @@ python safe_edit.py replace-lines \
 放宽匹配条件，但保持行为可控：
 
 ```bash
-python safe_edit.py edit --file a.cpp --old "    foo" --new "bar" --ignore-indent
-python safe_edit.py edit --file a.cpp --old "foo\r\nbar" --new "baz" --ignore-eol
-python safe_edit.py edit --file a.cpp --old "foo   bar" --new "baz" --normalize-whitespace
+python skills/safe-edit/safe_edit.py edit --file a.cpp --old "    foo" --new "bar" --ignore-indent
+python skills/safe-edit/safe_edit.py edit --file a.cpp --old "foo\r\nbar" --new "baz" --ignore-eol
+python skills/safe-edit/safe_edit.py edit --file a.cpp --old "foo   bar" --new "baz" --normalize-whitespace
 ```
 
 **原则**：只影响匹配，不影响替换内容。
@@ -561,7 +568,7 @@ python safe_edit.py edit --file a.cpp --old "foo   bar" --new "baz" --normalize-
 类似 `git add -p` 的交互模式：
 
 ```bash
-python safe_edit.py edit --file a.cpp --old "foo" --new "bar" -i
+python skills/safe-edit/safe_edit.py edit --file a.cpp --old "foo" --new "bar" -i
 ```
 
 提示选项：
@@ -574,7 +581,7 @@ python safe_edit.py edit --file a.cpp --old "foo" --new "bar" -i
 ## 匹配失败诊断
 
 ```bash
-python safe_edit.py edit --file a.cpp --old "    foo" --new "bar" --explain-match-failure
+python skills/safe-edit/safe_edit.py edit --file a.cpp --old "    foo" --new "bar" --explain-match-failure
 ```
 
 输出：
@@ -605,14 +612,14 @@ PowerShell、Windows 原生命令行和 MSYS2 都可能在 Python 收到参数�
 一个 stdin 流只能供一个 `--*-stdin` 参数读取。只有一个文本字段时可以直接使用：
 
 ```bash
-python safe_edit.py replace-lines --file a.cpp --start 10 --end 20 --text-stdin
-python safe_edit.py edit --file a.cpp --diff-input-stdin
+python skills/safe-edit/safe_edit.py replace-lines --file a.cpp --start 10 --end 20 --text-stdin
+python skills/safe-edit/safe_edit.py edit --file a.cpp --diff-input-stdin
 ```
 
 精确替换同时需要 `old` 和 `new`，应把整个操作封装为 JSON，交给：
 
 ```bash
-python safe_edit.py batch --file a.cpp --ops-stdin
+python skills/safe-edit/safe_edit.py batch --file a.cpp --ops-stdin
 ```
 
 JSON 示例：
@@ -631,11 +638,11 @@ JSON 示例：
 应优先通过执行工具的 stdin 字段传入 JSON，而不是把源码先放进 PowerShell here-string。若载荷已经存在于文件中，也可通过管道读取；这不用于绕过载荷文件本身的创建规则：
 
 ```powershell
-Get-Content -Raw ops.json | py -3 safe_edit.py batch --file a.cpp --ops-stdin
+Get-Content -Raw ops.json | py -3 skills/safe-edit/safe_edit.py batch --file a.cpp --ops-stdin
 ```
 
 ```bash
-cat ops.json | python3 safe_edit.py batch --file a.cpp --ops-stdin
+cat ops.json | python3 skills/safe-edit/safe_edit.py batch --file a.cpp --ops-stdin
 ```
 
 ### Base64 方式
@@ -643,10 +650,10 @@ cat ops.json | python3 safe_edit.py batch --file a.cpp --ops-stdin
 所有 Base64 参数都将解码为严格 UTF-8。支持标准 Base64 和 URL-safe Base64，也支持省略末尾 `=`；Windows/MSYS2 下推荐无填充的 URL-safe 形式。
 
 ```bash
-python safe_edit.py batch --file a.cpp --ops-base64 B64
-python safe_edit.py edit --file a.cpp --diff-input-base64 B64
-python safe_edit.py replace-lines --file a.cpp --start 10 --end 20 --text-base64 B64
-python safe_edit.py edit --file a.cpp --old-base64 OLD_B64 --new-base64 NEW_B64 --expected-count 1
+python skills/safe-edit/safe_edit.py batch --file a.cpp --ops-base64 B64
+python skills/safe-edit/safe_edit.py edit --file a.cpp --diff-input-base64 B64
+python skills/safe-edit/safe_edit.py replace-lines --file a.cpp --start 10 --end 20 --text-base64 B64
+python skills/safe-edit/safe_edit.py edit --file a.cpp --old-base64 OLD_B64 --new-base64 NEW_B64 --expected-count 1
 ```
 
 字段级入口包括：
@@ -662,8 +669,8 @@ python safe_edit.py edit --file a.cpp --old-base64 OLD_B64 --new-base64 NEW_B64 
 `--*-file` 适合已经存在的 UTF-8 载荷文件：
 
 ```bash
-python safe_edit.py edit --file a.cpp --old-file old.txt --new-file new.txt
-python safe_edit.py insert --file a.cpp --line 5 --text-file block.txt
+python skills/safe-edit/safe_edit.py edit --file a.cpp --old-file old.txt --new-file new.txt
+python skills/safe-edit/safe_edit.py insert --file a.cpp --line 5 --text-file block.txt
 ```
 
 不要为了使用文件参数而通过 shell 重定向或临时脚本创建载荷文件。参数文件默认按 UTF-8 读取；需要时使用 `--arg-encoding` 覆盖。
@@ -677,7 +684,7 @@ python safe_edit.py insert --file a.cpp --line 5 --text-file block.txt
 `edit` 永远是字面量替换；只有 `regex` 命令会启用正则。
 
 ```bash
-python safe_edit.py regex \
+python skills/safe-edit/safe_edit.py regex \
   --file package.toml \
   --pattern 'version = "[^"]+"' \
   --replacement 'version = "1.2.3"' \
@@ -705,13 +712,13 @@ python safe_edit.py regex \
 
 ```bash
 # 原生 stdin
-python safe_edit.py batch --file path/to/file --ops-stdin
+python skills/safe-edit/safe_edit.py batch --file path/to/file --ops-stdin
 
 # URL-safe UTF-8 Base64
-python safe_edit.py batch --file path/to/file --ops-base64 B64
+python skills/safe-edit/safe_edit.py batch --file path/to/file --ops-base64 B64
 
 # 已存在的 JSON 文件
-python safe_edit.py batch --file path/to/file --ops-file ops.json
+python skills/safe-edit/safe_edit.py batch --file path/to/file --ops-file ops.json
 ```
 
 `*_file` 相对路径会按 `ops.json` 所在目录解析。
@@ -752,8 +759,8 @@ python safe_edit.py batch --file path/to/file --ops-file ops.json
 优先通过宿主的结构化工具参数或原生 stdin 传入：
 
 ```bash
-python safe_edit.py transaction --request-stdin --dry-run --json
-python safe_edit.py transaction --request-stdin --json
+python skills/safe-edit/safe_edit.py transaction --request-stdin --dry-run --json
+python skills/safe-edit/safe_edit.py transaction --request-stdin --json
 ```
 
 没有原生 stdin 时，官方 fallback 顺序为：已存在的 JSON 文件
@@ -768,7 +775,9 @@ parent/target identity 和输入哈希，再直接写入计划字节，不重跑
 确认时重新 prepare。dry-run 未显式设置 `diff` 时返回精简 diff：单文件最多 80 行、12,000 字符；
 整个 transaction 的 compact diff 另受 240 行、32,000 字符总预算约束，超限时
 通过 `diffBudget`、`diffTruncatedBy`、`diffOmitted` 显式标记。显式
-`diff: true` 的文件返回完整 diff，不消耗 compact 总预算。
+`diff: true` 的文件在 `structuredContent` 中返回完整 diff，不消耗 compact
+总预算。工具结果超过 256 KiB 时，文本兼容 `content` 仍保留受事务预算约束的
+compact diff 和截断标记，调用方可先审查再确认。
 
 每个输出先在已 pin 的父目录内写入随机隐藏 sibling stage，完成全部字节写入、文件
 `fsync` 和内容复验后才进入发布步骤。编辑已有文件时，事务先用 no-replace 操作把
@@ -818,9 +827,9 @@ parent 和 basename 为准；path 仅供定位，父目录被重新绑定后可�
 自动检测优先级大致是 BOM、UTF-16 NUL 模式、UTF-8、GBK。纯 ASCII 文件会被视为 UTF-8；如果它属于 GBK、Shift-JIS 或 Big5 项目，并且本次要插入非 ASCII 字符，请显式指定：
 
 ```bash
-python safe_edit.py edit --encoding gbk --file a.cpp --old "name" --new "中文"
-python safe_edit.py edit --encoding shift-jis --file a.cpp --old "name" --new "日本語"
-python safe_edit.py edit --encoding big5 --file a.cpp --old "name" --new "繁體"
+python skills/safe-edit/safe_edit.py edit --encoding gbk --file a.cpp --old "name" --new "中文"
+python skills/safe-edit/safe_edit.py edit --encoding shift-jis --file a.cpp --old "name" --new "日本語"
+python skills/safe-edit/safe_edit.py edit --encoding big5 --file a.cpp --old "name" --new "繁體"
 ```
 
 ## 测试
