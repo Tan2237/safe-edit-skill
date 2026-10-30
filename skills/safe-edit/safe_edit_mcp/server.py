@@ -378,6 +378,36 @@ def _validate_transaction_file(item: Any, index: int) -> int:
     return len(operations)
 
 
+def _normalize_transaction_arguments(
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    if "file" not in arguments:
+        return arguments
+    if "files" in arguments or "transactionId" in arguments:
+        raise ToolInputError(
+            "single-file shorthand cannot be combined with files or "
+            "transactionId"
+        )
+    _reject_unknown_keys(
+        arguments,
+        _TRANSACTION_ARGUMENT_KEYS | _TRANSACTION_FILE_KEYS,
+        "arguments",
+    )
+    normalized = {
+        key: value
+        for key, value in arguments.items()
+        if key in _TRANSACTION_ARGUMENT_KEYS
+    }
+    normalized["files"] = [
+        {
+            key: value
+            for key, value in arguments.items()
+            if key in _TRANSACTION_FILE_KEYS
+        }
+    ]
+    return normalized
+
+
 def _validate_transaction_arguments(arguments: Dict[str, Any]) -> None:
     _reject_unknown_keys(
         arguments, _TRANSACTION_ARGUMENT_KEYS, "arguments"
@@ -818,6 +848,7 @@ def execute_tool(name: str, raw_arguments: Any) -> Dict[str, Any]:
             write_attempted=False,
         )
     elif name == "safe_edit_transaction":
+        arguments = _normalize_transaction_arguments(arguments)
         _validate_transaction_arguments(arguments)
         confirmation_id = arguments.get("transactionId")
         pending = None
@@ -1202,6 +1233,51 @@ FILE_ITEM_SCHEMA = {
     ]
 }
 
+TRANSACTION_OPERATION_SCHEMA = {
+    "type": "object",
+    "description": (
+        "A native safe-edit operation. Use op to select the operation. "
+        "Common fields are listed here; other native operation fields are "
+        "also accepted. Set expected_count on every edit before enabling "
+        "transaction-wide relaxed matching."
+    ),
+    "properties": {
+        "op": {
+            "type": "string",
+            "enum": [
+                "edit",
+                "regex",
+                "insert",
+                "prepend",
+                "append",
+                "delete",
+                "replace-lines",
+                "delete-lines",
+            ],
+        },
+        "old": {"type": "string"},
+        "new": {"type": "string"},
+        "expected_count": {"type": "integer", "minimum": 0},
+        "context_before": {"type": "string"},
+        "context_after": {"type": "string"},
+        "pattern": {"type": "string"},
+        "replacement": {"type": "string"},
+        "text": {"type": "string"},
+        "line": {"type": "integer", "minimum": 1},
+        "start": {"type": "integer", "minimum": 1},
+        "end": {"type": "integer", "minimum": 1},
+        "preserve_indent": {
+            "type": "boolean",
+            "default": True,
+            "description": (
+                "For replace-lines, automatically preserve the replaced "
+                "block's base indentation. Set false only for literal text."
+            ),
+        },
+    },
+    "additionalProperties": True,
+}
+
 TRANSACTION_ITEM_SCHEMA = {
     "type": "object",
     "description": (
@@ -1219,19 +1295,7 @@ TRANSACTION_ITEM_SCHEMA = {
             "type": "array",
             "minItems": 1,
             "maxItems": MAX_OPERATIONS_PER_FILE,
-            "items": {
-                "type": "object",
-                "description": (
-                    "A native safe-edit operation such as edit, regex, "
-                    "insert, prepend, append, replace-lines, or delete-lines. "
-                    "Copy edit.old verbatim from the latest file and keep it "
-                    "as short and unique as practical. Add context only when "
-                    "the target itself is not unique, and set expected_count "
-                    "on every edit before enabling transaction-wide relaxed "
-                    "matching."
-                ),
-                "additionalProperties": True,
-            },
+            "items": TRANSACTION_OPERATION_SCHEMA,
         },
         "text": {"type": "string"},
         "encoding": {"type": "string", "minLength": 1},
@@ -1359,10 +1423,12 @@ TOOLS = [
         "title": "Apply a safe-edit transaction",
         "description": (
             "Apply raw structured text edits and controlled creates without "
-            "shell quoting or Base64. Existing files require SHA-256 values "
-            "from safe_edit_stat. All files are prevalidated and writes roll "
-            "back if a later write fails. A successful dryRun returns a "
-            "transactionId that can be confirmed without resending the payload."
+            "shell quoting or Base64. Existing files require current SHA-256 "
+            "guards from safe_edit_stat or a prior successful write. All files "
+            "are prevalidated; later write failures trigger conflict-safe "
+            "best-effort rollback and may require recovery. An admitted dryRun "
+            "returns a transactionId that can be confirmed without resending "
+            "the payload."
         ),
         "inputSchema": {
             "type": "object",
@@ -1432,11 +1498,26 @@ TOOLS = [
                     "type": "number",
                     "minimum": 0,
                 },
+                **TRANSACTION_ITEM_SCHEMA["properties"],
             },
             "oneOf": [
                 {
                     "required": ["files"],
-                    "not": {"required": ["transactionId"]},
+                    "not": {
+                        "anyOf": [
+                            {"required": ["file"]},
+                            {"required": ["transactionId"]},
+                        ]
+                    },
+                },
+                {
+                    "required": ["file"],
+                    "not": {
+                        "anyOf": [
+                            {"required": ["files"]},
+                            {"required": ["transactionId"]},
+                        ]
+                    },
                 },
                 {
                     "required": ["transactionId"],

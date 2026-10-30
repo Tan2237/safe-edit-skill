@@ -112,6 +112,38 @@ class SafeEditMcpTests(unittest.TestCase):
         )
         self.assertEqual(result["transport"], "mcp-structured")
 
+    def test_single_file_transaction_shorthand(self):
+        target = self.root / "single-file-shorthand.txt"
+        created = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "file": str(target),
+                "text": "before\n",
+                "encoding": "utf-8",
+                "lineEnding": "lf",
+            },
+        )
+        self.assertTrue(created["written"])
+        self.assertEqual(target.read_bytes(), b"before\n")
+
+        edited = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "file": str(target),
+                "expectedSha256": created["files"][0]["sha256"],
+                "operations": [
+                    {
+                        "op": "edit",
+                        "old": "before",
+                        "new": "after",
+                        "expected_count": 1,
+                    }
+                ],
+            },
+        )
+        self.assertTrue(edited["written"])
+        self.assertEqual(target.read_bytes(), b"after\n")
+
     def test_replace_lines_preserves_indent_by_default(self):
         target = self.root / "replace-lines-indent.txt"
         target.write_bytes(b"void foo()\n{\n    bar();\n}\n")
@@ -1078,10 +1110,21 @@ class SafeEditMcpTests(unittest.TestCase):
             operation_schema["maxItems"],
             implementation.MAX_OPERATIONS_PER_FILE,
         )
+        branches = transaction_schema["oneOf"]
+        confirmation = next(
+            branch
+            for branch in branches
+            if branch.get("required") == ["transactionId"]
+        )
         self.assertEqual(
-            transaction_schema["oneOf"][1],
+            confirmation,
             {"required": ["transactionId"], "maxProperties": 1},
         )
+        self.assertTrue(
+            any(branch.get("required") == ["file"] for branch in branches)
+        )
+        operation_properties = operation_schema["items"]["properties"]
+        self.assertTrue(operation_properties["preserve_indent"]["default"])
 
         implementation._validate_stat_arguments(
             {
