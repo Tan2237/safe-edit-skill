@@ -6371,6 +6371,22 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertTrue(all(not marker.exists() for marker in orphan_paths))
 
 
+    def test_file_lock_recreates_deleted_lock_directories(self):
+        m = self._import_safe_edit()
+        temp_root = self.tmpdir / "temp"
+        temp_root.mkdir()
+        path = self.tmpdir / "deleted-lock-directories.txt"
+        path.write_bytes(b"content\n")
+
+        with patch.object(m, "_get_tmp_dir", return_value=str(temp_root)):
+            lock = m.FileLock(path, 1, 0)
+            m._get_kernel_lock_dir()
+            shutil.rmtree(temp_root / "safe-edit")
+
+            with lock:
+                self.assertTrue((temp_root / "safe-edit" / "locks").is_dir())
+                self.assertTrue((temp_root / "safe-edit" / "kernel-v2").is_dir())
+
     def test_protocol2_uses_legacy_marker_namespace(self):
         m = self._import_safe_edit()
         legacy_dir = Path(m._get_tmp_dir()) / "safe-edit" / "locks"

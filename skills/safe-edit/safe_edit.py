@@ -2287,7 +2287,6 @@ def _validate_private_lock_directory(path: Path) -> None:
                 fail(f"cannot secure lock directory: {path}")
 
 
-@functools.lru_cache(maxsize=1)
 def _get_lock_dir() -> Path:
     """Return the hardened legacy marker namespace used by protocol 1."""
     root = Path(_get_tmp_dir()) / "safe-edit"
@@ -2303,7 +2302,6 @@ def _get_lock_dir() -> Path:
     return lock_dir
 
 
-@functools.lru_cache(maxsize=1)
 def _get_kernel_lock_dir() -> Path:
     """Return a private namespace for permanent protocol-2 stripes."""
     if os.name == "nt":
