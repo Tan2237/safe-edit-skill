@@ -135,6 +135,22 @@ class SafeEditMcpInstallerTests(unittest.TestCase):
         )
         self.assertEqual(summary["results"][0]["clients"], ["kimi-code"])
 
+    def test_kimi_project_uses_git_root_from_subdirectory(self):
+        (self.project / ".git").mkdir()
+        subdirectory = self.project / "nested"
+        subdirectory.mkdir()
+
+        installer.install_configs(
+            clients=["kimi-code"],
+            scope="project",
+            home=self.home,
+            project_dir=subdirectory,
+            invocation=self.invocation,
+        )
+
+        self.assertTrue((self.project / ".mcp.json").is_file())
+        self.assertFalse((subdirectory / ".mcp.json").exists())
+
     def test_kimi_user_uses_dedicated_path(self):
         installer.install_configs(
             clients=["kimi-code"],
@@ -183,6 +199,92 @@ class SafeEditMcpInstallerTests(unittest.TestCase):
         self.assertFalse((self.project / ".cursor").exists())
         self.assertFalse((self.project / "opencode.json").exists())
         self.assertTrue(all(item["changed"] for item in summary["results"]))
+
+    def test_project_install_uses_portable_command(self):
+        with patch.object(
+            installer.shutil,
+            "which",
+            return_value="/opt/safe-edit/bin/safe-edit-mcp",
+        ):
+            summary = installer.install_configs(
+                clients=["cursor"],
+                scope="project",
+                home=self.home,
+                project_dir=self.project,
+                dry_run=True,
+            )
+
+        self.assertEqual(summary["server"]["command"], "safe-edit-mcp")
+        self.assertEqual(
+            summary["results"][0]["config"]["mcpServers"]["safe-edit"][
+                "command"
+            ],
+            "safe-edit-mcp",
+        )
+
+    def test_install_json_does_not_echo_unrelated_secrets(self):
+        target = self.project / ".mcp.json"
+        target.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "other": {
+                            "command": "other",
+                            "env": {"API_TOKEN": "secret-test-token"},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        summary = installer.install_configs(
+            clients=["claude-code"],
+            scope="project",
+            home=self.home,
+            project_dir=self.project,
+            invocation=self.invocation,
+            dry_run=True,
+        )
+
+        self.assertNotIn("secret-test-token", json.dumps(summary))
+        self.assertEqual(
+            summary["results"][0]["config"],
+            {
+                "mcpServers": {
+                    "safe-edit": {"command": "safe-edit-mcp", "args": []}
+                }
+            },
+        )
+
+    def test_vscode_dry_run_reports_would_change(self):
+        summary = installer.install_configs(
+            clients=["vscode"],
+            scope="user",
+            home=self.home,
+            project_dir=self.project,
+            invocation=self.invocation,
+            code_cli="code-test",
+            dry_run=True,
+        )
+
+        self.assertTrue(summary["results"][0]["changed"])
+
+    def test_kimi_user_install_honors_home_environment(self):
+        kimi_home = self.root / "custom-kimi-home"
+        with patch.dict(
+            installer.os.environ, {"KIMI_CODE_HOME": str(kimi_home)}
+        ):
+            installer.install_configs(
+                clients=["kimi-code"],
+                scope="user",
+                home=self.home,
+                project_dir=self.project,
+                invocation=self.invocation,
+            )
+
+        self.assertTrue((kimi_home / "mcp.json").is_file())
+        self.assertFalse((self.home / ".kimi-code" / "mcp.json").exists())
 
     def test_invalid_json_prevents_all_file_writes(self):
         cursor_config = self.project / ".cursor" / "mcp.json"

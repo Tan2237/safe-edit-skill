@@ -267,6 +267,55 @@ def _find_script(
     return None
 
 
+def _script_reference_is_missing(
+    command: str, args: Sequence[str], cwd: Optional[str], base_dir: Path
+) -> bool:
+    for value in [command, *args]:
+        if not isinstance(value, str) or not value.endswith(".py"):
+            continue
+        candidate = _resolve_path(value, cwd, base_dir)
+        if candidate is None or not candidate.is_file():
+            return True
+    return False
+
+
+def _module_reference_exists(
+    command: str,
+    args: Sequence[str],
+    cwd: Optional[str],
+    base_dir: Path,
+    timeout: float,
+) -> Optional[bool]:
+    resolved = _resolve_command(command, cwd, base_dir)
+    if resolved is None or "-m" not in args:
+        return None
+    resolved_name = Path(resolved).name.lower()
+    if not resolved_name.startswith("python") and resolved_name not in (
+        "py",
+        "py.exe",
+    ):
+        return None
+    index = list(args).index("-m")
+    module = args[index + 1] if index + 1 < len(args) else ""
+    if not module:
+        return False
+    source = (
+        "import contextlib, importlib.util\n"
+        "spec = None\n"
+        "with contextlib.suppress(ImportError, ValueError):\n"
+        f"    spec = importlib.util.find_spec({module!r})\n"
+        "print('true' if spec is not None else 'false')"
+    )
+    output, _error = _run_text(
+        [resolved, "-c", source], cwd, timeout
+    )
+    if output == "true":
+        return True
+    if output == "false":
+        return False
+    return None
+
+
 def _probe_entry(
     command: str,
     args: Sequence[str],
@@ -504,7 +553,16 @@ def _collect_configs(
         resolved = _resolve_command(command, cwd_value, base_dir)
         command_exists = resolved is not None
         script = _find_script(command, args, cwd_value, base_dir)
-        launcher_exists = script is not None or command_exists
+        script_missing = _script_reference_is_missing(
+            command, args, cwd_value, base_dir
+        )
+        module_exists = _module_reference_exists(
+            command, args, cwd_value, base_dir, timeout
+        )
+        module_missing = module_exists is False
+        launcher_exists = script is not None or (
+            command_exists and not script_missing and not module_missing
+        )
         probe = _probe_entry(command, args, cwd_value, base_dir, timeout)
         result.update(
             command=command,
@@ -519,6 +577,20 @@ def _collect_configs(
                 _drift(
                     "config_command_missing",
                     f"{path}: command not found: {command}",
+                    path=str(path),
+                )
+            )
+        elif script_missing or module_missing:
+            code = (
+                "config_module_missing"
+                if module_missing
+                else "config_launcher_missing"
+            )
+            result.update(status="invalid", error="launcher or module not found")
+            drift.append(
+                _drift(
+                    code,
+                    f"{path}: safe-edit launcher or module is missing",
                     path=str(path),
                 )
             )
@@ -589,6 +661,7 @@ def _collect_skill_copies(
             "exists": exists,
             "corePath": str(core),
             "coreSha256": None,
+            "skillSha256": None,
             "version": None,
             "matchesCurrent": False,
         }
@@ -606,16 +679,49 @@ def _collect_skill_copies(
                         result["version"] = match.group(1)
                 except OSError:
                     pass
-            result["matchesCurrent"] = (
+            skill_doc = path / "SKILL.md"
+            if skill_doc.is_file():
+                result["skillSha256"] = _sha256(skill_doc)
+            current_doc = CORE_PATH.parent / "SKILL.md"
+            current_doc_sha = (
+                _sha256(current_doc) if current_doc.is_file() else None
+            )
+            core_matches = (
                 current_sha is not None and result["coreSha256"] == current_sha
             )
-            if not result["matchesCurrent"]:
+            version_matches = result["version"] == __version__
+            docs_match = (
+                current_doc_sha is None
+                or result["skillSha256"] == current_doc_sha
+            )
+            result["matchesCurrent"] = (
+                core_matches and version_matches and docs_match
+            )
+            if not core_matches:
                 drift.append(
                     _drift(
                         "skill_core_mismatch",
                         f"{path}: skill core differs from this doctor",
                         path=str(path),
                         coreSha256=result["coreSha256"],
+                    )
+                )
+            elif not version_matches:
+                drift.append(
+                    _drift(
+                        "skill_version_mismatch",
+                        f"{path}: skill version differs from this doctor",
+                        path=str(path),
+                        version=result["version"],
+                    )
+                )
+            elif not docs_match:
+                drift.append(
+                    _drift(
+                        "skill_docs_mismatch",
+                        f"{path}: SKILL.md differs from this doctor",
+                        path=str(path),
+                        skillSha256=result["skillSha256"],
                     )
                 )
         elif exists and is_explicit:

@@ -117,6 +117,15 @@ codex plugin add safe-edit-skill@safe-edit
 }
 ```
 
+operation 只接受各操作已声明的字段；`old_string`、`expectedCount` 等未知字段会
+直接返回 `validation_error`，不会静默忽略。MCP operation 不接受 `*_file`、
+`*_stdin` 或 `*_base64` 外部参数通道，复杂内容应直接放入 `old`、`new` 或 `text`。
+
+已有文件的解码默认自动探测，可用 `inputEncoding` 显式覆盖；`encoding` 在 edit
+中是输出编码，在 create 中是新建文件的显式编码。`safe_edit_stat` 返回的
+`encoding` 描述输入；同编码写回会保留原有 BOM。自动探测仅覆盖文档列出的
+UTF 与 GBK，其他编码必须显式指定，不能依赖内容猜测。
+
 dry-run 会先生成不可变 prepared plan，并为每个文件返回精简 `diff` 与
 `resultSha256`。只有计划成功进入有界缓存时，顶层才会返回一次性事务 ID；
 缓存已满时会拒绝新的 dry-run admission，不会逐出尚未过期的已签发 token。
@@ -165,7 +174,7 @@ CLI 保留为未加载插件时的兼容回退。
 # 当前用户；VS Code 需要 code CLI
 safe-edit-mcp install --client all --scope user
 
-# 当前项目，适合提交团队配置
+# 当前项目，适合提交团队配置（各机器需让 safe-edit-mcp 在 PATH 中可用）
 safe-edit-mcp install --client all --scope project --project-dir .
 
 # 先查看将写入的路径和配置
@@ -183,12 +192,18 @@ safe-edit-mcp install --client cursor --scope user --dry-run --json
 | VS Code | 通过 `code --add-mcp` | `.vscode/mcp.json` |
 
 项目级 `.mcp.json` 由 Claude Code、Kimi Code（读取 git 根目录）和 Codex
-插件共用，安装器按真实路径去重，只写一次。Kimi 的用户级配置独立；Codex CLI
-的用户级配置是 `~/.codex/config.toml` 的 TOML 表，安装器不写 TOML，Codex
-继续使用插件 marketplace。
+插件共用，安装器按真实路径去重，只写一次。项目条目使用可移植的
+`safe-edit-mcp` 命令名，不写本机绝对路径；每台机器需先安装并让该命令在 `PATH`
+中可用。Kimi 的用户级配置独立，并遵循 `KIMI_CODE_HOME`；未设置时使用
+`~/.kimi-code/mcp.json`。项目级 stdio 配置还受客户端 workspace trust 约束，
+CI 需按客户端文档显式信任工作区。Codex CLI 的用户级配置是
+`~/.codex/config.toml` 的 TOML 表，安装器不写 TOML，Codex 继续使用插件
+marketplace。
 
 如果目标配置不是有效 JSON（例如含 JSONC 注释），安装器会拒绝重写并保持
-原文件不变；此时使用 `--dry-run --json` 获取配置片段后手工合并。
+原文件不变，`--dry-run` 也不例外；此时需手工合并 `safe-edit` 条目。
+`--dry-run --json` 仅用于有效配置预览，输出也只包含 `safe-edit` 自己的条目，
+不会回显其他 server 的密钥。
 
 ## 安装诊断（doctor）
 
@@ -256,7 +271,9 @@ MCP 结构化工具可用时，所有已有文件编辑都使用 `safe_edit_tran
 
 以下示例假设从源码仓库根目录运行；通过 pipx/uv 安装后，也可把
 `python skills/safe-edit/safe_edit.py` 换成 `safe-edit`。Windows 上如果
-`python` 不在 `PATH`，可以用 `py -3` 替代。
+`python` 不在 `PATH`，可以用 `py -3` 替代；这只适用于 CLI 示例。仓库根目录
+`.mcp.json` 使用 `python` 启动 MCP，只有 `py -3` 时应改用安装器生成的
+`safe-edit-mcp` 条目，或调整本机 MCP 启动配置。
 
 ```bash
 python skills/safe-edit/safe_edit.py preflight --json

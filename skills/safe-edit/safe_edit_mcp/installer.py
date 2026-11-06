@@ -43,10 +43,12 @@ class CommandAction:
     argv: Tuple[str, ...]
 
 
-def _server_invocation() -> Invocation:
+def _server_invocation(portable: bool = False) -> Invocation:
     override = os.environ.get("SAFE_EDIT_MCP_EXECUTABLE")
     if override:
         return Invocation(str(Path(override).expanduser().resolve()))
+    if portable:
+        return Invocation("safe-edit-mcp")
     launcher = shutil.which("safe-edit-mcp")
     if launcher:
         return Invocation(str(Path(launcher).resolve()))
@@ -76,6 +78,14 @@ def _server_entry(client: str, invocation: Invocation) -> Dict[str, Any]:
     return entry
 
 
+def _kimi_project_root(project_dir: Path) -> Path:
+    resolved = project_dir.resolve(strict=False)
+    for candidate in (resolved, *resolved.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return project_dir
+
+
 def _target_path(
     client: str, scope: str, home: Path, project_dir: Path
 ) -> Optional[Path]:
@@ -83,16 +93,19 @@ def _target_path(
         return {
             "claude-code": project_dir / ".mcp.json",
             "cursor": project_dir / ".cursor" / "mcp.json",
-            "kimi-code": project_dir / ".mcp.json",
+            "kimi-code": _kimi_project_root(project_dir) / ".mcp.json",
             "opencode": project_dir / "opencode.json",
             "vscode": project_dir / ".vscode" / "mcp.json",
         }[client]
     if client == "vscode":
         return None
+    kimi_home = Path(
+        os.environ.get("KIMI_CODE_HOME", str(home / ".kimi-code"))
+    ).expanduser()
     return {
         "claude-code": home / ".claude.json",
         "cursor": home / ".cursor" / "mcp.json",
-        "kimi-code": home / ".kimi-code" / "mcp.json",
+        "kimi-code": kimi_home / "mcp.json",
         "opencode": home / ".config" / "opencode" / "opencode.json",
     }[client]
 
@@ -269,7 +282,7 @@ def install_configs(
     code_cli: Optional[str] = None,
 ) -> Dict[str, Any]:
     selected = _expand_clients(clients)
-    server = invocation or _server_invocation()
+    server = invocation or _server_invocation(portable=scope == "project")
     files_by_path: Dict[str, FileAction] = {}
     clients_by_path: Dict[str, List[str]] = {}
     commands: List[CommandAction] = []
@@ -307,7 +320,11 @@ def install_configs(
                     "path": str(action.path),
                     "changed": action.changed,
                     "backup": str(backup) if backup else None,
-                    "config": json.loads(action.content.decode("utf-8")),
+                    "config": {
+                        _section_name(action.client): {
+                            SERVER_KEY: _server_entry(action.client, server)
+                        }
+                    },
                 }
             )
 
@@ -320,7 +337,7 @@ def install_configs(
                     "clients": [action.client],
                     "kind": "command",
                     "argv": list(action.argv),
-                    "changed": not dry_run,
+                    "changed": True,
                     "backup": None,
                 }
             )

@@ -2183,7 +2183,7 @@ def make_encoding_info(name: str, data: bytes = b"") -> EncodingInfo:
 
 def encoding_for_output(name: str, original: EncodingInfo) -> EncodingInfo:
     name = normalize_encoding(name)
-    if name == "preserve":
+    if name == "preserve" or (name == original.name and original.bom):
         return original
     return make_encoding_info(name)
 
@@ -3121,6 +3121,9 @@ def parse_diff_input(diff_text: str) -> List[Dict[str, Any]]:
             else:
                 new_lines.append(line)
     
+    if state == 'search':
+        fail("invalid diff-input format: SEARCH block missing separator")
+
     # Handle unterminated block (missing REPLACE marker)
     if state == 'replace' and old_lines:
         old_text = '\n'.join(old_lines)
@@ -3398,10 +3401,14 @@ def _apply_edit_with_context(
                     line_index=line_index,
                     position_mapper=position_mapper,
                 )
+                if original_pos < 0:
+                    fail(
+                        "matched text could not be mapped to original text; "
+                        "refusing edit"
+                    )
                 search_start = norm_pos + len(normalized_old)
-                if original_pos >= 0:
-                    search_start_orig = original_pos + original_len
-                    yield original_pos, original_len
+                search_start_orig = original_pos + original_len
+                yield original_pos, original_len
             return
 
         start = 0
@@ -3708,6 +3715,11 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
     elif normalize_whitespace and not ignore_indent:
         position_mapper = _WhitespacePositionMapper(text)
 
+    if not normalized_old and (
+        ignore_indent or ignore_eol or normalize_whitespace
+    ):
+        fail("old text is empty after normalization; refusing edit")
+
     if context_before or context_after:
         return _apply_edit_with_context(
             text,
@@ -3757,7 +3769,10 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
                 position_mapper=position_mapper,
             )
             if original_pos < 0:
-                return (text, 0, effective_strategy)
+                fail(
+                    "matched text could not be mapped to original text; "
+                    "refusing edit"
+                )
             spans = [(original_pos, original_len)]
         else:
             spans = []
@@ -3780,9 +3795,13 @@ def apply_literal_edit(text: str, operation: Dict[str, Any], newline: str, expla
                     line_index=line_index,
                     position_mapper=position_mapper,
                 )
-                if original_pos >= 0:
-                    spans.append((original_pos, original_len))
-                    search_start_orig = original_pos + original_len
+                if original_pos < 0:
+                    fail(
+                        "matched text could not be mapped to original text; "
+                        "refusing edit"
+                    )
+                spans.append((original_pos, original_len))
+                search_start_orig = original_pos + original_len
                 search_start = norm_pos + len(normalized_old)
 
         return (
@@ -3896,6 +3915,37 @@ def _find_original_position_line_based(
         0,
         bisect_right(line_index.normalized_starts, norm_pos) - 1,
     )
+
+    def map_boundary(boundary: int) -> int:
+        line = max(
+            0,
+            bisect_right(line_index.normalized_starts, boundary) - 1,
+        )
+        original_start = line_index.original_starts[line]
+        normalized_offset = boundary - line_index.normalized_starts[line]
+        if normalized_offset == 0:
+            return original_start
+        line_end = original_text.find("\n", original_start)
+        if line_end < 0:
+            line_end = len(original_text)
+        indent = 0
+        if ignore_indent:
+            while (
+                original_start + indent < line_end
+                and original_text[original_start + indent] in " \t"
+            ):
+                indent += 1
+        return original_start + indent + normalized_offset
+
+    original_pos = map_boundary(norm_pos)
+    original_end = map_boundary(norm_pos + len(normalized_old))
+    if original_pos >= start_search_pos and original_end >= original_pos:
+        candidate = original_text[original_pos:original_end]
+        if normalize_for_match(
+            candidate, ignore_indent, ignore_eol, False
+        ) == normalized_old:
+            return original_pos, original_end - original_pos
+
     search_start = max(
         start_search_pos,
         line_index.original_starts[target_line],
@@ -4368,6 +4418,72 @@ class _OperationBuffer:
         self._records = None
 
 
+def _validate_native_operation(operation: Dict[str, Any]) -> None:
+    op = str(operation.get("op") or operation.get("command") or "").replace("_", "-")
+    required = {
+        "edit": ("old", "new"),
+        "regex": ("pattern", "replacement"),
+        "insert": ("line", "text"),
+        "prepend": ("text",),
+        "append": ("text",),
+        "delete": ("line",),
+        "replace-lines": ("text",),
+    }
+    for key in required.get(op, ()):
+        if key not in operation:
+            fail(f"batch operation missing {key}")
+    if op in ("delete-lines", "replace-lines") and not operation.get(
+        "anchor_pattern"
+    ):
+        for key in ("start", "end"):
+            if key not in operation:
+                fail(f"batch operation missing {key}")
+
+    for key in (
+        "old",
+        "new",
+        "pattern",
+        "replacement",
+        "flags",
+        "text",
+        "context_before",
+        "context_after",
+        "anchor_pattern",
+    ):
+        if key in operation and not isinstance(operation[key], str):
+            fail(f"batch operation {key} must be a string")
+    for key in ("first", "no_op_ok", "literal_replacement", "preserve_indent"):
+        if key in operation and not isinstance(operation[key], bool):
+            fail(f"batch operation {key} must be a boolean")
+    for key in (
+        "expected_count",
+        "count",
+        "line",
+        "start",
+        "end",
+        "anchor_occurrence",
+    ):
+        if key not in operation or operation[key] is None:
+            continue
+        value = operation[key]
+        if type(value) is not int:
+            fail(f"batch operation {key} must be an integer")
+        if key in ("expected_count", "count") and value < 0:
+            fail(
+                f"batch operation {key} must be an integer "
+                "greater than or equal to 0"
+            )
+    for key in ("offset_start", "offset_end"):
+        if key not in operation or operation[key] is None:
+            continue
+        value = operation[key]
+        if type(value) is int:
+            continue
+        if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value):
+            continue
+        fail(f"batch operation {key} must be an integer or signed decimal string")
+
+
 def apply_operation(text: str, operation: Dict[str, Any], newline: str, explain: bool = False,
                     ignore_indent: bool = False, ignore_eol: bool = False, normalize_whitespace: bool = False,
                     auto_match: bool = False, fuzzy: bool = False,
@@ -4658,6 +4774,7 @@ def apply_operations(
     results: List[Dict[str, Any]] = []
 
     for index, operation in enumerate(operations, start=1):
+        _validate_native_operation(operation)
         op_name = str(
             operation.get("op") or operation.get("command") or ""
         ).replace("_", "-")
@@ -6512,11 +6629,20 @@ def stat_target(
 def make_backup_path(path: Path, backup_dir: Optional[str], backup_suffix: str) -> Path:
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     suffix = backup_suffix.replace("{timestamp}", timestamp)
+    if not suffix:
+        fail("--backup-suffix must not be empty")
     if any(part in suffix for part in ("/", "\\")):
         fail("--backup-suffix must not contain path separators")
     directory = Path(backup_dir) if backup_dir else path.parent
     directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"{path.name}{suffix}"
+    candidate = directory / f"{path.name}{suffix}"
+    if not os.path.lexists(candidate):
+        return candidate
+    for index in range(1, 10000):
+        candidate = directory / f"{path.name}{suffix}.{index}"
+        if not os.path.lexists(candidate):
+            return candidate
+    fail(f"unable to allocate a unique backup path for: {path}")
 
 
 def _is_cross_device_error(exc: OSError) -> bool:
@@ -7113,7 +7239,13 @@ def run_stat_many_payload(
         child.follow_symlink = bool(options.get("followSymlink", False))
         child.max_bytes = int(options.get("maxBytes", args.max_bytes))
         child._fs_capability_cache = capability_cache
-        results.append(run(child))
+        try:
+            results.append(run(child))
+        except SafeEditError as exc:
+            setattr(exc, "_diagnostic_file_index", index)
+            setattr(exc, "_diagnostic_file", file_value)
+            setattr(exc, "_diagnostic_command", "stat-many")
+            raise
 
     return {
         "ok": True,
@@ -10990,6 +11122,70 @@ def run_transaction_payload(
     args: argparse.Namespace,
     payload: Any,
 ) -> Dict[str, Any]:
+    payload = normalize_request_payload(payload, "transaction")
+    allowed_options = frozenset(
+        {
+            "files",
+            "dryRun",
+            "autoMatch",
+            "autoEolMatch",
+            "fuzzy",
+            "fuzzyWorkers",
+            "maxBytes",
+            "lockTimeout",
+            "lockStaleSeconds",
+        }
+    )
+    unknown_options = sorted(set(payload) - allowed_options)
+    if unknown_options:
+        fail(
+            "transaction request contains unknown field(s): "
+            + ", ".join(unknown_options)
+        )
+    for key in ("dryRun", "autoMatch", "autoEolMatch", "fuzzy"):
+        if key in payload and not isinstance(payload[key], bool):
+            fail(f"transaction {key} must be a boolean")
+    if "dryRun" in payload:
+        args.dry_run = bool(args.dry_run or payload["dryRun"])
+    if "autoMatch" in payload:
+        args.auto_match = payload["autoMatch"]
+    if "autoEolMatch" in payload:
+        args.auto_eol_match = payload["autoEolMatch"]
+    if "fuzzy" in payload:
+        args.fuzzy = payload["fuzzy"]
+    if "fuzzyWorkers" in payload:
+        workers = payload["fuzzyWorkers"]
+        if workers != "auto" and (
+            type(workers) is not int
+            or workers < 1
+            or workers > _FUZZY_MAX_WORKERS
+        ):
+            fail(
+                "transaction fuzzyWorkers must be auto or an integer "
+                f"from 1 to {_FUZZY_MAX_WORKERS}"
+            )
+        args.fuzzy_workers = workers
+    if "maxBytes" in payload:
+        max_bytes = payload["maxBytes"]
+        if type(max_bytes) is not int or max_bytes <= 0:
+            fail("transaction maxBytes must be a positive integer")
+        args.max_bytes = max_bytes
+    for key, attribute in (
+        ("lockTimeout", "lock_timeout"),
+        ("lockStaleSeconds", "lock_stale_seconds"),
+    ):
+        if key not in payload:
+            continue
+        value = payload[key]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            fail(f"transaction {key} must be a finite non-negative number")
+        setattr(args, attribute, value)
+
     args._prepared_transaction = None
     try:
         prepared = prepare_transaction(args, payload)
@@ -11470,6 +11666,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     with lock_context:
         original = read_target(path, args.max_bytes)
+        source_stat = path.stat()
+        source_identity = (source_stat.st_dev, source_stat.st_ino)
         original_sha256: Optional[str] = None
         if args.expected_sha256:
             expected = args.expected_sha256.lower()
@@ -11542,8 +11740,18 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 )
 
         new_text = apply_post_transforms(new_text, args, newline)
+        if "\x00" in new_text and not args.allow_nul:
+            fail(
+                "output text contains NUL bytes; "
+                "use --allow-nul to permit binary-like output"
+            )
         output_encoding = encoding_for_output(args.to_encoding, encoding)
         output = encode_text(new_text, output_encoding)
+        if len(output) > args.max_bytes:
+            fail(
+                f"output is {len(output)} bytes, "
+                f"exceeding --max-bytes {args.max_bytes}"
+            )
         if original_sha256 is None:
             original_sha256 = hashlib.sha256(original).hexdigest()
         result_sha256 = hashlib.sha256(output).hexdigest()
@@ -11619,6 +11827,17 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             if output == original and not args.force_write:
                 summary["skipped"] = True
             else:
+                current_stat = path.stat()
+                current = read_target(path, args.max_bytes)
+                current_sha256 = hashlib.sha256(current).hexdigest()
+                if current_sha256 != original_sha256:
+                    _fail_sha256_mismatch(
+                        "target changed before write; run stat again",
+                        original_sha256,
+                        current_sha256,
+                    )
+                if (current_stat.st_dev, current_stat.st_ino) != source_identity:
+                    fail("target identity changed before write; run stat again")
                 backup = atomic_replace(path, output, args.backup, args.backup_dir, args.backup_suffix)
                 if not _compare_file_bytes_strict(path, output):
                     fail("post-write verification failed: bytes on disk do not match intended output")

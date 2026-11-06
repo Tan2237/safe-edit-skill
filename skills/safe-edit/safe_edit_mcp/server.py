@@ -90,7 +90,9 @@ def _run_tool_stage(
 ) -> Any:
     try:
         return operation()
-    except (ToolInputError, ToolExecutionError, core.SafeEditError):
+    except (ToolInputError, ToolExecutionError, core.SafeEditError) as error:
+        if transaction_id_consumed is not None:
+            setattr(error, "_transaction_id_consumed", transaction_id_consumed)
         raise
     except Exception as error:
         raise ToolInternalError(
@@ -155,6 +157,71 @@ _TRANSACTION_FILE_KEYS = frozenset(
         "diff",
     }
 )
+_TRANSACTION_OPERATION_KEYS = {
+    "edit": frozenset(
+        {
+            "op",
+            "old",
+            "new",
+            "expected_count",
+            "context_before",
+            "context_after",
+            "first",
+            "no_op_ok",
+        }
+    ),
+    "regex": frozenset(
+        {
+            "op",
+            "pattern",
+            "replacement",
+            "flags",
+            "count",
+            "expected_count",
+            "first",
+            "no_op_ok",
+            "literal_replacement",
+        }
+    ),
+    "insert": frozenset({"op", "line", "text"}),
+    "prepend": frozenset({"op", "text"}),
+    "append": frozenset({"op", "text"}),
+    "delete": frozenset({"op", "line"}),
+    "delete-lines": frozenset(
+        {
+            "op",
+            "start",
+            "end",
+            "anchor_pattern",
+            "anchor_occurrence",
+            "offset_start",
+            "offset_end",
+        }
+    ),
+    "replace-lines": frozenset(
+        {
+            "op",
+            "start",
+            "end",
+            "text",
+            "preserve_indent",
+            "anchor_pattern",
+            "anchor_occurrence",
+            "offset_start",
+            "offset_end",
+        }
+    ),
+}
+_TRANSACTION_OPERATION_REQUIRED_KEYS = {
+    "edit": ("old", "new"),
+    "regex": ("pattern", "replacement"),
+    "insert": ("line", "text"),
+    "prepend": ("text",),
+    "append": ("text",),
+    "delete": ("line",),
+    "delete-lines": (),
+    "replace-lines": ("text",),
+}
 
 
 PARSER = core.build_parser()
@@ -278,6 +345,80 @@ def _validate_stat_arguments(arguments: Dict[str, Any]) -> None:
     )
 
 
+def _validate_transaction_operation(
+    operation: Any, file_label: str, index: int
+) -> None:
+    label = f"{file_label}.operations[{index}]"
+    if not isinstance(operation, dict):
+        raise ToolInputError(f"{label} must be an object")
+    _require_non_empty_string(operation, "op", label, required=True)
+    op = operation["op"]
+    if op not in _TRANSACTION_OPERATION_KEYS:
+        raise ToolInputError(f"{label}.op has unsupported operation: {op}")
+    _reject_unknown_keys(operation, _TRANSACTION_OPERATION_KEYS[op], label)
+
+    for key in _TRANSACTION_OPERATION_REQUIRED_KEYS[op]:
+        if key not in operation:
+            raise ToolInputError(f"{label}.{key} is required")
+    for key in (
+        "old",
+        "new",
+        "pattern",
+        "replacement",
+        "flags",
+        "text",
+        "context_before",
+        "context_after",
+        "anchor_pattern",
+    ):
+        if key in operation and not isinstance(operation[key], str):
+            raise ToolInputError(f"{label}.{key} must be a string")
+    for key in ("first", "no_op_ok", "literal_replacement", "preserve_indent"):
+        _validate_boolean(operation, key, label)
+    for key in ("expected_count", "count", "line", "start", "end", "anchor_occurrence"):
+        if key not in operation:
+            continue
+        minimum = 0 if key in ("expected_count", "count") else 1
+        value = operation[key]
+        if type(value) is not int or value < minimum:
+            raise ToolInputError(
+                f"{label}.{key} must be an integer greater than or equal to {minimum}"
+            )
+    for key in ("offset_start", "offset_end"):
+        if key not in operation:
+            continue
+        value = operation[key]
+        if type(value) is int:
+            continue
+        if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value):
+            continue
+        raise ToolInputError(
+            f"{label}.{key} must be an integer or signed decimal string"
+        )
+
+    if op not in ("delete-lines", "replace-lines"):
+        return
+    if "anchor_pattern" in operation:
+        if not operation["anchor_pattern"]:
+            raise ToolInputError(
+                f"{label}.anchor_pattern must be a non-empty string"
+            )
+        for key in ("start", "end"):
+            if key in operation:
+                raise ToolInputError(
+                    f"{label}.{key} is not allowed with anchor_pattern"
+                )
+        return
+    for key in ("start", "end"):
+        if key not in operation:
+            raise ToolInputError(f"{label}.{key} is required")
+    for key in ("anchor_occurrence", "offset_start", "offset_end"):
+        if key in operation:
+            raise ToolInputError(
+                f"{label}.{key} requires anchor_pattern"
+            )
+
+
 def _validate_transaction_file(item: Any, index: int) -> int:
     label = f"files[{index}]"
     if not isinstance(item, dict):
@@ -344,6 +485,11 @@ def _validate_transaction_file(item: Any, index: int) -> int:
             raise ToolInputError(
                 f"{label}.expectedSha256 is not allowed for create"
             )
+        for key in ("forceWrite", "inputEncoding", "followSymlink"):
+            if key in item:
+                raise ToolInputError(
+                    f"{label}.{key} is not allowed for create"
+                )
         _require_non_empty_string(
             item, "encoding", label, required=True
         )
@@ -370,10 +516,7 @@ def _validate_transaction_file(item: Any, index: int) -> int:
             f"{MAX_OPERATIONS_PER_FILE} items"
         )
     for operation_index, operation in enumerate(operations):
-        if not isinstance(operation, dict):
-            raise ToolInputError(
-                f"{label}.operations[{operation_index}] must be an object"
-            )
+        _validate_transaction_operation(operation, label, operation_index)
     _validate_sha256(
         item, "expectedSha256", label, required=True
     )
@@ -1078,6 +1221,11 @@ def _tool_failure(error: Exception, command: str) -> Dict[str, Any]:
         }
         if isinstance(error, ToolExecutionError):
             payload.update(error.details)
+    transaction_id_consumed = getattr(
+        error, "_transaction_id_consumed", None
+    )
+    if transaction_id_consumed is not None:
+        payload["transactionIdConsumed"] = transaction_id_consumed
     payload["transport"] = "mcp-structured"
     payload["serverInstanceId"] = SERVER_INSTANCE_ID
     result = _tool_result(payload)
@@ -1315,10 +1463,10 @@ FILE_ITEM_SCHEMA = {
 TRANSACTION_OPERATION_SCHEMA = {
     "type": "object",
     "description": (
-        "A native safe-edit operation. Use op to select the operation. "
-        "Common fields are listed here; other native operation fields are "
-        "also accepted. Set expected_count on every edit before enabling "
-        "transaction-wide relaxed matching."
+        "A structured safe-edit operation. Use op to select the operation. "
+        "Fields are validated per operation. External file, stdin, and "
+        "Base64 argument transports are not accepted. Set expected_count "
+        "on every edit before enabling transaction-wide relaxed matching."
     ),
     "properties": {
         "op": {
@@ -1339,12 +1487,31 @@ TRANSACTION_OPERATION_SCHEMA = {
         "expected_count": {"type": "integer", "minimum": 0},
         "context_before": {"type": "string"},
         "context_after": {"type": "string"},
+        "first": {"type": "boolean"},
+        "no_op_ok": {"type": "boolean"},
         "pattern": {"type": "string"},
         "replacement": {"type": "string"},
+        "flags": {"type": "string"},
+        "count": {"type": "integer", "minimum": 0},
+        "literal_replacement": {"type": "boolean"},
         "text": {"type": "string"},
         "line": {"type": "integer", "minimum": 1},
         "start": {"type": "integer", "minimum": 1},
         "end": {"type": "integer", "minimum": 1},
+        "anchor_pattern": {"type": "string", "minLength": 1},
+        "anchor_occurrence": {"type": "integer", "minimum": 1},
+        "offset_start": {
+            "oneOf": [
+                {"type": "integer"},
+                {"type": "string", "pattern": "^[+-]?\\d+$"},
+            ]
+        },
+        "offset_end": {
+            "oneOf": [
+                {"type": "integer"},
+                {"type": "string", "pattern": "^[+-]?\\d+$"},
+            ]
+        },
         "preserve_indent": {
             "type": "boolean",
             "default": True,
@@ -1354,7 +1521,7 @@ TRANSACTION_OPERATION_SCHEMA = {
             ),
         },
     },
-    "additionalProperties": True,
+    "additionalProperties": False,
 }
 
 TRANSACTION_ITEM_SCHEMA = {
@@ -1377,8 +1544,19 @@ TRANSACTION_ITEM_SCHEMA = {
             "items": TRANSACTION_OPERATION_SCHEMA,
         },
         "text": {"type": "string"},
-        "encoding": {"type": "string", "minLength": 1},
-        "inputEncoding": {"type": "string", "minLength": 1},
+        "encoding": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Output encoding for edit; explicit encoding for create. "
+                "Use inputEncoding to override source decoding."
+            ),
+        },
+        "inputEncoding": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Source decoding override for an existing file.",
+        },
         "lineEnding": {
             "type": "string",
             "enum": ["lf", "crlf", "cr", "preserve"],
@@ -1415,6 +1593,9 @@ TRANSACTION_ITEM_SCHEMA = {
                 "anyOf": [
                     {"required": ["operations"]},
                     {"required": ["expectedSha256"]},
+                    {"required": ["forceWrite"]},
+                    {"required": ["inputEncoding"]},
+                    {"required": ["followSymlink"]},
                 ]
             },
         },
@@ -1596,9 +1777,12 @@ TOOLS = [
                     "required": ["files"],
                     "not": {
                         "anyOf": [
-                            {"required": ["file"]},
-                            {"required": ["transactionId"]},
-                            {"required": ["cancelTransactionId"]},
+                            {"required": [key]}
+                            for key in (
+                                *TRANSACTION_ITEM_SCHEMA["properties"],
+                                "transactionId",
+                                "cancelTransactionId",
+                            )
                         ]
                     },
                 },

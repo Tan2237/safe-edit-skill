@@ -2066,6 +2066,82 @@ class SafeEditTests(unittest.TestCase):
         # Should have replaced with the provided new text
         self.assertEqual(path.read_bytes(), b"if (y) {\n\t\tdoSomething();\n\t}\n")
 
+    def test_ignore_indent_deep_multiline_replaces_all_matches(self):
+        path = self.tmpdir / "deep_multiline_indent.txt"
+        old = "\n".join(f"t{index}" for index in range(9))
+        shallow = "\n".join(f"    t{index}" for index in range(9))
+        deep = "\n".join(f"{' ' * 24}t{index}" for index in range(9))
+        path.write_bytes(
+            f"head\n{shallow}\nmid\n{deep}\ntail\n".encode()
+        )
+
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            old,
+            "--new",
+            "X",
+            "--expected-count",
+            "2",
+            "--ignore-indent",
+        )
+
+        self.assertEqual(
+            path.read_bytes(),
+            f"head\n    X\nmid\n{' ' * 24}X\ntail\n".encode(),
+        )
+
+    def test_ignore_indent_first_deep_multiline_is_not_silent(self):
+        path = self.tmpdir / "first_deep_multiline_indent.txt"
+        old = "\n".join("foo();" for _ in range(10))
+        indented = "\n".join(f"{' ' * 16}foo();" for _ in range(10))
+        path.write_bytes(f"{indented}\n".encode())
+
+        self.run_tool(
+            "edit",
+            "--file",
+            path,
+            "--old",
+            old,
+            "--new",
+            "BAR();",
+            "--first",
+            "--ignore-indent",
+        )
+
+        self.assertEqual(path.read_bytes(), f"{' ' * 16}BAR();\n".encode())
+
+    def test_whitespace_only_old_does_not_hang_normalized_matching(self):
+        for flag in ("--ignore-indent", "--auto-match"):
+            with self.subTest(flag=flag):
+                path = self.tmpdir / f"whitespace_only_{flag[2:]}.txt"
+                path.write_bytes(b"abc\ndef\n")
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(SCRIPT),
+                        "edit",
+                        "--file",
+                        str(path),
+                        "--old",
+                        " \t",
+                        "--new",
+                        "X",
+                        flag,
+                        "--json",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    encoding="utf-8",
+                    timeout=5,
+                )
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 2, output)
+                self.assertIn("empty after normalization", output)
+                self.assertEqual(path.read_bytes(), b"abc\ndef\n")
+
     def test_whitespace_flags_only_affect_edit(self):
         """Test that whitespace flags only affect edit command, not other commands."""
         path = self.tmpdir / "other_command.txt"
@@ -7524,6 +7600,281 @@ value = frozenset({'"', '%', '!', '\\r', '\\n', '`'})"""
         self.assertEqual(payload["atomicity"], "prevalidated")
         self.assertFalse(payload["written"])
         self.assertFalse(created.exists())
+
+    def test_transaction_payload_dry_run_does_not_write(self):
+        target = self.tmpdir / "payload-dry-run.txt"
+        target.write_bytes(b"    before\n")
+        request = {
+            "dryRun": True,
+            "autoMatch": True,
+            "files": [
+                {
+                    "file": str(target),
+                    "expectedSha256": hashlib.sha256(
+                        b"    before\n"
+                    ).hexdigest(),
+                    "operations": [
+                        {
+                            "op": "edit",
+                            "old": "\tbefore",
+                            "new": "after",
+                            "expected_count": 1,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        result = self.run_tool(
+            "transaction",
+            "--request-stdin",
+            "--json",
+            input_text=json.dumps(request),
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["dryRun"])
+        self.assertFalse(payload["written"])
+        self.assertEqual(target.read_bytes(), b"    before\n")
+        self.assertEqual(
+            payload["files"][0]["operations"][0]["matchStrategy"],
+            "ignore-indent",
+        )
+
+    def test_transaction_payload_rejects_unknown_top_level_option(self):
+        target = self.tmpdir / "payload-unknown-option.txt"
+        target.write_bytes(b"before\n")
+        request = {
+            "dryRun": True,
+            "dryrun": False,
+            "files": [
+                {
+                    "file": str(target),
+                    "expectedSha256": hashlib.sha256(b"before\n").hexdigest(),
+                    "operations": [
+                        {"op": "edit", "old": "before", "new": "after"}
+                    ],
+                }
+            ],
+        }
+
+        result = self.run_tool(
+            "transaction",
+            "--request-stdin",
+            "--json",
+            input_text=json.dumps(request),
+            expect=2,
+        )
+
+        self.assertIn("unknown field", result.stdout + result.stderr)
+        self.assertEqual(target.read_bytes(), b"before\n")
+
+    def test_batch_rejects_invalid_native_operation_values(self):
+        invalid_operations = (
+            {"op": "delete-lines"},
+            {"op": "delete", "line": 1.9},
+            {"op": "insert", "line": 1},
+            {
+                "op": "edit",
+                "old": "before",
+                "new": "after",
+                "first": "false",
+            },
+            {
+                "op": "edit",
+                "old": "before",
+                "new": "after",
+                "expected_count": 2.9,
+            },
+            {
+                "op": "replace-lines",
+                "start": 1,
+                "end": 1,
+                "text": "x",
+                "preserve_indent": "false",
+            },
+        )
+        for operation in invalid_operations:
+            with self.subTest(operation=operation):
+                target = self.tmpdir / "invalid-native-operation.txt"
+                target.write_bytes(b"before\n")
+                result = self.run_tool(
+                    "batch",
+                    "--file",
+                    target,
+                    "--ops",
+                    json.dumps([operation]),
+                    "--json",
+                    expect=2,
+                )
+
+                payload = json.loads(result.stdout)
+                self.assertFalse(payload["ok"])
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(target.read_bytes(), b"before\n")
+
+    def test_diff_input_rejects_hunk_missing_separator(self):
+        target = self.tmpdir / "malformed-diff-input.txt"
+        target.write_bytes(b"alpha\nbeta\n")
+        diff = (
+            "--- SEARCH\n"
+            "alpha\n"
+            "=======\n"
+            "ALPHA\n"
+            "+++ REPLACE\n"
+            "--- SEARCH\n"
+            "beta\n"
+            "+++ REPLACE\n"
+        )
+
+        result = self.run_tool(
+            "edit",
+            "--file",
+            target,
+            "--diff-input-stdin",
+            "--json",
+            input_text=diff,
+            expect=2,
+        )
+
+        self.assertIn("missing separator", result.stdout + result.stderr)
+        self.assertEqual(target.read_bytes(), b"alpha\nbeta\n")
+
+    def test_single_file_edit_rechecks_source_before_replace(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "single-file-lost-update.txt"
+        target.write_bytes(b"alpha\n")
+        expected = hashlib.sha256(b"alpha\n").hexdigest()
+        args = m.build_parser().parse_args(
+            [
+                "edit",
+                "--file",
+                str(target),
+                "--old",
+                "alpha",
+                "--new",
+                "beta",
+                "--expected-count",
+                "1",
+                "--expected-sha256",
+                expected,
+                "--interactive",
+            ]
+        )
+
+        def external_edit_during_review(*_args):
+            target.write_bytes(b"external\n")
+            return True, False
+
+        with patch.object(
+            m, "prompt_interactive", side_effect=external_edit_during_review
+        ):
+            with self.assertRaises(m.SafeEditError) as ctx:
+                m.run(args)
+
+        self.assertIn("changed before write", str(ctx.exception))
+        self.assertEqual(target.read_bytes(), b"external\n")
+
+    def test_edit_rejects_nul_in_output_without_allow_nul(self):
+        target = self.tmpdir / "nul-output.txt"
+        target.write_bytes(b"abc\n")
+        replacement = self.tmpdir / "nul-output-payload.bin"
+        replacement.write_bytes(b"a\x00b")
+
+        result = self.run_tool(
+            "edit",
+            "--file",
+            target,
+            "--old",
+            "abc",
+            "--new-file",
+            replacement,
+            "--expected-count",
+            "1",
+            "--json",
+            expect=2,
+        )
+
+        self.assertIn("output text contains NUL", result.stdout)
+        self.assertEqual(target.read_bytes(), b"abc\n")
+
+    def test_edit_enforces_max_bytes_on_output(self):
+        target = self.tmpdir / "max-output-bytes.txt"
+        target.write_bytes(b"a\n")
+
+        result = self.run_tool(
+            "edit",
+            "--file",
+            target,
+            "--old",
+            "a",
+            "--new",
+            "abcdef",
+            "--expected-count",
+            "1",
+            "--max-bytes",
+            "4",
+            "--json",
+            expect=2,
+        )
+
+        self.assertIn("output is 7 bytes", result.stdout)
+        self.assertEqual(target.read_bytes(), b"a\n")
+
+    def test_backup_paths_are_unique_within_one_second(self):
+        m = self._import_safe_edit()
+        target = self.tmpdir / "unique-backup.txt"
+        target.write_bytes(b"first\n")
+
+        def edit(old, new):
+            args = m.build_parser().parse_args(
+                [
+                    "edit",
+                    "--file",
+                    str(target),
+                    "--old",
+                    old,
+                    "--new",
+                    new,
+                    "--expected-count",
+                    "1",
+                    "--backup",
+                ]
+            )
+            return m.run(args)
+
+        with patch.object(m.time, "strftime", return_value="20261106-120000"):
+            first = edit("first", "second")
+            second = edit("second", "third")
+
+        first_backup = Path(first["backup"])
+        second_backup = Path(second["backup"])
+        self.assertNotEqual(first_backup, second_backup)
+        self.assertEqual(first_backup.read_bytes(), b"first\n")
+        self.assertEqual(second_backup.read_bytes(), b"second\n")
+        self.assertEqual(target.read_bytes(), b"third\n")
+
+    def test_empty_backup_suffix_is_a_structured_error(self):
+        target = self.tmpdir / "empty-backup-suffix.txt"
+        target.write_bytes(b"before\n")
+
+        result = self.run_tool(
+            "edit",
+            "--file",
+            target,
+            "--old",
+            "before",
+            "--new",
+            "after",
+            "--backup",
+            "--backup-suffix",
+            "",
+            "--json",
+            expect=2,
+        )
+
+        self.assertIn("must not be empty", result.stdout + result.stderr)
+        self.assertEqual(target.read_bytes(), b"before\n")
 
     def test_transaction_rolls_back_files_written_before_runtime_failure(self):
         m = self._import_safe_edit()

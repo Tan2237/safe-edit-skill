@@ -1,3 +1,4 @@
+import codecs
 import hashlib
 import importlib.util
 import io
@@ -71,6 +72,34 @@ class SafeEditMcpTests(unittest.TestCase):
             ],
         )
 
+    def test_stat_many_failure_identifies_file(self):
+        target = self.root / "stat-wrong-hash.txt"
+        target.write_bytes(b"actual\n")
+
+        response = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "safe_edit_stat",
+                    "arguments": {
+                        "files": [
+                            {
+                                "file": str(target),
+                                "expectedSha256": "0" * 64,
+                            }
+                        ]
+                    },
+                },
+            }
+        )
+
+        payload = response["result"]["structuredContent"]
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(payload["failedFile"]["index"], 1)
+        self.assertEqual(payload["failedFile"]["file"], str(target))
+
     def test_raw_structured_transaction_needs_no_base64(self):
         target = self.root / "raw-payload.txt"
         target.write_bytes(b"alpha\n")
@@ -111,6 +140,44 @@ class SafeEditMcpTests(unittest.TestCase):
             target.read_text(encoding="utf-8"), replacement + "\n"
         )
         self.assertEqual(result["transport"], "mcp-structured")
+
+    def test_stat_encoding_roundtrip_preserves_utf16_bom(self):
+        target = self.root / "utf16-roundtrip.txt"
+        target.write_bytes(
+            codecs.BOM_UTF16_LE + "before\n".encode("utf-16-le")
+        )
+        stat = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]
+        self.assertTrue(stat["hasBom"])
+
+        result = server.execute_tool(
+            "safe_edit_transaction",
+            {
+                "files": [
+                    {
+                        "file": str(target),
+                        "expectedSha256": stat["sha256"],
+                        "encoding": stat["encoding"],
+                        "operations": [
+                            {
+                                "op": "edit",
+                                "old": "before",
+                                "new": "after",
+                                "expected_count": 1,
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        self.assertTrue(result["written"])
+        self.assertEqual(result["files"][0]["outputEncoding"], "utf-16-le")
+        self.assertEqual(
+            target.read_bytes(),
+            codecs.BOM_UTF16_LE + "after\n".encode("utf-16-le"),
+        )
 
     def test_single_file_transaction_shorthand(self):
         target = self.root / "single-file-shorthand.txt"
@@ -1114,6 +1181,189 @@ class SafeEditMcpTests(unittest.TestCase):
             stat_properties["lockStaleSeconds"]["minimum"], 0
         )
 
+    def test_transaction_operation_schema_matches_runtime_allowlist(self):
+        response = server.handle_message(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        )
+        transaction = next(
+            tool
+            for tool in response["result"]["tools"]
+            if tool["name"] == "safe_edit_transaction"
+        )
+        operation_schema = transaction["inputSchema"]["properties"][
+            "files"
+        ]["items"]["properties"]["operations"]["items"]
+        allowed = set().union(
+            *implementation._TRANSACTION_OPERATION_KEYS.values()
+        )
+
+        self.assertFalse(operation_schema["additionalProperties"])
+        self.assertEqual(set(operation_schema["properties"]), allowed)
+
+    def test_transaction_operation_validation_rejects_unknown_fields(self):
+        for key in (
+            "old_file",
+            "new_file",
+            "pattern_file",
+            "replacement_file",
+            "text_file",
+            "old_base64",
+            "new_stdin",
+            "old_string",
+            "new_string",
+            "expectedCount",
+        ):
+            with self.subTest(key=key):
+                arguments = {
+                    "files": [
+                        {
+                            "file": "unused",
+                            "expectedSha256": "0" * 64,
+                            "operations": [
+                                {
+                                    "op": "edit",
+                                    "old": "before",
+                                    "new": "after",
+                                    key: "invalid",
+                                }
+                            ],
+                        }
+                    ]
+                }
+                with self.assertRaisesRegex(
+                    ToolInputError, "contains unknown field"
+                ):
+                    implementation._validate_transaction_arguments(arguments)
+
+    def test_transaction_operation_validation_rejects_invalid_values(self):
+        invalid_operations = (
+            {"op": "edit", "old": 123, "new": "after"},
+            {
+                "op": "edit",
+                "old": "before",
+                "new": "after",
+                "expected_count": 2.9,
+            },
+            {
+                "op": "edit",
+                "old": "before",
+                "new": "after",
+                "expected_count": True,
+            },
+            {
+                "op": "edit",
+                "old": "before",
+                "new": "after",
+                "first": "false",
+            },
+            {
+                "op": "edit",
+                "old": "before",
+                "new": "after",
+                "no_op_ok": "false",
+            },
+            {"op": "insert", "line": 1},
+            {"op": "delete", "line": 1.9},
+            {"op": "delete-lines", "start": 1.9, "end": 2},
+            {"op": "delete-lines", "start": 1},
+            {
+                "op": "replace-lines",
+                "start": 1,
+                "end": 1,
+                "text": "x",
+                "preserve_indent": "false",
+            },
+            {
+                "op": "replace-lines",
+                "anchor_pattern": "anchor",
+                "start": 1,
+                "end": 1,
+                "text": "x",
+            },
+            {
+                "op": "replace-lines",
+                "start": 1,
+                "end": 1,
+                "text": "x",
+                "offset_start": 1,
+            },
+        )
+        for operation in invalid_operations:
+            with self.subTest(operation=operation):
+                arguments = {
+                    "files": [
+                        {
+                            "file": "unused",
+                            "expectedSha256": "0" * 64,
+                            "operations": [operation],
+                        }
+                    ]
+                }
+                with self.assertRaises(ToolInputError):
+                    implementation._validate_transaction_arguments(arguments)
+
+    def test_transaction_operation_file_transport_is_rejected_end_to_end(self):
+        target = self.root / "target.txt"
+        target.write_bytes(b"before\n")
+        secret = self.root / "argument.txt"
+        secret.write_bytes(b"must-not-be-read\n")
+        expected = server.execute_tool(
+            "safe_edit_stat", {"files": [str(target)]}
+        )["files"][0]["sha256"]
+
+        response = server.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "safe_edit_transaction",
+                    "arguments": {
+                        "files": [
+                            {
+                                "file": str(target),
+                                "expectedSha256": expected,
+                                "operations": [
+                                    {"op": "append", "text_file": str(secret)}
+                                ],
+                            }
+                        ]
+                    },
+                },
+            }
+        )
+
+        payload = response["result"]["structuredContent"]
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(payload["failureReason"], "validation_error")
+        self.assertFalse(payload["written"])
+        self.assertEqual(target.read_bytes(), b"before\n")
+        self.assertNotIn("must-not-be-read", response["result"]["content"][0]["text"])
+
+    def test_batch_transaction_schema_rejects_single_file_fields(self):
+        response = server.handle_message(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        )
+        transaction = next(
+            tool
+            for tool in response["result"]["tools"]
+            if tool["name"] == "safe_edit_transaction"
+        )
+        batch = next(
+            branch
+            for branch in transaction["inputSchema"]["oneOf"]
+            if branch.get("required") == ["files"]
+        )
+        forbidden = {
+            entry["required"][0] for entry in batch["not"]["anyOf"]
+        }
+
+        self.assertEqual(
+            forbidden,
+            set(implementation._TRANSACTION_FILE_KEYS)
+            | {"transactionId", "cancelTransactionId"},
+        )
+
     def test_resource_limits_match_runtime_and_tool_schemas(self):
         response = server.handle_message(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
@@ -1211,7 +1461,8 @@ class SafeEditMcpTests(unittest.TestCase):
                 "file": f"unused-{index}",
                 "expectedSha256": "0" * 64,
                 "operations": [
-                    {"op": "append"} for _ in range(operation_count)
+                    {"op": "append", "text": ""}
+                    for _ in range(operation_count)
                 ],
             }
 
@@ -1371,6 +1622,22 @@ class SafeEditMcpTests(unittest.TestCase):
                 "safe_edit_transaction",
                 {"files": [valid_create], "unknown": True},
             ),
+            (
+                "safe_edit_transaction",
+                {"files": [valid_create], "action": "batch"},
+            ),
+            (
+                "safe_edit_transaction",
+                {"files": [{**valid_create, "forceWrite": True}]},
+            ),
+            (
+                "safe_edit_transaction",
+                {"files": [{**valid_create, "inputEncoding": "gbk"}]},
+            ),
+            (
+                "safe_edit_transaction",
+                {"files": [{**valid_create, "followSymlink": True}]},
+            ),
         )
 
         for request_id, (name, arguments) in enumerate(
@@ -1402,8 +1669,6 @@ class SafeEditMcpTests(unittest.TestCase):
             "text": "content\n",
             "encoding": "utf-8",
             "lineEnding": "lf",
-            "followSymlink": False,
-            "forceWrite": False,
             "allowNul": False,
             "trimTrailingWhitespace": False,
             "diff": False,
@@ -1897,6 +2162,7 @@ class SafeEditMcpTests(unittest.TestCase):
         self.assertTrue(response["result"]["isError"])
         payload = response["result"]["structuredContent"]
         self.assertEqual(payload["error"]["type"], "hash_mismatch")
+        self.assertTrue(payload["transactionIdConsumed"])
         self.assertNotIn(transaction_id, implementation._PENDING_TRANSACTIONS)
         retry = server.handle_message(
             {

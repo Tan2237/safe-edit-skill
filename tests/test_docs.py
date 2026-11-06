@@ -74,6 +74,17 @@ class DocumentationTests(unittest.TestCase):
             ):
                 self.assertIn(value, text)
 
+    def test_encoding_and_installer_contracts_are_explicit(self):
+        skill = SKILL.read_text(encoding="utf-8")
+        readme = README.read_text(encoding="utf-8")
+        for text in (skill, readme):
+            self.assertIn("inputEncoding", text)
+            self.assertIn("old_string", text)
+        self.assertIn("KIMI_CODE_HOME", readme)
+        self.assertIn("`PATH`", readme)
+        self.assertIn("`--dry-run` 也不例外", readme)
+        self.assertIn("不会回显其他 server 的密钥", readme)
+
     def test_readme_cli_examples_resolve_from_repository_root(self):
         text = README.read_text(encoding="utf-8")
         self.assertNotRegex(

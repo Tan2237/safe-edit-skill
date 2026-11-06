@@ -95,6 +95,10 @@ is unavailable. These tools are part of the allowed safe-edit protocol.
 5. Cache each successful file result's `sha256` as the guard for its next edit.
    Do not re-run stat after a confirmed successful write.
 
+Operations accept only their documented fields. `old_string`, `expectedCount`, and
+external `*_file`/`*_stdin`/`*_base64` transports are rejected; use raw `old`/`new`.
+For existing files, `inputEncoding` overrides decoding; `encoding` selects output.
+
 The server is long-lived: it imports the editing core and builds its parser only
 once. Successfully admitted dry-runs receive single-use transaction IDs valid for
 up to 10 minutes. Admission is bounded to 32 tokens, 128 MiB total, and 64 MiB

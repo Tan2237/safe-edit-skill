@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -94,6 +95,55 @@ class DoctorTests(unittest.TestCase):
             [item["code"] for item in report["drift"]],
         )
 
+    def test_stale_skill_version_or_docs_is_drift(self):
+        cases = (
+            ("version", "skill_version_mismatch"),
+            ("docs", "skill_docs_mismatch"),
+        )
+        for kind, expected_drift in cases:
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    skill = root / ".agents" / "skills" / "safe-edit"
+                    shutil.copytree(
+                        SKILL_DIR,
+                        skill,
+                        ignore=shutil.ignore_patterns(
+                            "__pycache__", "*.egg-info"
+                        ),
+                    )
+                    if kind == "version":
+                        (skill / "safe_edit_mcp" / "__init__.py").write_text(
+                            '__version__ = "0.0.0"\n', encoding="utf-8"
+                        )
+                    else:
+                        with (skill / "SKILL.md").open(
+                            "a", encoding="utf-8"
+                        ) as stream:
+                            stream.write("stale documentation\n")
+                    code, report = run_doctor(
+                        [
+                            "--json",
+                            "--no-handshake",
+                            "--home",
+                            str(root),
+                            "--project-dir",
+                            str(root),
+                        ]
+                    )
+
+                self.assertEqual(code, 1)
+                self.assertIn(
+                    expected_drift,
+                    [item["code"] for item in report["drift"]],
+                )
+                copied = next(
+                    item
+                    for item in report["skillCopies"]
+                    if item["path"] == str(skill)
+                )
+                self.assertFalse(copied["matchesCurrent"])
+
     def test_kimi_user_config_path_is_scanned(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -132,6 +182,59 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(configs[0]["section"], "mcpServers")
         self.assertEqual(configs[0]["clients"], ["kimi-code"])
         self.assertTrue(configs[0]["entryPresent"])
+
+    def test_missing_configured_script_or_module_is_drift(self):
+        cases = (
+            (["missing_launcher.py"], "config_launcher_missing"),
+            (
+                ["-m", "definitely_missing.safe_edit_module"],
+                "config_module_missing",
+            ),
+        )
+        for args, expected_drift in cases:
+            with self.subTest(expected_drift=expected_drift):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    path = root / ".kimi-code" / "mcp.json"
+                    path.parent.mkdir(parents=True)
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "mcpServers": {
+                                    "safe-edit": {
+                                        "command": sys.executable,
+                                        "args": args,
+                                    }
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    code, report = run_doctor(
+                        [
+                            "--json",
+                            "--no-handshake",
+                            "--home",
+                            str(root),
+                            "--project-dir",
+                            str(root),
+                            "--client",
+                            "kimi-code",
+                            "--scope",
+                            "user",
+                        ]
+                    )
+
+                self.assertEqual(code, 1)
+                self.assertIn(
+                    expected_drift,
+                    [item["code"] for item in report["drift"]],
+                )
+                config = next(
+                    item for item in report["configs"] if item["exists"]
+                )
+                self.assertEqual(config["status"], "invalid")
+                self.assertFalse(config["launcherExists"])
 
     def test_invalid_json_config_is_drift(self):
         with tempfile.TemporaryDirectory() as directory:
