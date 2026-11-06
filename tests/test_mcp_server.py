@@ -1200,6 +1200,46 @@ class SafeEditMcpTests(unittest.TestCase):
         self.assertFalse(operation_schema["additionalProperties"])
         self.assertEqual(set(operation_schema["properties"]), allowed)
 
+    def test_transaction_operation_schema_requires_operation_fields(self):
+        response = server.handle_message(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        )
+        transaction = next(
+            tool
+            for tool in response["result"]["tools"]
+            if tool["name"] == "safe_edit_transaction"
+        )
+        operation_schema = transaction["inputSchema"]["properties"][
+            "files"
+        ]["items"]["properties"]["operations"]["items"]
+        self.assertEqual(operation_schema["required"], ["op"])
+
+        branches = {
+            branch["properties"]["op"]["const"]: branch
+            for branch in operation_schema["oneOf"]
+        }
+        required = {
+            op: set(branch.get("required", []))
+            for op, branch in branches.items()
+        }
+        self.assertEqual(
+            required,
+            {
+                op: set(fields)
+                for op, fields in (
+                    implementation._TRANSACTION_OPERATION_REQUIRED_KEYS.items()
+                )
+            },
+        )
+        for op in ("delete-lines", "replace-lines"):
+            self.assertEqual(
+                branches[op]["anyOf"],
+                [
+                    {"required": ["start", "end"]},
+                    {"required": ["anchor_pattern"]},
+                ],
+            )
+
     def test_transaction_operation_validation_rejects_unknown_fields(self):
         for key in (
             "old_file",

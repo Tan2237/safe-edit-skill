@@ -1521,6 +1521,48 @@ TRANSACTION_OPERATION_SCHEMA = {
             ),
         },
     },
+    "required": ["op"],
+    "oneOf": [
+        {
+            "properties": {"op": {"const": "edit"}},
+            "required": ["old", "new"],
+        },
+        {
+            "properties": {"op": {"const": "regex"}},
+            "required": ["pattern", "replacement"],
+        },
+        {
+            "properties": {"op": {"const": "insert"}},
+            "required": ["line", "text"],
+        },
+        {
+            "properties": {"op": {"const": "prepend"}},
+            "required": ["text"],
+        },
+        {
+            "properties": {"op": {"const": "append"}},
+            "required": ["text"],
+        },
+        {
+            "properties": {"op": {"const": "delete"}},
+            "required": ["line"],
+        },
+        {
+            "properties": {"op": {"const": "delete-lines"}},
+            "anyOf": [
+                {"required": ["start", "end"]},
+                {"required": ["anchor_pattern"]},
+            ],
+        },
+        {
+            "properties": {"op": {"const": "replace-lines"}},
+            "required": ["text"],
+            "anyOf": [
+                {"required": ["start", "end"]},
+                {"required": ["anchor_pattern"]},
+            ],
+        },
+    ],
     "additionalProperties": False,
 }
 
